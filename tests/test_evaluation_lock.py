@@ -287,6 +287,19 @@ def test_compatible_authority_creates_new_full_identity() -> None:
     assert_candidate_execution_allowed(full)
 
 
+def test_full_lock_cannot_be_constructed_or_tampered_with_directly() -> None:
+    from lowbit_lab.evaluation_lock import FullEvaluationLock
+
+    with pytest.raises(EvaluationLockError, match="threshold authority validation"):
+        FullEvaluationLock(
+            base_lock_sha256="1" * 64,
+            authority_sha256="2" * 64,
+            canonical_json="{}",
+            sha256="3" * 64,
+            _token=object(),
+        )
+
+
 @pytest.mark.parametrize(
     ("mutation", "message"),
     [

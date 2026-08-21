@@ -18,6 +18,19 @@ from lowbit_lab.jsonio import emit
 from lowbit_lab.runtime import RuntimeArtifact, RuntimeContractError, RuntimeLock, load_runtime_lock
 
 
+def _approved_url(url: str, hosts: frozenset[str]) -> bool:
+    parsed = urlsplit(url)
+    return (
+        parsed.scheme == "https"
+        and parsed.hostname in hosts
+        and not parsed.username
+        and not parsed.password
+        and not parsed.fragment
+        and not parsed.query
+        and parsed.port in {None, 443}
+    )
+
+
 class _ClosedRedirects(urllib.request.HTTPRedirectHandler):
     def __init__(self, hosts: frozenset[str]) -> None:
         self._hosts = hosts
@@ -31,8 +44,7 @@ class _ClosedRedirects(urllib.request.HTTPRedirectHandler):
         headers: Any,
         newurl: str,
     ) -> urllib.request.Request:
-        parsed = urlsplit(newurl)
-        if parsed.scheme != "https" or parsed.hostname not in self._hosts:
+        if not _approved_url(newurl, self._hosts):
             raise RuntimeContractError("runtime artifact redirect left the approved HTTPS hosts")
         redirected = super().redirect_request(req, fp, code, msg, headers, newurl)
         if redirected is None:
@@ -90,8 +102,7 @@ def fetch_runtime_artifacts(lock: RuntimeLock, *, root: Path) -> dict[str, objec
         temporary_path: Path | None = None
         try:
             with closing(opener.open(request, timeout=60)) as response:
-                final = urlsplit(response.geturl())
-                if final.scheme != "https" or final.hostname not in hosts or response.status != 200:
+                if not _approved_url(response.geturl(), hosts) or response.status != 200:
                     raise RuntimeContractError("runtime artifact response identity is invalid")
                 declared = response.headers.get("Content-Length")
                 if (

@@ -91,6 +91,9 @@ def make_activation(tmp_path: Path) -> tuple[ActivationRequest, Counter[str]]:
         {
             "preview_only": False,
             "approved_plan_sha256": _sha(tmp_path / "docs/plans/local/approved.md"),
+            "runtime_decision_sha256": _sha(
+                tmp_path / "configs/local/runtime-decision.json"
+            ),
             "runtime_lock_sha256": runtime.sha256,
             "metadata_policy_sha256": metadata.sha256,
             "evaluation_lock_sha256": _sha(tmp_path / "eval/local/evaluation.json"),
@@ -176,22 +179,14 @@ def test_action_gate_failure_stops_and_closes_every_child(
     assert not any(calls[name] for name in GATE_ORDER[failed_index + 1 :])
 
 
-def test_retry_gets_new_run_and_reuses_only_completed_exact_evidence(tmp_path: Path) -> None:
+def test_retry_gets_new_run_and_reexecutes_all_evidence_gates(tmp_path: Path) -> None:
     request, first_calls = make_activation(tmp_path)
     first = run_activation(request, apply=True, adapters=adapters(first_calls))
     second_calls: Counter[str] = Counter()
     second = run_activation(request, apply=True, adapters=adapters(second_calls))
     assert first["run"]["run_id"] != second["run"]["run_id"]
-    assert second_calls == Counter(
-        {
-            "publication": 1,
-            "runtime_decision": 1,
-            "verified_local_runtime": 1,
-            "runtime_probe": 1,
-        }
-    )
-    assert all(gate["reused_gate_id"] is None for gate in second["gates"][3:6])
-    assert all(gate["reused_gate_id"] for gate in second["gates"][6:])
+    assert second_calls == Counter({"publication": 1, **dict.fromkeys(GATE_ORDER[3:], 1)})
+    assert all(gate["reused_gate_id"] is None for gate in second["gates"])
 
 
 def test_publication_preflight_failure_is_audited_without_linking_run(tmp_path: Path) -> None:

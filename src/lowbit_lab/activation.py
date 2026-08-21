@@ -52,7 +52,9 @@ ACTION_GATES = (
     "evaluation_lock",
 )
 GATE_ORDER = PREFLIGHT_GATES + ACTION_GATES
-REUSABLE_GATES = {"provenance", "evaluation_lock"}
+REUSABLE_GATES: frozenset[str] = frozenset()
+MAX_EVALUATION_FIXTURE_BYTES = 4 * 1024 * 1024
+MAX_EVALUATION_SUITE_BYTES = 16 * 1024 * 1024
 ZERO_STATE = {
     "weights_required": False,
     "weights_loaded": False,
@@ -176,6 +178,7 @@ def _authority_and_bytes(request: ActivationRequest) -> tuple[dict[str, str], di
     metadata_policy = load_metadata_policy(request.metadata_policy_path, root=request.root)
     authority = {
         "approved_plan_sha256": _file_sha256(request.approved_plan_path),
+        "runtime_decision_sha256": _file_sha256(request.runtime_decision_path),
         "runtime_lock_sha256": runtime_lock.sha256,
         "metadata_policy_sha256": metadata_policy.sha256,
         "evaluation_lock_sha256": _file_sha256(request.evaluation_lock_path),
@@ -288,10 +291,18 @@ def _verified_runtime_adapter(context: ActivationContext) -> Mapping[str, Any]:
 def _runtime_probe_adapter(context: ActivationContext) -> Mapping[str, Any]:
     lock = load_runtime_lock(context.request.runtime_lock_path, root=context.request.root)
     python_path = context.request.root / lock.artifact_root / "env/bin/python"
+    package_versions = {
+        artifact.name: artifact.version
+        for artifact in lock.artifacts
+        if artifact.role == "python_distribution"
+        and artifact.name in {"torch", "transformers"}
+    }
     evidence = run_wsl_cuda_probe(
         python_path=python_path,
         root=context.request.root,
         lock_sha256=lock.sha256,
+        expected_python_version=lock.python_version,
+        expected_package_versions=package_versions,
     )
     return {"ok": evidence["status"] == "observed", **evidence}
 
@@ -312,6 +323,7 @@ def _evaluation_adapter(context: ActivationContext) -> Mapping[str, Any]:
         raise ActivationError("evaluation lock fixture inventory is invalid")
     fixture_root = (context.request.root / "eval/local/fixtures").resolve()
     fixture_bytes: dict[str, bytes] = {}
+    total_bytes = 0
     for fixture in raw["fixtures"]:
         if not isinstance(fixture, Mapping):
             raise ActivationError("evaluation lock fixture is invalid")
@@ -326,6 +338,12 @@ def _evaluation_adapter(context: ActivationContext) -> Mapping[str, Any]:
         if not path.is_relative_to(fixture_root):
             raise ActivationError("evaluation fixture path escapes its local root")
         try:
+            size = path.stat().st_size
+            if size > MAX_EVALUATION_FIXTURE_BYTES:
+                raise ActivationError("evaluation fixture exceeds its byte cap")
+            total_bytes += size
+            if total_bytes > MAX_EVALUATION_SUITE_BYTES:
+                raise ActivationError("evaluation fixture suite exceeds its byte cap")
             fixture_bytes[fixture_id] = path.read_bytes()
         except OSError as exc:
             raise ActivationError("evaluation fixture material is missing") from exc
@@ -453,8 +471,8 @@ def run_activation(
             owner_id=owner_id,
             lease_expires_at=lease,
             heartbeat_at=heartbeat,
+            attempt_id=attempt_id,
         )
-        database.link_attempt(attempt_id, run_id, _iso(clock()))
         database.transition(run_id, "validated")
         database.transition(run_id, "running")
         gate_rows = _gate_bindings(config, authority)

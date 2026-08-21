@@ -98,6 +98,7 @@ def _activation_config(*, preview_only: bool) -> dict:
     raw["activation"] = {
         "preview_only": preview_only,
         "approved_plan_sha256": None if preview_only else "1" * 64,
+        "runtime_decision_sha256": None if preview_only else "5" * 64,
         "runtime_lock_sha256": None if preview_only else "2" * 64,
         "metadata_policy_sha256": None if preview_only else "3" * 64,
         "evaluation_lock_sha256": None if preview_only else "4" * 64,

@@ -814,8 +814,8 @@ def verify_metadata_repository(
                     "requested_url": _evidence_url(response.metadata.requested_url),
                     "final_url": _evidence_url(response.metadata.final_url),
                     "content_length": int(item["size_bytes"]),
-                    "etag": response.metadata.etag,
-                    "last_modified": response.metadata.last_modified,
+                    "etag_present": response.metadata.etag is not None,
+                    "last_modified_present": response.metadata.last_modified is not None,
                 },
                 "local_content": local,
             }

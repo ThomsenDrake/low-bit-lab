@@ -42,3 +42,7 @@ def test_runtime_redirects_are_closed_to_https_allowlist() -> None:
     assert redirected.full_url == "https://example.invalid/artifact"
     with pytest.raises(RuntimeContractError, match="approved HTTPS"):
         handler.redirect_request(request, None, 302, "Found", {}, "https://escape.invalid/a")
+    with pytest.raises(RuntimeContractError, match="approved HTTPS"):
+        handler.redirect_request(
+            request, None, 302, "Found", {}, "https://example.invalid/a?token=redacted"
+        )

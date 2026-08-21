@@ -70,8 +70,9 @@ def _git(root: Path, *args: str, input_text: str | None = None) -> str:
             check=True,
             capture_output=True,
             text=True,
+            timeout=30,
         )
-    except (OSError, subprocess.CalledProcessError) as exc:
+    except (OSError, subprocess.SubprocessError) as exc:
         raise PublicationError("repository inspection failed") from exc
     return result.stdout
 
@@ -109,8 +110,9 @@ def load_manifest(root: Path, path: Path) -> PublicationManifest:
             ["git", "-C", str(root), "check-ignore", "--quiet", "--no-index", "--", relative],
             check=False,
             capture_output=True,
+            timeout=30,
         ).returncode
-    except OSError as exc:
+    except (OSError, subprocess.SubprocessError) as exc:
         raise PublicationError("cannot verify publication manifest ignore status") from exc
     if ignored != 0:
         raise PublicationError("publication manifest must be in an ignored local directory")
@@ -214,6 +216,7 @@ def _git_object_chunks(root: Path, object_type: str, object_id: str) -> Iterator
 def _tracked_contents(root: Path) -> Iterable[Iterator[bytes]]:
     paths = [item for item in _git(root, "ls-files", "-z").split("\0") if item]
     for relative in paths:
+        yield iter((relative.encode("utf-8"),))
         candidate = (root / relative).resolve()
         if not candidate.is_relative_to(root):
             raise PublicationError("tracked path resolves outside repository")
@@ -227,7 +230,10 @@ def _tracked_contents(root: Path) -> Iterable[Iterator[bytes]]:
 def _outgoing_contents(root: Path, remote: str) -> Iterable[Iterator[bytes]]:
     rows = _git(root, "rev-list", "--objects", "HEAD", "--not", f"--remotes={remote}").splitlines()
     for row in rows:
-        object_id = row.split(maxsplit=1)[0]
+        fields = row.split(maxsplit=1)
+        object_id = fields[0]
+        if len(fields) == 2:
+            yield iter((fields[1].encode("utf-8"),))
         object_type = _git(root, "cat-file", "-t", object_id).strip()
         if object_type in {"blob", "commit"}:
             yield _git_object_chunks(root, object_type, object_id)

@@ -82,7 +82,10 @@ class PendingEvaluationLock:
     candidate_execution: str = "blocked"
 
 
-@dataclass(frozen=True)
+_FULL_LOCK_TOKEN = object()
+
+
+@dataclass(frozen=True, init=False)
 class FullEvaluationLock:
     base_lock_sha256: str
     authority_sha256: str
@@ -91,6 +94,27 @@ class FullEvaluationLock:
     status: str = "locked"
     promotion_authorized: bool = True
     candidate_execution: str = "allowed"
+
+    def __init__(
+        self,
+        *,
+        base_lock_sha256: str,
+        authority_sha256: str,
+        canonical_json: str,
+        sha256: str,
+        _token: object,
+    ) -> None:
+        if _token is not _FULL_LOCK_TOKEN:
+            raise EvaluationLockError(
+                "full evaluation locks must be created by threshold authority validation"
+            )
+        object.__setattr__(self, "base_lock_sha256", base_lock_sha256)
+        object.__setattr__(self, "authority_sha256", authority_sha256)
+        object.__setattr__(self, "canonical_json", canonical_json)
+        object.__setattr__(self, "sha256", sha256)
+        object.__setattr__(self, "status", "locked")
+        object.__setattr__(self, "promotion_authorized", True)
+        object.__setattr__(self, "candidate_execution", "allowed")
 
 
 def _closed_mapping(value: object, keys: set[str], label: str) -> Mapping[str, object]:
@@ -531,4 +555,5 @@ def apply_threshold_authority(
         authority_sha256=authority_sha256,
         canonical_json=canonical,
         sha256=hashlib.sha256(canonical.encode()).hexdigest(),
+        _token=_FULL_LOCK_TOKEN,
     )

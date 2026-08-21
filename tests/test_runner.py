@@ -88,6 +88,7 @@ def test_invalid_activation_authority_is_audited_before_run_link(
         {
             "preview_only": False,
             "approved_plan_sha256": "1" * 64,
+            "runtime_decision_sha256": "5" * 64,
             "runtime_lock_sha256": "2" * 64,
             "metadata_policy_sha256": "3" * 64,
             "evaluation_lock_sha256": "4" * 64,

@@ -77,6 +77,19 @@ def test_tracked_protected_identifier_fails_without_echoing_value(tmp_path: Path
     assert protected not in rendered
 
 
+def test_protected_identifier_in_tracked_filename_fails(tmp_path: Path) -> None:
+    repo, _ = _repo_with_public_remote(tmp_path)
+    protected = "private-selected-identifier"
+    (repo / f"{protected}.txt").write_text("generic", encoding="utf-8")
+    _git(repo, "add", ".")
+
+    result = scan_publication(repo, public_remote="public", protected_values=[protected])
+
+    assert result["ok"] is False
+    assert any(item["category"] == "configured_private_value" for item in result["findings"])
+    assert protected not in json.dumps(result)
+
+
 @pytest.mark.parametrize(
     ("private_text", "category"),
     [

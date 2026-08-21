@@ -11,7 +11,7 @@ import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
-from pathlib import Path, PureWindowsPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -228,7 +228,8 @@ def parse_runtime_lock(raw: Any, *, root: Path) -> RuntimeLock:
     if not isinstance(python_version, str) or not re.fullmatch(r"3\.12\.\d+", python_version):
         raise RuntimeContractError("managed Python must be an exact 3.12 patch version")
     artifact_root = _repo_relative_path(root, lock["artifact_root"], "artifact_root")
-    if not artifact_root.startswith("artifacts/local/runtime"):
+    artifact_root_parts = PurePosixPath(artifact_root).parts
+    if artifact_root_parts[:3] != ("artifacts", "local", "runtime"):
         raise RuntimeContractError("artifact_root must be under artifacts/local/runtime")
     resolution_keys = {"status", "binary_only", "apply_index_access", "allowed_hosts"}
     resolution = _closed_mapping(lock["resolution"], resolution_keys, "resolution")
@@ -282,6 +283,8 @@ def parse_runtime_lock(raw: Any, *, root: Path) -> RuntimeLock:
             or parsed.username
             or parsed.password
             or parsed.fragment
+            or parsed.query
+            or parsed.port not in {None, 443}
         ):
             raise RuntimeContractError(f"artifacts[{index}].url must be immutable HTTPS")
         if parsed.hostname not in allowed_hosts:

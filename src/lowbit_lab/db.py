@@ -265,6 +265,7 @@ def _validate_activation_run_config(config_json: str, requested_cost: str) -> No
         raise DatabaseError("local_activation config is not executable")
     for name in (
         "approved_plan_sha256",
+        "runtime_decision_sha256",
         "runtime_lock_sha256",
         "metadata_policy_sha256",
         "evaluation_lock_sha256",
@@ -462,6 +463,7 @@ class ResultsDatabase:
         owner_id: str | None = None,
         lease_expires_at: str | None = None,
         heartbeat_at: str | None = None,
+        attempt_id: str | None = None,
     ) -> None:
         if mode == "local_activation":
             _validate_activation_run_config(config_json, requested_cost)
@@ -512,6 +514,14 @@ class ResultsDatabase:
                 VALUES (?, NULL, 'created')""",
                 (run_id,),
             )
+            if attempt_id is not None:
+                cursor = connection.execute(
+                    """UPDATE attempts SET status = 'linked', run_id = ?, ended_at = ?
+                    WHERE attempt_id = ? AND status = 'received'""",
+                    (run_id, started_at, attempt_id),
+                )
+                if cursor.rowcount != 1:
+                    raise DatabaseError(f"attempt cannot be linked: {attempt_id}")
 
     def create_activation_gates(
         self,

@@ -25,6 +25,19 @@ CHECK_NAMES = (
 )
 STATES = {"observed", "missing", "failed", "unknown"}
 SAFE_CHECK_KEYS = {"state", "reason_code", "version", "versions", "value", "bytes", "missing"}
+OBSERVED_CHECK_KEYS = {
+    "os": {"state", "version"},
+    "python": {"state", "version"},
+    "packages": {"state", "versions"},
+    "driver": {"state", "version"},
+    "gpu": {"state", "bytes"},
+    "cuda_build": {"state", "version"},
+    "cuda_availability": {"state"},
+    "device_capability": {"state", "value"},
+    "small_allocation": {"state", "bytes"},
+    "deterministic_operation": {"state"},
+    "synchronization": {"state"},
+}
 PROBE_SCRIPT = r"""
 import importlib.metadata
 import json
@@ -114,11 +127,26 @@ def run_wsl_cuda_probe(
     python_path: Path,
     root: Path,
     lock_sha256: str,
+    expected_python_version: str | None = None,
+    expected_package_versions: dict[str, str] | None = None,
     timeout_seconds: int = 30,
     runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
 ) -> dict[str, Any]:
     if not isinstance(lock_sha256, str) or not SHA256_RE.fullmatch(lock_sha256):
         raise RuntimeContractError("lock_sha256 must be lowercase SHA-256")
+    if expected_python_version is not None and (
+        not isinstance(expected_python_version, str)
+        or not expected_python_version.startswith("3.12.")
+    ):
+        raise RuntimeContractError("expected Python version must be an exact 3.12 patch")
+    if expected_package_versions is not None and (
+        set(expected_package_versions) != {"torch", "transformers"}
+        or any(
+            not isinstance(value, str) or not value
+            for value in expected_package_versions.values()
+        )
+    ):
+        raise RuntimeContractError("expected package versions must identify torch and transformers")
     if (
         not isinstance(timeout_seconds, int)
         or isinstance(timeout_seconds, bool)
@@ -229,6 +257,17 @@ def run_wsl_cuda_probe(
             or value.get("state") not in STATES
         ):
             return _unknown("PROBE_OUTPUT_INVALID", lock_sha256, elapsed_ms)
+        state = value["state"]
+        if state == "observed" and set(value) != OBSERVED_CHECK_KEYS[name]:
+            return _unknown("PROBE_OUTPUT_INVALID", lock_sha256, elapsed_ms)
+        if state != "observed":
+            permitted = {"state", "reason_code"}
+            if name == "python":
+                permitted.add("version")
+            if name == "packages" and state == "missing":
+                permitted.add("missing")
+            if "reason_code" not in value or set(value) - permitted:
+                return _unknown("PROBE_OUTPUT_INVALID", lock_sha256, elapsed_ms)
         if "missing" in value and (
             not isinstance(value["missing"], list)
             or not set(value["missing"]).issubset({"torch", "transformers"})
@@ -285,6 +324,14 @@ def run_wsl_cuda_probe(
         ):
             return _unknown("PROBE_OUTPUT_INVALID", lock_sha256, elapsed_ms)
         checks[name] = dict(value)
+    if expected_python_version is not None and (
+        checks["python"].get("version") != expected_python_version
+    ):
+        return _unknown("PYTHON_LOCK_MISMATCH", lock_sha256, elapsed_ms)
+    if expected_package_versions is not None and (
+        checks["packages"].get("versions") != expected_package_versions
+    ):
+        return _unknown("PACKAGE_LOCK_MISMATCH", lock_sha256, elapsed_ms)
     states = {value["state"] for value in checks.values()}
     if "failed" in states:
         status = "failed"

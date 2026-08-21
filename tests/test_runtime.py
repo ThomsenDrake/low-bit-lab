@@ -175,6 +175,17 @@ def test_tracked_example_is_a_valid_target_neutral_schema() -> None:
         (lambda raw: raw["artifacts"][1].update({"sha256": "0" * 64}), "resolved"),
         (lambda raw: raw.update({"artifact_root": "../outside"}), "repository-relative"),
         (lambda raw: raw.update({"artifact_root": "artifacts/runtime"}), "artifacts/local/runtime"),
+        (
+            lambda raw: raw.update({"artifact_root": "artifacts/local/runtimeevil"}),
+            "artifacts/local/runtime",
+        ),
+        (lambda raw: raw["artifacts"][0].update({"url": "https://example.invalid/a?x=1"}), "HTTPS"),
+        (
+            lambda raw: raw["artifacts"][0].update(
+                {"url": "https://example.invalid:8443/a"}
+            ),
+            "HTTPS",
+        ),
         (lambda raw: raw.update({"aggregate_cap_bytes": 12}), "aggregate"),
         (lambda raw: raw["resolution"].update({"status": "partial"}), "complete"),
     ],
@@ -244,8 +255,13 @@ def _probe_payload(**overrides: object) -> dict[str, object]:
         )
     }
     fields["python"]["version"] = "3.12.11"
+    fields["os"]["version"] = "WSL2"
     fields["packages"]["versions"] = {"torch": "2.13.0", "transformers": "5.15.1"}
+    fields["driver"]["version"] = "13030"
+    fields["gpu"]["bytes"] = 16_000_000_000
+    fields["cuda_build"]["version"] = "13.0"
     fields["device_capability"]["value"] = [9, 0]
+    fields["small_allocation"]["bytes"] = 1024
     fields.update(overrides)
     return {"schema_version": 1, "checks": fields}
 
@@ -271,6 +287,24 @@ def test_probe_success_is_framework_only_and_sanitized(tmp_path: Path) -> None:
     assert result["framework_readiness_proven"] is True
     assert result["target_support_proven"] is False
     assert "secret" not in json.dumps(result)
+
+
+def test_probe_rejects_versions_that_do_not_match_runtime_lock(tmp_path: Path) -> None:
+    python = tmp_path / "artifacts/local/runtime/env/bin/python"
+    python.parent.mkdir(parents=True)
+    python.write_bytes(b"")
+    result = run_wsl_cuda_probe(
+        python_path=python,
+        root=tmp_path,
+        lock_sha256="a" * 64,
+        expected_python_version="3.12.12",
+        expected_package_versions={"torch": "2.13.0", "transformers": "5.15.1"},
+        runner=lambda *a, **k: subprocess.CompletedProcess(
+            a[0], 0, json.dumps(_probe_payload()), ""
+        ),
+    )
+    assert result["status"] == "unknown"
+    assert result["reason_code"] == "PYTHON_LOCK_MISMATCH"
 
 
 @pytest.mark.parametrize(

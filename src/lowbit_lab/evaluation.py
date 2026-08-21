@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
@@ -80,6 +82,22 @@ def assert_candidate_execution_allowed(lock: object) -> None:
     from lowbit_lab.evaluation_lock import FullEvaluationLock
 
     if not isinstance(lock, FullEvaluationLock):
+        raise CandidateExecutionBlocked("candidate execution is blocked by evaluation authority")
+    try:
+        identity = json.loads(lock.canonical_json)
+    except (json.JSONDecodeError, TypeError):
+        raise CandidateExecutionBlocked(
+            "candidate execution is blocked by evaluation authority"
+        ) from None
+    canonical = json.dumps(identity, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    authority = identity.get("authority")
+    if (
+        canonical != lock.canonical_json
+        or hashlib.sha256(canonical.encode()).hexdigest() != lock.sha256
+        or identity.get("base_lock_sha256") != lock.base_lock_sha256
+        or not isinstance(authority, dict)
+        or authority.get("authority_sha256") != lock.authority_sha256
+    ):
         raise CandidateExecutionBlocked("candidate execution is blocked by evaluation authority")
     status = lock.status
     promotion_authorized = lock.promotion_authorized

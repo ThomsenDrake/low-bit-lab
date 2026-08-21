@@ -136,6 +136,7 @@ def executable_activation_json(*, preview_only: bool = False) -> str:
             "activation": {
                 "preview_only": preview_only,
                 "approved_plan_sha256": "1" * 64,
+                "runtime_decision_sha256": "5" * 64,
                 "runtime_lock_sha256": "2" * 64,
                 "metadata_policy_sha256": "3" * 64,
                 "evaluation_lock_sha256": "4" * 64,

@@ -63,6 +63,7 @@ class ModalPolicy:
 class ActivationPolicy:
     preview_only: bool
     approved_plan_sha256: str | None
+    runtime_decision_sha256: str | None
     runtime_lock_sha256: str | None
     metadata_policy_sha256: str | None
     evaluation_lock_sha256: str | None
@@ -73,6 +74,7 @@ class ActivationPolicy:
     def authority_hashes(self) -> dict[str, str]:
         values = {
             "approved_plan_sha256": self.approved_plan_sha256,
+            "runtime_decision_sha256": self.runtime_decision_sha256,
             "runtime_lock_sha256": self.runtime_lock_sha256,
             "metadata_policy_sha256": self.metadata_policy_sha256,
             "evaluation_lock_sha256": self.evaluation_lock_sha256,
@@ -285,6 +287,7 @@ def load_experiment_config(path: Path, *, activation_preview: bool = False) -> E
             {
                 "preview_only",
                 "approved_plan_sha256",
+                "runtime_decision_sha256",
                 "runtime_lock_sha256",
                 "metadata_policy_sha256",
                 "evaluation_lock_sha256",
@@ -296,6 +299,7 @@ def load_experiment_config(path: Path, *, activation_preview: bool = False) -> E
         required_activation = {
             "preview_only",
             "approved_plan_sha256",
+            "runtime_decision_sha256",
             "runtime_lock_sha256",
             "metadata_policy_sha256",
             "evaluation_lock_sha256",
@@ -324,6 +328,7 @@ def load_experiment_config(path: Path, *, activation_preview: bool = False) -> E
             raise ConfigError("activation remote GPU request must remain disabled")
         authority_names = (
             "approved_plan_sha256",
+            "runtime_decision_sha256",
             "runtime_lock_sha256",
             "metadata_policy_sha256",
             "evaluation_lock_sha256",
@@ -350,6 +355,7 @@ def load_experiment_config(path: Path, *, activation_preview: bool = False) -> E
         activation = ActivationPolicy(
             preview_only=preview_only,
             approved_plan_sha256=authority_values["approved_plan_sha256"],
+            runtime_decision_sha256=authority_values["runtime_decision_sha256"],
             runtime_lock_sha256=authority_values["runtime_lock_sha256"],
             metadata_policy_sha256=authority_values["metadata_policy_sha256"],
             evaluation_lock_sha256=authority_values["evaluation_lock_sha256"],
