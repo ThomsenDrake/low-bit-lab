@@ -69,6 +69,7 @@ class RuntimeLock:
     artifact_root: str
     per_artifact_cap_bytes: int
     aggregate_cap_bytes: int
+    allowed_hosts: tuple[str, ...]
     artifacts: tuple[RuntimeArtifact, ...]
     canonical_json: str
     sha256: str
@@ -349,6 +350,7 @@ def parse_runtime_lock(raw: Any, *, root: Path) -> RuntimeLock:
         artifact_root=artifact_root,
         per_artifact_cap_bytes=per_cap,
         aggregate_cap_bytes=aggregate_cap,
+        allowed_hosts=tuple(allowed_hosts),
         artifacts=tuple(artifacts),
         canonical_json=canonical,
         sha256=hashlib.sha256(canonical.encode()).hexdigest(),

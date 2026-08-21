@@ -39,18 +39,19 @@ from lowbit_lab.runtime import (
 )
 from lowbit_lab.runtime_probe import run_wsl_cuda_probe
 
-GATE_ORDER = (
+PREFLIGHT_GATES = (
     "publication",
     "config_authority",
     "zero_budget",
+)
+ACTION_GATES = (
     "runtime_decision",
     "verified_local_runtime",
     "runtime_probe",
     "provenance",
     "evaluation_lock",
 )
-PREFLIGHT_GATES = GATE_ORDER[:3]
-ACTION_GATES = GATE_ORDER[3:]
+GATE_ORDER = PREFLIGHT_GATES + ACTION_GATES
 REUSABLE_GATES = {"provenance", "evaluation_lock"}
 ZERO_STATE = {
     "weights_required": False,
@@ -399,7 +400,6 @@ def run_activation(
     owner_id = owner_id or str(uuid.uuid4())
     run_id: str | None = None
     current_gate_id: str | None = None
-    linked = False
     try:
         publication = _checked_evidence(
             "publication",
@@ -407,11 +407,9 @@ def run_activation(
                 ActivationContext(request, None, {}, True)
             ),
         )
-        preview = preview_activation(request)
+        authority, _ = _authority_and_bytes(request)
         config = load_experiment_config(request.config_path)
-        authority = verify_activation_authority(
-            config, preview["observed_authority_sha256"]
-        )
+        authority = verify_activation_authority(config, authority)
         context = ActivationContext(request, config, authority, True)
         source_hashes = verify_sources(config, request.root)
         config_evidence = {
@@ -457,7 +455,6 @@ def run_activation(
             heartbeat_at=heartbeat,
         )
         database.link_attempt(attempt_id, run_id, _iso(clock()))
-        linked = True
         database.transition(run_id, "validated")
         database.transition(run_id, "running")
         gate_rows = _gate_bindings(config, authority)
@@ -469,7 +466,7 @@ def run_activation(
             started_at=heartbeat,
             gates=gate_rows,
         )
-        for row, evidence in zip(gate_rows[:3], preflight, strict=True):
+        for row, evidence in zip(gate_rows[: len(PREFLIGHT_GATES)], preflight, strict=True):
             encoded, digest = _canonical(evidence)
             database.complete_activation_gate(
                 row["gate_id"],
@@ -485,7 +482,9 @@ def run_activation(
             "provenance": adapters.provenance,
             "evaluation_lock": adapters.evaluation_lock,
         }
-        for order, row in enumerate(gate_rows[3:], start=3):
+        for order, row in enumerate(
+            gate_rows[len(PREFLIGHT_GATES) :], start=len(PREFLIGHT_GATES)
+        ):
             current_gate_id = row["gate_id"]
             reusable = None
             if row["name"] in REUSABLE_GATES:
@@ -554,7 +553,7 @@ def run_activation(
             with suppress(DatabaseError):
                 database.transition(run_id, "failed", reason=reason, ended_at=ended)
         raise
-    assert run_id is not None and linked
+    assert run_id is not None
     return {
         "ok": True,
         "attempt_id": attempt_id,

@@ -10,10 +10,11 @@ import tempfile
 import urllib.error
 import urllib.request
 from collections.abc import Iterator, Mapping
+from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Protocol
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote, urlsplit, urlunsplit
 
 MAX_FILE_BYTES = 24 * 1024 * 1024
 MAX_AGGREGATE_BYTES = 32 * 1024 * 1024
@@ -386,6 +387,11 @@ def _validate_response_url(metadata: ResponseMetadata, hosts: tuple[str, ...]) -
             raise ProvenanceError(f"{label} response URL is not an exact allowed HTTPS origin")
 
 
+def _evidence_url(url: str) -> str:
+    parsed = urlsplit(url)
+    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
+
+
 def _response_length(value: object) -> int:
     if isinstance(value, bool):
         raise ProvenanceError("response content length is invalid")
@@ -581,10 +587,10 @@ def _source_key(policy: MetadataPolicy, item: Mapping[str, object]) -> str:
 
 def _load_identity_index(cache_root: Path) -> dict[str, str]:
     index = cache_root / "source-identities.json"
-    if not index.exists():
-        return {}
     try:
         raw = json.loads(index.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise ProvenanceError("cache identity index is ambiguous") from exc
     if (
@@ -805,8 +811,8 @@ def verify_metadata_repository(
                 "path": path,
                 "source": source,
                 "http": {
-                    "requested_url": response.metadata.requested_url,
-                    "final_url": response.metadata.final_url,
+                    "requested_url": _evidence_url(response.metadata.requested_url),
+                    "final_url": _evidence_url(response.metadata.final_url),
                     "content_length": int(item["size_bytes"]),
                     "etag": response.metadata.etag,
                     "last_modified": response.metadata.last_modified,
@@ -845,7 +851,7 @@ def verify_metadata_repository(
         "requested_cloud_cost_usd": 0,
         "actual_cloud_cost_usd": 0,
     }
-    identity_manifest = json.loads(json.dumps(manifest))
+    identity_manifest = deepcopy(manifest)
     for entry in identity_manifest["files"]:
         entry["local_content"].pop("reused", None)
     manifest["manifest_sha256"] = hashlib.sha256(

@@ -828,15 +828,16 @@ class ResultsDatabase:
             return result
 
     def spend_totals(self, phase: int) -> tuple[str, str]:
+        total = Decimal("0")
+        phase_total = Decimal("0")
         with self.connect() as connection:
-            rows = connection.execute(
+            for row in connection.execute(
                 "SELECT phase, modal_cost_actual_usd FROM experiments"
-            ).fetchall()
-        total = sum((Decimal(row["modal_cost_actual_usd"]) for row in rows), Decimal("0"))
-        phase_total = sum(
-            (Decimal(row["modal_cost_actual_usd"]) for row in rows if row["phase"] == phase),
-            Decimal("0"),
-        )
+            ):
+                cost = Decimal(row["modal_cost_actual_usd"])
+                total += cost
+                if row["phase"] == phase:
+                    phase_total += cost
         return format(phase_total, "f"), format(total, "f")
 
 

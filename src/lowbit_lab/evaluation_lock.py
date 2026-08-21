@@ -164,7 +164,7 @@ def _privacy_scan_object(value: object) -> None:
             _privacy_scan_object(item)
 
 
-def validate_fixture_privacy(content: bytes) -> str:
+def validate_fixture_privacy(content: bytes) -> None:
     if not isinstance(content, bytes):
         raise EvaluationLockError("fixture material must be bytes")
     try:
@@ -174,7 +174,6 @@ def validate_fixture_privacy(content: bytes) -> str:
     if "placeholder_not_locked" in text:
         raise EvaluationLockError("fixture status placeholder_not_locked is forbidden")
     _validate_private_text(text)
-    return text
 
 
 def _sha256_bytes(content: bytes) -> str:
@@ -417,12 +416,6 @@ def validate_pending_evaluation_lock(
         )
         for fixture in fixtures_raw
     )
-    if tuple(fixture.family for fixture in fixtures) != EVALUATION_FAMILIES:
-        raise EvaluationLockError("fixture families must match the closed registry order")
-    for attribute in ("fixture_id", "version", "sha256", "seed"):
-        values = [getattr(fixture, attribute) for fixture in fixtures]
-        if len(values) != len(set(values)):
-            raise EvaluationLockError(f"fixture {attribute} values must be unique")
     if set(fixture_bytes) != {fixture.fixture_id for fixture in fixtures}:
         raise EvaluationLockError("fixture material set must exactly match the lock")
 

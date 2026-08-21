@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import json
 import os
 import ssl
+import stat
 import sys
 import tempfile
 import urllib.error
 import urllib.request
+from contextlib import closing
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -51,9 +52,13 @@ def _opener(hosts: frozenset[str]) -> urllib.request.OpenerDirector:
 
 
 def _verify_existing(path: Path, artifact: RuntimeArtifact) -> bool:
-    if not path.exists():
+    try:
+        metadata = path.stat()
+    except FileNotFoundError:
         return False
-    if not path.is_file() or path.stat().st_size != artifact.size_bytes:
+    except OSError as exc:
+        raise RuntimeContractError(f"runtime artifact cache ambiguity: {artifact.role}") from exc
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_size != artifact.size_bytes:
         raise RuntimeContractError(f"runtime artifact cache ambiguity: {artifact.role}")
     with path.open("rb") as handle:
         digest = hashlib.file_digest(handle, "sha256").hexdigest()
@@ -67,8 +72,7 @@ def fetch_runtime_artifacts(lock: RuntimeLock, *, root: Path) -> dict[str, objec
     artifact_root = (root / lock.artifact_root).resolve()
     if not artifact_root.is_relative_to(root):
         raise RuntimeContractError("artifact root resolves outside repository")
-    raw = json.loads(lock.canonical_json)
-    hosts = frozenset(raw["resolution"]["allowed_hosts"])
+    hosts = frozenset(lock.allowed_hosts)
     opener = _opener(hosts)
     fetched = reused = transferred = 0
     artifact_root.mkdir(parents=True, exist_ok=True)
@@ -85,29 +89,32 @@ def fetch_runtime_artifacts(lock: RuntimeLock, *, root: Path) -> dict[str, objec
         )
         temporary_path: Path | None = None
         try:
-            response = opener.open(request, timeout=60)
-            final = urlsplit(response.geturl())
-            if final.scheme != "https" or final.hostname not in hosts or response.status != 200:
-                raise RuntimeContractError("runtime artifact response identity is invalid")
-            declared = response.headers.get("Content-Length")
-            if declared is None or not declared.isdigit() or int(declared) != artifact.size_bytes:
-                raise RuntimeContractError(
-                    f"runtime artifact size declaration drifted: {artifact.role}"
-                )
-            digest = hashlib.sha256()
-            written = 0
-            with tempfile.NamedTemporaryFile(
-                mode="w+b", prefix="partial-", dir=destination.parent, delete=False
-            ) as temporary:
-                temporary_path = Path(temporary.name)
-                while chunk := response.read(1024 * 1024):
-                    written += len(chunk)
-                    transferred += len(chunk)
-                    if written > artifact.size_bytes or transferred > lock.aggregate_cap_bytes:
-                        raise RuntimeContractError("runtime artifact transfer exceeded its cap")
-                    digest.update(chunk)
-                    temporary.write(chunk)
-            response.close()
+            with closing(opener.open(request, timeout=60)) as response:
+                final = urlsplit(response.geturl())
+                if final.scheme != "https" or final.hostname not in hosts or response.status != 200:
+                    raise RuntimeContractError("runtime artifact response identity is invalid")
+                declared = response.headers.get("Content-Length")
+                if (
+                    declared is None
+                    or not declared.isdigit()
+                    or int(declared) != artifact.size_bytes
+                ):
+                    raise RuntimeContractError(
+                        f"runtime artifact size declaration drifted: {artifact.role}"
+                    )
+                digest = hashlib.sha256()
+                written = 0
+                with tempfile.NamedTemporaryFile(
+                    mode="w+b", prefix="partial-", dir=destination.parent, delete=False
+                ) as temporary:
+                    temporary_path = Path(temporary.name)
+                    while chunk := response.read(1024 * 1024):
+                        written += len(chunk)
+                        transferred += len(chunk)
+                        if written > artifact.size_bytes or transferred > lock.aggregate_cap_bytes:
+                            raise RuntimeContractError("runtime artifact transfer exceeded its cap")
+                        digest.update(chunk)
+                        temporary.write(chunk)
             if written != artifact.size_bytes or digest.hexdigest() != artifact.sha256:
                 raise RuntimeContractError(f"runtime artifact content drifted: {artifact.role}")
             os.replace(temporary_path, destination)

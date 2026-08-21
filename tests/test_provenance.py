@@ -439,6 +439,19 @@ def test_redirect_downgrade_size_and_partial_response_fail_closed(
         _verify(tmp_path, files, response_overrides={"LICENSE": override})
 
 
+def test_manifest_strips_redirect_query_credentials(tmp_path: Path) -> None:
+    files = _files()
+    result = _verify(
+        tmp_path,
+        files,
+        response_overrides={
+            "LICENSE": {"final_url": f"https://{HOST}/LICENSE?Signature=temporary"}
+        },
+    )
+    entry = next(item for item in result["files"] if item["path"] == "LICENSE")
+    assert entry["http"]["final_url"] == f"https://{HOST}/LICENSE"
+
+
 def test_certificate_failure_is_sanitized_and_no_cache_is_promoted(tmp_path: Path) -> None:
     policy = parse_metadata_policy(_policy(), root=tmp_path)
     with pytest.raises(ProvenanceError, match="TLS verification failed") as raised:
