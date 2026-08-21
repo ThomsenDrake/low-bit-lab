@@ -1,0 +1,69 @@
+{
+  "files": [
+    {
+      "path": "BUDGET.md",
+      "sha256": "e8593c035a439f31f040a82fbbb9faf49ead6cc878f41b2b09ca55bcac099e47",
+      "size_bytes": 573
+    },
+    {
+      "path": "PLAN.md",
+      "sha256": "c5769271ce84b7faceac064ab00c7db0cdf03bf1c3f6f8c12e9d0c54dd276a33",
+      "size_bytes": 4128
+    },
+    {
+      "path": "SPEC.md",
+      "sha256": "a527d39933ba4c6daddcb52f702df3694b6f527c753c9c2ac7d256abbd78228b",
+      "size_bytes": 1577
+    },
+    {
+      "path": "configs/budget-policy.json",
+      "sha256": "3f0a091b2da0946aaed8310e5c942edafcf24e1d41a7d1e7f688902f65f5f33b",
+      "size_bytes": 314
+    },
+    {
+      "path": "configs/example-local-dry-run.yaml",
+      "sha256": "260630bf097651fb33112fee69572e1da7adf7753a0dd7b8861d01f4f3d12785",
+      "size_bytes": 797
+    },
+    {
+      "path": "pyproject.toml",
+      "sha256": "7ea48bbfd1de792b6551ce252fa63ced80c2874126a7340282a635d286e0db00",
+      "size_bytes": 821
+    },
+    {
+      "path": "uv.lock",
+      "sha256": "b5c0be6baa218ef2f19ede8ed534b6a14239321cd1d3b4c409fc280a824e6a3b",
+      "size_bytes": 14224
+    }
+  ],
+  "generated_at": "2026-08-21T21:23:29.498859+00:00",
+  "hash_algorithm": "sha256",
+  "lineage": {
+    "evaluation_report_sha256": null,
+    "experiment_config_sha256": "80f369d13f3ca1cd1965e19bbe66d1437a1dcb8313a13450ff85e60e4f8e8bd3",
+    "kv_cache_format": null,
+    "runtime": {
+      "control_plane_sha256": "496943770efe2b1ccfb9be2cafd438e6ce7a8b01797b891b7184ea6c7ae6b907",
+      "git_commit": "097f8a88672cd60fa1ea65d55d9c87f3cbed234b",
+      "git_dirty": false,
+      "implementation": "CPython",
+      "lab_version": "0.1.0",
+      "name": "scaffold-control-plane",
+      "python": "3.12.13",
+      "revision": "0.1.0"
+    },
+    "scaffold_disclaimer": "no target artifact, weights, training, or evaluation proof",
+    "source_hashes": {
+      "PLAN.md": "c5769271ce84b7faceac064ab00c7db0cdf03bf1c3f6f8c12e9d0c54dd276a33"
+    },
+    "target_identifier": null,
+    "target_license": null,
+    "target_revision": null,
+    "target_status": "unconfigured",
+    "tokenizer_path": null,
+    "tokenizer_sha256": null,
+    "training_config_sha256": null,
+    "true_bits_per_weight": null
+  },
+  "schema_version": 1
+}
