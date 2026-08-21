@@ -4,6 +4,12 @@ __pycache__/
 .ruff_cache/
 *.py[cod]
 results/*.sqlite*
+results/local/
+reports/local/
+configs/local/
+docs/plans/local/
+eval/local/
+artifacts/local/
 artifacts/checkpoints/
 artifacts/**/*.bin
 artifacts/**/*.gguf
@@ -14,4 +20,3 @@ artifacts/**/*.ckpt
 .env
 .env.*
 !.env.example
-

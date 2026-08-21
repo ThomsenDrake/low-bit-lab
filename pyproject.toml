@@ -22,6 +22,8 @@ lowbit-db = "lowbit_lab.db:main"
 lowbit-dry-run = "lowbit_lab.runner:main"
 lowbit-manifest = "lowbit_lab.manifest:main"
 lowbit-modal-plan = "lowbit_lab.modal_job:main"
+lowbit-activate = "lowbit_lab.activation:main"
+lowbit-runtime-artifacts = "lowbit_lab.runtime_artifacts:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/lowbit_lab"]

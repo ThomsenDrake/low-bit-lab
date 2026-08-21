@@ -1,0 +1,115 @@
+{
+  "schema_version": 1,
+  "suite_id": "generic-evaluation-suite",
+  "suite_version": "1.0.0",
+  "fixtures": [
+    {
+      "family": "coding",
+      "fixture_id": "generic-coding-fixture",
+      "version": "1.0.1",
+      "sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+      "source": {"classification": "synthetic", "reference": "generated-contract-1", "license": "CC0-1.0"},
+      "seed": 4101,
+      "scorer_id": "deterministic-json-scorer",
+      "metrics": ["exact_match"]
+    },
+    {
+      "family": "tool_call_validity",
+      "fixture_id": "generic-tool-call-validity-fixture",
+      "version": "1.0.2",
+      "sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+      "source": {"classification": "synthetic", "reference": "generated-contract-2", "license": "CC0-1.0"},
+      "seed": 4102,
+      "scorer_id": "deterministic-json-scorer",
+      "metrics": ["schema_valid_rate"]
+    },
+    {
+      "family": "long_context_retrieval",
+      "fixture_id": "generic-long-context-retrieval-fixture",
+      "version": "1.0.3",
+      "sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+      "source": {"classification": "synthetic", "reference": "generated-contract-3", "license": "CC0-1.0"},
+      "seed": 4103,
+      "scorer_id": "deterministic-json-scorer",
+      "metrics": ["retrieval_accuracy"]
+    },
+    {
+      "family": "throughput",
+      "fixture_id": "generic-throughput-fixture",
+      "version": "1.0.4",
+      "sha256": "4444444444444444444444444444444444444444444444444444444444444444",
+      "source": {"classification": "synthetic", "reference": "generated-contract-4", "license": "CC0-1.0"},
+      "seed": 4104,
+      "scorer_id": "deterministic-json-scorer",
+      "metrics": ["decode_tokens_per_second"]
+    },
+    {
+      "family": "memory",
+      "fixture_id": "generic-memory-fixture",
+      "version": "1.0.5",
+      "sha256": "5555555555555555555555555555555555555555555555555555555555555555",
+      "source": {"classification": "synthetic", "reference": "generated-contract-5", "license": "CC0-1.0"},
+      "seed": 4105,
+      "scorer_id": "deterministic-json-scorer",
+      "metrics": ["peak_vram_bytes"]
+    },
+    {
+      "family": "soak",
+      "fixture_id": "generic-soak-fixture",
+      "version": "1.0.6",
+      "sha256": "6666666666666666666666666666666666666666666666666666666666666666",
+      "source": {"classification": "synthetic", "reference": "generated-contract-6", "license": "CC0-1.0"},
+      "seed": 4106,
+      "scorer_id": "deterministic-json-scorer",
+      "metrics": ["failure_free_rate"]
+    }
+  ],
+  "scorer": {
+    "id": "deterministic-json-scorer",
+    "version": "1.0.0",
+    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "runtime": {
+      "id": "python",
+      "version": "3.12",
+      "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    }
+  },
+  "metrics": {
+    "coding": ["exact_match"],
+    "tool_call_validity": ["schema_valid_rate"],
+    "long_context_retrieval": ["retrieval_accuracy"],
+    "throughput": ["decode_tokens_per_second"],
+    "memory": ["peak_vram_bytes"],
+    "soak": ["failure_free_rate"]
+  },
+  "aggregation": {"method": "arithmetic_mean", "missing": "fail"},
+  "confidence": {"method": "bootstrap_percentile", "level": "0.95", "resamples": 1000, "seed": 90210},
+  "context": {
+    "configured_tokens": 8192,
+    "runtime_initialized": false,
+    "usefulness_proven": false,
+    "retrieval_evidence_sha256": null
+  },
+  "resources": {
+    "weights_required": false,
+    "allow_cloud_upload": false,
+    "remote_submission_enabled": false,
+    "scheduling_enabled": false,
+    "destructive_cleanup_enabled": false,
+    "requested_cloud_cost_usd": "0",
+    "actual_cloud_cost_usd": "0",
+    "max_wall_clock_seconds": 300,
+    "max_ram_bytes": 1073741824,
+    "max_vram_bytes": 1073741824
+  },
+  "stop_policy": {
+    "fixture_hash_mismatch": "stop",
+    "privacy_violation": "stop",
+    "scorer_drift": "stop",
+    "resource_limit": "stop",
+    "unknown_state": "stop"
+  },
+  "threshold_authority": {"status": "absent"},
+  "promotion_authorized": false,
+  "candidate_execution": "blocked"
+}

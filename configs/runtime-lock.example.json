@@ -1,0 +1,60 @@
+{
+  "schema_version": 1,
+  "runtime_id": "generic-wsl-cuda-runtime",
+  "python_version": "3.12.11",
+  "artifact_root": "artifacts/local/runtime",
+  "resolution": {
+    "status": "complete",
+    "binary_only": true,
+    "apply_index_access": false,
+    "allowed_hosts": ["artifacts.example.invalid"]
+  },
+  "per_artifact_cap_bytes": 1073741824,
+  "aggregate_cap_bytes": 4294967296,
+  "artifacts": [
+    {
+      "role": "uv_bootstrap",
+      "name": "generic-bootstrap",
+      "version": "1.0.0",
+      "url": "https://artifacts.example.invalid/generic-bootstrap.bin",
+      "filename": "generic-bootstrap.bin",
+      "size_bytes": 2,
+      "sha256": "31f086c719e626d50a917976100f61001a7e9c0a2f7350988c5a4dd0f52718ea",
+      "binary_format": "standalone_binary",
+      "direct": true
+    },
+    {
+      "role": "managed_cpython",
+      "name": "generic-managed-cpython",
+      "version": "3.12.11",
+      "url": "https://artifacts.example.invalid/generic-managed-cpython.tar.zst",
+      "filename": "generic-managed-cpython.tar.zst",
+      "size_bytes": 6,
+      "sha256": "11a4a60b518bf24989d4814680d46449250247c9ef81a27180e1c1bbd5dc451c",
+      "binary_format": "binary_archive",
+      "direct": true
+    },
+    {
+      "role": "python_distribution",
+      "name": "generic-framework",
+      "version": "1.0.0",
+      "url": "https://artifacts.example.invalid/generic_framework-1.0.0-py3-none-any.whl",
+      "filename": "generic_framework-1.0.0-py3-none-any.whl",
+      "size_bytes": 5,
+      "sha256": "ac6621607d320ea94da99c84b57be91c0db3ea709d378d54f83fddf2c8013c29",
+      "binary_format": "wheel",
+      "direct": true
+    },
+    {
+      "role": "python_distribution",
+      "name": "generic-transitive-dependency",
+      "version": "1.0.0",
+      "url": "https://artifacts.example.invalid/generic_transitive_dependency-1.0.0-py3-none-any.whl",
+      "filename": "generic_transitive_dependency-1.0.0-py3-none-any.whl",
+      "size_bytes": 10,
+      "sha256": "07885957c1673b5c616862fee13ebad4350db48dab63d93f67eecc957024c3e5",
+      "binary_format": "wheel",
+      "direct": true
+    }
+  ]
+}

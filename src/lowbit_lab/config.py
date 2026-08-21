@@ -3,7 +3,9 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
@@ -58,6 +60,27 @@ class ModalPolicy:
 
 
 @dataclass(frozen=True)
+class ActivationPolicy:
+    preview_only: bool
+    approved_plan_sha256: str | None
+    runtime_lock_sha256: str | None
+    metadata_policy_sha256: str | None
+    evaluation_lock_sha256: str | None
+    scheduling_enabled: bool
+    destructive_cleanup_enabled: bool
+
+    @property
+    def authority_hashes(self) -> dict[str, str]:
+        values = {
+            "approved_plan_sha256": self.approved_plan_sha256,
+            "runtime_lock_sha256": self.runtime_lock_sha256,
+            "metadata_policy_sha256": self.metadata_policy_sha256,
+            "evaluation_lock_sha256": self.evaluation_lock_sha256,
+        }
+        return {name: value for name, value in values.items() if value is not None}
+
+
+@dataclass(frozen=True)
 class ExperimentConfig:
     schema_version: int
     experiment_id: str
@@ -78,6 +101,7 @@ class ExperimentConfig:
     modal: ModalPolicy
     evaluations: tuple[str, ...]
     allow_cloud_upload: bool
+    activation: ActivationPolicy | None
     canonical_json: str
     sha256: str
 
@@ -94,7 +118,7 @@ def _safe_repo_relative(path_text: str, label: str) -> str:
     return path.as_posix()
 
 
-def load_experiment_config(path: Path) -> ExperimentConfig:
+def load_experiment_config(path: Path, *, activation_preview: bool = False) -> ExperimentConfig:
     try:
         raw = yaml.safe_load(path.read_text(encoding="utf-8"))
     except (OSError, yaml.YAMLError) as exc:
@@ -113,7 +137,7 @@ def load_experiment_config(path: Path) -> ExperimentConfig:
         "evaluations",
         "privacy",
     }
-    top = _closed_mapping(raw, required, "config")
+    top = _closed_mapping(raw, required | {"activation"}, "config")
     missing = required - set(top)
     if missing:
         raise ConfigError(f"config is missing keys: {sorted(missing)}")
@@ -123,10 +147,10 @@ def load_experiment_config(path: Path) -> ExperimentConfig:
         raise ConfigError("experiment_id is not a safe immutable identifier")
     if not isinstance(top["phase"], int) or isinstance(top["phase"], bool) or top["phase"] < 0:
         raise ConfigError("phase must be a non-negative integer")
-    if top["mode"] not in {"local_dry_run", "modal_dry_run"}:
-        raise ConfigError("Phase 0 mode must be local_dry_run or modal_dry_run")
+    if top["mode"] not in {"local_dry_run", "modal_dry_run", "local_activation"}:
+        raise ConfigError("mode must be local_dry_run, modal_dry_run, or local_activation")
     if top["weights_required"] is not False:
-        raise ConfigError("Phase 0 configs must set weights_required: false")
+        raise ConfigError("configs must set weights_required: false")
 
     target = _closed_mapping(
         top["target"],
@@ -250,6 +274,89 @@ def load_experiment_config(path: Path) -> ExperimentConfig:
     if privacy.get("allow_cloud_upload") is not False:
         raise ConfigError("cloud upload must remain disabled in Phase 0")
 
+    activation: ActivationPolicy | None = None
+    activation_value = top.get("activation")
+    if top["mode"] != "local_activation":
+        if activation_value is not None:
+            raise ConfigError("activation settings require mode: local_activation")
+    else:
+        raw_activation = _closed_mapping(
+            activation_value,
+            {
+                "preview_only",
+                "approved_plan_sha256",
+                "runtime_lock_sha256",
+                "metadata_policy_sha256",
+                "evaluation_lock_sha256",
+                "scheduling_enabled",
+                "destructive_cleanup_enabled",
+            },
+            "activation",
+        )
+        required_activation = {
+            "preview_only",
+            "approved_plan_sha256",
+            "runtime_lock_sha256",
+            "metadata_policy_sha256",
+            "evaluation_lock_sha256",
+            "scheduling_enabled",
+            "destructive_cleanup_enabled",
+        }
+        missing_activation = required_activation - set(raw_activation)
+        if missing_activation:
+            raise ConfigError(f"activation is missing keys: {sorted(missing_activation)}")
+        preview_only = raw_activation["preview_only"]
+        if not isinstance(preview_only, bool):
+            raise ConfigError("activation.preview_only must be boolean")
+        if raw_activation["scheduling_enabled"] is not False:
+            raise ConfigError("activation scheduling must remain disabled")
+        if raw_activation["destructive_cleanup_enabled"] is not False:
+            raise ConfigError("activation destructive cleanup must remain disabled")
+        try:
+            requested_cost = Decimal(modal["requested_cost_usd"])
+        except InvalidOperation as exc:
+            raise ConfigError("activation requested cost must be zero") from exc
+        if not requested_cost.is_finite() or requested_cost != 0:
+            raise ConfigError("activation requested cost must be zero")
+        if modal["cleanup"] != "retain":
+            raise ConfigError("activation destructive cleanup must remain disabled")
+        if modal["gpu_type"] != "none" or modal["gpu_count"] != 0:
+            raise ConfigError("activation remote GPU request must remain disabled")
+        authority_names = (
+            "approved_plan_sha256",
+            "runtime_lock_sha256",
+            "metadata_policy_sha256",
+            "evaluation_lock_sha256",
+        )
+        authority_values = {name: raw_activation[name] for name in authority_names}
+        if preview_only:
+            if any(value is not None for value in authority_values.values()):
+                raise ConfigError("preview-only activation authority hashes must be null")
+            if not activation_preview:
+                raise ConfigError("preview-only activation config cannot execute")
+        else:
+            if target_status != "configured":
+                raise ConfigError("executable activation requires a configured target")
+            invalid_hashes = [
+                name
+                for name, value in authority_values.items()
+                if not isinstance(value, str) or not SHA256_RE.fullmatch(value)
+            ]
+            if invalid_hashes:
+                raise ConfigError(
+                    f"executable activation requires lowercase SHA-256 authority hashes: "
+                    f"{sorted(invalid_hashes)}"
+                )
+        activation = ActivationPolicy(
+            preview_only=preview_only,
+            approved_plan_sha256=authority_values["approved_plan_sha256"],
+            runtime_lock_sha256=authority_values["runtime_lock_sha256"],
+            metadata_policy_sha256=authority_values["metadata_policy_sha256"],
+            evaluation_lock_sha256=authority_values["evaluation_lock_sha256"],
+            scheduling_enabled=False,
+            destructive_cleanup_enabled=False,
+        )
+
     canonical, digest = _canonical(top)
     return ExperimentConfig(
         schema_version=1,
@@ -279,9 +386,31 @@ def load_experiment_config(path: Path) -> ExperimentConfig:
         ),
         evaluations=tuple(evaluations),
         allow_cloud_upload=False,
+        activation=activation,
         canonical_json=canonical,
         sha256=digest,
     )
+
+
+def verify_activation_authority(
+    config: ExperimentConfig, observed_hashes: Mapping[str, str]
+) -> dict[str, str]:
+    if config.mode != "local_activation" or config.activation is None:
+        raise ConfigError("activation authority requires mode: local_activation")
+    if config.activation.preview_only:
+        raise ConfigError("preview-only activation config cannot execute")
+    expected = config.activation.authority_hashes
+    unknown = set(observed_hashes) - set(expected)
+    missing = set(expected) - set(observed_hashes)
+    if unknown or missing:
+        raise ConfigError("activation authority hash set does not match approved config")
+    for name, expected_digest in expected.items():
+        observed = observed_hashes[name]
+        if not isinstance(observed, str) or not SHA256_RE.fullmatch(observed):
+            raise ConfigError(f"observed activation authority hash is invalid: {name}")
+        if observed != expected_digest:
+            raise ConfigError(f"activation authority hash mismatch: {name}")
+    return dict(expected)
 
 
 def verify_sources(config: ExperimentConfig, root: Path) -> dict[str, str]:

@@ -4,7 +4,8 @@ from pathlib import Path
 import pytest
 import yaml
 
-from lowbit_lab.config import ConfigError
+from lowbit_lab.audit import begin_attempt, failure_reason
+from lowbit_lab.config import ConfigError, load_experiment_config, verify_activation_authority
 from lowbit_lab.db import DatabaseError, ResultsDatabase
 from lowbit_lab.modal_job import plan_modal_dry_run
 from lowbit_lab.runner import run_local_dry_run
@@ -74,3 +75,51 @@ def test_source_hash_failure_is_audited(tmp_path: Path) -> None:
         row = connection.execute("SELECT * FROM attempts").fetchone()
     assert row["status"] == "failed"
     assert "source hash mismatch" in row["failure_reason"]
+
+
+@pytest.mark.parametrize("failure_kind", ["missing", "changed"])
+def test_invalid_activation_authority_is_audited_before_run_link(
+    tmp_path: Path, failure_kind: str
+) -> None:
+    root = make_project(tmp_path)
+    source = yaml.safe_load((ROOT / "configs/example-local-activation.yaml").read_text())
+    source["experiment_id"] = "generic-executable-activation-v1"
+    source["activation"].update(
+        {
+            "preview_only": False,
+            "approved_plan_sha256": "1" * 64,
+            "runtime_lock_sha256": "2" * 64,
+            "metadata_policy_sha256": "3" * 64,
+            "evaluation_lock_sha256": "4" * 64,
+        }
+    )
+    source["target"].update(
+        {
+            "status": "configured",
+            "identifier": "organization/repository",
+            "revision": "a" * 40,
+            "license": "example-license",
+        }
+    )
+    if failure_kind == "missing":
+        source["activation"]["evaluation_lock_sha256"] = None
+    config_path = root / "configs/local-activation.yaml"
+    config_path.write_text(yaml.safe_dump(source), encoding="utf-8")
+    database = ResultsDatabase(root / "results/activation.sqlite")
+    database.initialize()
+    attempt_id = begin_attempt(
+        database, config_path, root, "2026-08-21T00:00:00+00:00"
+    )
+    with pytest.raises(ConfigError) as raised:
+        config = load_experiment_config(config_path)
+        observed = config.activation.authority_hashes
+        observed["evaluation_lock_sha256"] = "f" * 64
+        verify_activation_authority(config, observed)
+    database.fail_attempt(
+        attempt_id, failure_reason(raised.value), "2026-08-21T00:00:01+00:00"
+    )
+    with database.connect() as connection:
+        attempt = connection.execute("SELECT * FROM attempts").fetchone()
+        run_count = connection.execute("SELECT count(*) FROM experiments").fetchone()[0]
+    assert attempt["status"] == "failed"
+    assert run_count == 0
