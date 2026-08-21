@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "family": "memory",
+  "status": "placeholder_not_locked",
+  "seed": 3805,
+  "metrics": ["peak_vram_bytes", "peak_ram_bytes"],
+  "target_vram_bytes": 17179869184
+}
+

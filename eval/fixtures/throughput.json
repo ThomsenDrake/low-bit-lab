@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "family": "throughput",
+  "status": "placeholder_not_locked",
+  "seed": 3804,
+  "metrics": ["cold_load_seconds", "prefill_tokens_per_second", "decode_tokens_per_second"]
+}
+

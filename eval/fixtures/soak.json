@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "family": "soak",
+  "status": "placeholder_not_locked",
+  "seed": 3806,
+  "duration_minutes": 90,
+  "execute": false,
+  "failure_signals": ["repetition", "malformed_tool_call", "context_rot", "oom", "runtime_error"]
+}
+

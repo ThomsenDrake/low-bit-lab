@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "family": "tool_call_validity",
+  "status": "placeholder_not_locked",
+  "seed": 3802,
+  "cases": [{"id": "placeholder-tool-001", "schema": {"type": "object"}, "expected_valid": true}]
+}
+

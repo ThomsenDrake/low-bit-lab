@@ -1,0 +1,38 @@
+schema_version: 1
+experiment_id: example-local-dry-run-v1
+phase: 0
+mode: local_dry_run
+target:
+  status: unconfigured
+  identifier: null
+  revision: null
+  license: null
+  tokenizer_path: null
+  tokenizer_sha256: null
+weights_required: false
+context:
+  configured_tokens: 32768
+  useful_proven: false
+sources:
+  - path: PLAN.md
+    sha256: c5769271ce84b7faceac064ab00c7db0cdf03bf1c3f6f8c12e9d0c54dd276a33
+runtime:
+  name: scaffold-control-plane
+  revision: 0.1.0
+modal:
+  requested_cost_usd: "0"
+  gpu_type: none
+  gpu_count: 0
+  wall_clock_seconds: 600
+  checkpoint_path: artifacts/checkpoints/example-local-dry-run
+  cleanup: retain
+  submit: false
+evaluations:
+  - coding
+  - tool_call_validity
+  - long_context_retrieval
+  - throughput
+  - memory
+  - soak
+privacy:
+  allow_cloud_upload: false

@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "currency": "USD",
+  "total_credits": "0",
+  "automated_spend_ceiling": "0",
+  "reserve": "0",
+  "single_job_cap": "0",
+  "h100_price_per_second": "0",
+  "phase_caps": {
+    "0": "0",
+    "1": "0",
+    "2": "0",
+    "3": "0",
+    "4": "0",
+    "5": "0",
+    "6": "0",
+    "7": "0"
+  }
+}

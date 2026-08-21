@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "family": "coding",
+  "status": "placeholder_not_locked",
+  "seed": 3801,
+  "cases": [{"id": "placeholder-code-001", "prompt": "Return a deterministic function body.", "executable": false}]
+}
+

@@ -1,0 +1,17 @@
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+*.py[cod]
+results/*.sqlite*
+artifacts/checkpoints/
+artifacts/**/*.bin
+artifacts/**/*.gguf
+artifacts/**/*.safetensors
+artifacts/**/*.pt
+artifacts/**/*.pth
+artifacts/**/*.ckpt
+.env
+.env.*
+!.env.example
+
