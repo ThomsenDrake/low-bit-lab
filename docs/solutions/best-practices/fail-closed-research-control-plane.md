@@ -49,6 +49,18 @@ Use compare-and-set state changes inside `BEGIN IMMEDIATE` transactions for rese
 
 Evidence formulas must be versioned and hashed. Memory and cold-path timing evidence should name the method digest and bind the exact evaluation context; otherwise a valid-looking report can be replayed against a larger context or a different accounting method. Promotion-threshold compilation remains a separate authority step and should be mechanically unavailable until implemented and approved.
 
+Cross-platform receipts must verify in the environment that owns the executable. Windows cannot
+reliably resolve a Linux virtual-environment symlink stored on a mounted filesystem. In that case,
+run an isolated WSL probe against the exact repository-relative interpreter, require the probe to
+prove its resolved executable stays below the expected repository root, and use the digest computed
+by that probe. Do not weaken the check to a path-string comparison or silently skip executable
+lineage.
+
+Provider retry configuration and provider crash recovery are separate controls. A declared retry
+count of zero does not bound provider-managed container rescheduling. Cost containment must instead
+be backed by independently observed provider evidence, such as a hard workspace cap, and unknown
+billing remains audit-blocked.
+
 ## Why This Matters
 
 These invariants make silent policy drift, config mutation, preflight failure loss, and concurrent overspend observable or impossible. They also let later agents resume from durable state without inheriting hidden judgment from an earlier session.

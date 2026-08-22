@@ -385,6 +385,7 @@ def _reserve(
             "safety_evidence_sha256": None,
         },
         "gates": {
+            "formula_authority_path": None,
             "memory_fit_evidence_path": None,
             "memory_fit_evidence_sha256": None,
             "cold_path_time_evidence_path": None,

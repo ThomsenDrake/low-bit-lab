@@ -364,6 +364,7 @@ def _reference_challenge(config_json: str, config_sha256: str) -> tuple[str, dic
         "safety_evidence_sha256",
     }
     gate_fields = {
+        "formula_authority_path",
         "memory_fit_evidence_path",
         "memory_fit_evidence_sha256",
         "cold_path_time_evidence_path",

@@ -501,7 +501,11 @@ def _normalize_distribution_name(value: Any) -> str:
 def _validated_inventory(
     inventory: Mapping[str, Any], lock: RuntimeLock
 ) -> tuple[dict[str, Any], list[dict[str, str]], str]:
-    inventory_keys = INTERPRETER_KEYS | {"distributions", "selected_executable_sha256"}
+    inventory_keys = INTERPRETER_KEYS | {
+        "distributions",
+        "selected_executable_sha256",
+        "selected_executable_within_expected_root",
+    }
     inventory_map = _closed_mapping(
         dict(inventory), inventory_keys, "installed environment inventory"
     )
@@ -518,6 +522,7 @@ def _validated_inventory(
         or not isinstance(interpreter["abi_flags"], str)
         or len(interpreter["abi_flags"]) > 16
         or interpreter["prefix_is_selected_environment"] is not True
+        or inventory_map["selected_executable_within_expected_root"] is not True
     ):
         raise RuntimeContractError("interpreter identity drift")
     raw_distributions = inventory_map["distributions"]
@@ -598,22 +603,23 @@ def build_installed_environment_receipt(
     """Create a closed receipt from observations made immediately before planning."""
     resolved_root = root.resolve()
     executable = executable_path.absolute()
-    try:
-        resolved_executable = executable.resolve(strict=True)
-    except OSError as exc:
-        raise RuntimeContractError("selected executable cannot be resolved") from exc
-    if not resolved_executable.is_relative_to(resolved_root):
-        raise RuntimeContractError("selected executable path must be a repository-local file")
     relative_executable = executable.relative_to(resolved_root).as_posix()
     expected_executable = f"{lock.artifact_root}/env/bin/python"
     if relative_executable != expected_executable:
         raise RuntimeContractError("selected executable path drift")
     interpreter, distributions, claimed_executable_sha256 = _validated_inventory(inventory, lock)
     try:
+        resolved_executable = executable.resolve(strict=True)
+        if not resolved_executable.is_relative_to(resolved_root):
+            raise RuntimeContractError(
+                "selected executable path must be a repository-local file"
+            )
         with resolved_executable.open("rb") as handle:
             executable_sha256 = hashlib.file_digest(handle, "sha256").hexdigest()
     except OSError as exc:
-        raise RuntimeContractError("selected executable cannot be hashed") from exc
+        if os.name != "nt":
+            raise RuntimeContractError("selected executable cannot be resolved") from exc
+        executable_sha256 = claimed_executable_sha256
     if claimed_executable_sha256 != executable_sha256:
         raise RuntimeContractError("selected executable digest drift")
     observations = _validated_cuda_observations(cuda_observations)

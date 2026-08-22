@@ -54,8 +54,13 @@ for distribution in importlib.metadata.distributions():
         raise RuntimeError("distribution name missing")
     items.append({"name": re.sub(r"[-_.]+", "-", name).lower(), "version": distribution.version})
 items.sort(key=lambda item: item["name"])
-selected_prefix = os.path.dirname(os.path.dirname(os.path.realpath(sys.executable)))
-with open(os.path.realpath(sys.executable), "rb") as executable:
+selected_executable = os.path.realpath(sys.executable)
+selected_prefix = os.path.dirname(os.path.dirname(selected_executable))
+expected_root = os.path.realpath(sys.argv[1])
+selected_executable_within_expected_root = (
+    os.path.commonpath((selected_executable, expected_root)) == expected_root
+)
+with open(selected_executable, "rb") as executable:
     selected_executable_sha256 = hashlib.file_digest(executable, "sha256").hexdigest()
 print(json.dumps({
     "implementation": platform.python_implementation(),
@@ -63,6 +68,7 @@ print(json.dumps({
     "cache_tag": sys.implementation.cache_tag,
     "abi_flags": getattr(sys, "abiflags", ""),
     "prefix_is_selected_environment": os.path.realpath(sys.prefix) == selected_prefix,
+    "selected_executable_within_expected_root": selected_executable_within_expected_root,
     "selected_executable_sha256": selected_executable_sha256,
     "distributions": items,
 }, sort_keys=True))
@@ -403,6 +409,7 @@ def run_environment_inventory_probe(
     if not executable.is_relative_to(resolved_root):
         raise RuntimeContractError("inventory Python must be repository-local")
     converted: str | None = None
+    converted_root: str | None = None
     if os.name == "nt" and runner is subprocess.run:
         try:
             converted = subprocess.run(
@@ -420,9 +427,29 @@ def run_environment_inventory_probe(
                 text=True,
                 timeout=5,
             ).stdout.strip()
+            converted_root = subprocess.run(
+                [
+                    "wsl.exe",
+                    "-d",
+                    "Ubuntu",
+                    "--",
+                    "wslpath",
+                    "-a",
+                    str(resolved_root).replace("\\", "/"),
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            ).stdout.strip()
         except (OSError, subprocess.SubprocessError) as exc:
             raise RuntimeContractError("inventory WSL path conversion failed") from exc
-        if not converted.startswith("/") or "\n" in converted:
+        if (
+            not converted.startswith("/")
+            or "\n" in converted
+            or not converted_root.startswith("/")
+            or "\n" in converted_root
+        ):
             raise RuntimeContractError("inventory WSL path is invalid")
         command = [
             "wsl.exe",
@@ -438,12 +465,19 @@ def run_environment_inventory_probe(
             "-I",
             "-c",
             ENVIRONMENT_INVENTORY_SCRIPT,
+            converted_root,
         ]
         environment = None
     else:
         if not executable.is_file():
             raise RuntimeContractError("inventory Python is missing")
-        command = [str(executable), "-I", "-c", ENVIRONMENT_INVENTORY_SCRIPT]
+        command = [
+            str(executable),
+            "-I",
+            "-c",
+            ENVIRONMENT_INVENTORY_SCRIPT,
+            str(resolved_root),
+        ]
         environment = {"PATH": "", "PYTHONNOUSERSITE": "1", "PYTHONHASHSEED": "0"}
     try:
         process = runner(

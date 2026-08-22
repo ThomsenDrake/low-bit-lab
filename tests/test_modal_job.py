@@ -17,6 +17,7 @@ from lowbit_lab.modal_job import (
     redact_provider_output,
     validate_reference_approval,
 )
+from lowbit_lab.reference_gates import A100_80GB_BYTES, MEMORY_FORMULA, TIME_FORMULA
 
 
 def _budget(path: Path, plan_sha256: str) -> None:
@@ -99,6 +100,7 @@ def _config(tmp_path: Path, **changes: object) -> Path:
             "safety_evidence_sha256": None,
         },
         "gates": {
+            "formula_authority_path": None,
             "memory_fit_evidence_path": None,
             "memory_fit_evidence_sha256": None,
             "cold_path_time_evidence_path": None,
@@ -138,6 +140,25 @@ def test_reference_preview_derives_gates_from_hashed_evidence(tmp_path: Path) ->
     path = _config(tmp_path)
     reports = tmp_path / "reports" / "local"
     reports.mkdir(parents=True)
+    formula = reports / "formula.json"
+    formula.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "kind": "reference_formula_authority",
+                "authority_id": "reference-resource-accounting",
+                "authority_version": "1.0.0",
+                "memory_formula": MEMORY_FORMULA,
+                "time_formula": TIME_FORMULA,
+                "maximum_gpu_memory_bytes": A100_80GB_BYTES,
+                "maximum_context_tokens": 32768,
+                "timeout_seconds": 2700,
+                "approval_status": "pending_human_review",
+            }
+        ),
+        encoding="utf-8",
+    )
+    formula_sha256 = hashlib.sha256(formula.read_bytes()).hexdigest()
     memory = reports / "memory.json"
     memory.write_text(
         json.dumps(
@@ -152,7 +173,7 @@ def test_reference_preview_derives_gates_from_hashed_evidence(tmp_path: Path) ->
                 "kv_cache_bytes": 20,
                 "allocator_reserve_bytes": 5,
                 "usable_gpu_memory_bytes": 90,
-                "method_sha256": "f" * 64,
+                "method_sha256": formula_sha256,
             }
         ),
         encoding="utf-8",
@@ -170,14 +191,15 @@ def test_reference_preview_derives_gates_from_hashed_evidence(tmp_path: Path) ->
                 "load_seconds": 400,
                 "evaluation_seconds": 600,
                 "safety_margin_seconds": 200,
-                "method_sha256": "f" * 64,
+                "method_sha256": formula_sha256,
             }
         ),
         encoding="utf-8",
     )
     raw = yaml.safe_load(path.read_text(encoding="utf-8"))
-    raw["inputs"]["formula_authority_sha256"] = "f" * 64
+    raw["inputs"]["formula_authority_sha256"] = formula_sha256
     raw["gates"] = {
+        "formula_authority_path": "reports/local/formula.json",
         "memory_fit_evidence_path": "reports/local/memory.json",
         "memory_fit_evidence_sha256": hashlib.sha256(memory.read_bytes()).hexdigest(),
         "cold_path_time_evidence_path": "reports/local/time.json",

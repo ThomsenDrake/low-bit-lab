@@ -7,8 +7,12 @@ from pathlib import Path
 import pytest
 
 from lowbit_lab.reference_gates import (
+    A100_80GB_BYTES,
+    MEMORY_FORMULA,
+    TIME_FORMULA,
     ReferenceGateError,
     verify_cold_path_time_evidence,
+    verify_formula_authority,
     verify_memory_fit_evidence,
     verify_provider_safety_evidence,
 )
@@ -18,6 +22,40 @@ def _write(path: Path, value: object) -> str:
     content = (json.dumps(value, sort_keys=True) + "\n").encode()
     path.write_bytes(content)
     return hashlib.sha256(content).hexdigest()
+
+
+def test_formula_authority_is_closed_exact_and_reviewable(tmp_path: Path) -> None:
+    authority = {
+        "schema_version": 1,
+        "kind": "reference_formula_authority",
+        "authority_id": "reference-resource-accounting",
+        "authority_version": "1.0.0",
+        "memory_formula": MEMORY_FORMULA,
+        "time_formula": TIME_FORMULA,
+        "maximum_gpu_memory_bytes": A100_80GB_BYTES,
+        "maximum_context_tokens": 262144,
+        "timeout_seconds": 2700,
+        "approval_status": "pending_human_review",
+    }
+    path = tmp_path / "formula.json"
+    digest = _write(path, authority)
+    result = verify_formula_authority(
+        path,
+        expected_sha256=digest,
+        expected_maximum_context_tokens=262144,
+        expected_timeout_seconds=2700,
+    )
+    assert result["verified"] is True
+    assert result["human_approved"] is False
+    authority["approval_status"] = "self_asserted"
+    digest = _write(path, authority)
+    with pytest.raises(ReferenceGateError, match="approval status"):
+        verify_formula_authority(
+            path,
+            expected_sha256=digest,
+            expected_maximum_context_tokens=262144,
+            expected_timeout_seconds=2700,
+        )
 
 
 def test_memory_fit_is_arithmetic_and_inventory_bound(tmp_path: Path) -> None:

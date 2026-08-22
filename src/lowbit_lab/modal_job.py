@@ -31,6 +31,7 @@ from lowbit_lab.reference_contract import REFERENCE_RESOURCES
 from lowbit_lab.reference_gates import (
     ReferenceGateError,
     verify_cold_path_time_evidence,
+    verify_formula_authority,
     verify_memory_fit_evidence,
     verify_provider_safety_evidence,
 )
@@ -235,6 +236,7 @@ def load_reference_job_config(path: Path, *, root: Path) -> ReferenceJobConfig:
     gates = _closed(
         top["gates"],
         {
+            "formula_authority_path",
             "memory_fit_evidence_path",
             "memory_fit_evidence_sha256",
             "cold_path_time_evidence_path",
@@ -254,6 +256,19 @@ def load_reference_job_config(path: Path, *, root: Path) -> ReferenceJobConfig:
             gates[path_name] = _repo_path(root, evidence_path, path_name, "reports/local/")
             if not isinstance(evidence_digest, str) or SHA256_RE.fullmatch(evidence_digest) is None:
                 raise ReferenceJobError(f"{digest_name} must be lowercase SHA-256")
+    formula_path = gates["formula_authority_path"]
+    formula_sha = inputs["formula_authority_sha256"]
+    if (formula_path is None) != (formula_sha is None):
+        raise ReferenceJobError(
+            "formula authority path and SHA-256 must be supplied together"
+        )
+    if formula_path is not None:
+        gates["formula_authority_path"] = _repo_path(
+            root,
+            formula_path,
+            "formula_authority_path",
+            "reports/local/",
+        )
     approval_path = top["approval_artifact_path"]
     if approval_path is not None:
         approval_path = _repo_path(
@@ -303,8 +318,30 @@ def plan_reference_preview(config: ReferenceJobConfig, *, root: Path) -> dict[st
         blockers.append("reviewed_commit_mismatch")
     if current_runtime["control_plane_sha256"] != config.inputs["control_plane_sha256"]:
         blockers.append("control_plane_hash_mismatch")
-    if config.inputs["formula_authority_sha256"] is None:
+    formula_verified = False
+    formula_human_approved = False
+    formula_sha = config.inputs["formula_authority_sha256"]
+    formula_path = config.gates["formula_authority_path"]
+    if isinstance(formula_sha, str) and isinstance(formula_path, str):
+        try:
+            formula_result = verify_formula_authority(
+                root / formula_path,
+                expected_sha256=formula_sha,
+                expected_maximum_context_tokens=int(
+                    config.inputs["evaluation_max_context_tokens"]
+                ),
+                expected_timeout_seconds=int(config.resources["timeout_seconds"]),
+            )
+            formula_verified = bool(formula_result["verified"])
+            formula_human_approved = bool(formula_result["human_approved"])
+        except ReferenceGateError:
+            formula_verified = False
+    if formula_sha is None:
         blockers.append("formula_authority_missing")
+    elif not formula_verified:
+        blockers.append("formula_authority_unverified")
+    elif not formula_human_approved:
+        blockers.append("formula_authority_review_pending")
     provider_safety_proven = False
     provider_path = config.provider["safety_evidence_path"]
     provider_sha = config.provider["safety_evidence_sha256"]
@@ -328,11 +365,11 @@ def plan_reference_preview(config: ReferenceJobConfig, *, root: Path) -> dict[st
     memory_fit_proven = False
     memory_path = config.gates["memory_fit_evidence_path"]
     memory_sha = config.gates["memory_fit_evidence_sha256"]
-    formula_sha = config.inputs["formula_authority_sha256"]
+    verified_formula_sha = formula_sha if formula_verified else None
     if (
         isinstance(memory_path, str)
         and isinstance(memory_sha, str)
-        and isinstance(formula_sha, str)
+        and isinstance(verified_formula_sha, str)
     ):
         try:
             memory_fit_proven = verify_memory_fit_evidence(
@@ -340,7 +377,7 @@ def plan_reference_preview(config: ReferenceJobConfig, *, root: Path) -> dict[st
                 expected_sha256=memory_sha,
                 expected_inventory_sha256=str(config.inputs["weight_inventory_sha256"]),
                 expected_tensor_bytes=int(config.inputs["weight_inventory_tensor_bytes"]),
-                expected_method_sha256=formula_sha,
+                expected_method_sha256=verified_formula_sha,
                 expected_evaluation_lock_sha256=str(
                     config.inputs["evaluation_lock_sha256"]
                 ),
@@ -355,13 +392,17 @@ def plan_reference_preview(config: ReferenceJobConfig, *, root: Path) -> dict[st
     time_budget_proven = False
     time_path = config.gates["cold_path_time_evidence_path"]
     time_sha = config.gates["cold_path_time_evidence_sha256"]
-    if isinstance(time_path, str) and isinstance(time_sha, str) and isinstance(formula_sha, str):
+    if (
+        isinstance(time_path, str)
+        and isinstance(time_sha, str)
+        and isinstance(verified_formula_sha, str)
+    ):
         try:
             time_budget_proven = verify_cold_path_time_evidence(
                 root / time_path,
                 expected_sha256=time_sha,
                 timeout_seconds=int(config.resources["timeout_seconds"]),
-                expected_method_sha256=formula_sha,
+                expected_method_sha256=verified_formula_sha,
                 expected_evaluation_lock_sha256=str(
                     config.inputs["evaluation_lock_sha256"]
                 ),
@@ -431,7 +472,9 @@ def _verify_reference_authorities(config: ReferenceJobConfig, *, root: Path) -> 
         evaluation_raw = json.loads(paths["evaluation_lock_path"].read_text(encoding="utf-8"))
         fixture_root = paths["evaluation_fixture_root"]
         fixture_bytes = {
-            fixture["fixture_id"]: (fixture_root / f"{fixture['family']}.json").read_bytes()
+            fixture["fixture_id"]: (
+                fixture_root / f"{fixture['fixture_id']}.json"
+            ).read_bytes()
             for fixture in evaluation_raw["fixtures"]
         }
         evaluation_lock = validate_pending_evaluation_lock(

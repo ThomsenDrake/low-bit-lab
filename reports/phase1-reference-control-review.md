@@ -49,6 +49,19 @@ Scope: the target-neutral public control plane for U1–U7. U8 submission remain
 
 ## Remaining blockers by design
 
-- The local evaluation fixture authority is still placeholder material and cannot pass validation.
-- No approved formula authority, provider-safety evidence, memory-fit evidence, cold-path-time evidence, or U8 approval exists.
+- Source, evaluation, inventory, and installed-runtime authority can be cross-verified without
+  transferring weight shards.
+- The resource-accounting formula remains pending human review.
+- No authenticated provider-cap/billing evidence, conservative memory-fit evidence,
+  cold-path-time evidence, or U8 approval exists.
 - No model weights have been downloaded or transferred, and no remote job has been submitted.
+
+## Evidence-remediation addendum
+
+- Evaluation fixtures are resolved by immutable fixture ID, not by family alias.
+- Windows delegates executable hashing to the isolated WSL inventory probe only when Windows cannot
+  resolve the Linux symlink; the probe must first attest that the resolved executable remains under
+  the expected repository root.
+- Provider documentation states that container crashes may be rescheduled independently of
+  configured function retries. Therefore `retries: 0` is not evidence of one billable attempt; a
+  separately observed hard workspace cap is still required.

@@ -16,6 +16,17 @@ class ReferenceGateError(ValueError):
     pass
 
 
+MEMORY_FORMULA = (
+    "tensor_bytes+runtime_overhead_bytes+kv_cache_bytes+allocator_reserve_bytes"
+    "<=usable_gpu_memory_bytes"
+)
+TIME_FORMULA = (
+    "transfer_seconds+verification_seconds+load_seconds+evaluation_seconds"
+    "+safety_margin_seconds<=timeout_seconds"
+)
+A100_80GB_BYTES = 80 * 1024**3
+
+
 @dataclass(frozen=True)
 class GateResult:
     proven: bool
@@ -74,6 +85,57 @@ def _load(path: Path, expected_sha256: str) -> tuple[Mapping[str, Any], str]:
     return raw, actual
 
 
+def verify_formula_authority(
+    path: Path,
+    *,
+    expected_sha256: str,
+    expected_maximum_context_tokens: int,
+    expected_timeout_seconds: int,
+) -> dict[str, object]:
+    raw, digest = _load(path, expected_sha256)
+    authority = _closed(
+        raw,
+        {
+            "schema_version",
+            "kind",
+            "authority_id",
+            "authority_version",
+            "memory_formula",
+            "time_formula",
+            "maximum_gpu_memory_bytes",
+            "maximum_context_tokens",
+            "timeout_seconds",
+            "approval_status",
+        },
+        "formula authority",
+    )
+    if authority["schema_version"] != 1 or authority["kind"] != "reference_formula_authority":
+        raise ReferenceGateError("unsupported formula authority")
+    if (
+        authority["authority_id"] != "reference-resource-accounting"
+        or authority["authority_version"] != "1.0.0"
+        or authority["memory_formula"] != MEMORY_FORMULA
+        or authority["time_formula"] != TIME_FORMULA
+    ):
+        raise ReferenceGateError("formula authority method is unsupported")
+    if (
+        _positive_int(authority["maximum_gpu_memory_bytes"], "maximum_gpu_memory_bytes")
+        != A100_80GB_BYTES
+        or _positive_int(authority["maximum_context_tokens"], "maximum_context_tokens")
+        != expected_maximum_context_tokens
+        or _positive_int(authority["timeout_seconds"], "timeout_seconds")
+        != expected_timeout_seconds
+    ):
+        raise ReferenceGateError("formula authority envelope mismatch")
+    if authority["approval_status"] not in {"pending_human_review", "approved"}:
+        raise ReferenceGateError("formula authority approval status is unknown")
+    return {
+        "verified": True,
+        "human_approved": authority["approval_status"] == "approved",
+        "evidence_sha256": digest,
+    }
+
+
 def verify_memory_fit_evidence(
     path: Path,
     *,
@@ -127,7 +189,7 @@ def verify_memory_fit_evidence(
     available = _positive_int(evidence["usable_gpu_memory_bytes"], "usable_gpu_memory_bytes")
     if _sha256(evidence["method_sha256"], "method_sha256") != expected_method_sha256:
         raise ReferenceGateError("memory-fit method authority mismatch")
-    if available > 80 * 1024**3:
+    if available > A100_80GB_BYTES:
         raise ReferenceGateError("usable GPU memory exceeds the A100-80GB hard envelope")
     return GateResult(required <= available, digest, required, available)
 

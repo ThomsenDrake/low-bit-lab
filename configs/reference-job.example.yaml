@@ -42,6 +42,7 @@ provider:
   safety_evidence_path: null
   safety_evidence_sha256: null
 gates:
+  formula_authority_path: null
   memory_fit_evidence_path: null
   memory_fit_evidence_sha256: null
   cold_path_time_evidence_path: null

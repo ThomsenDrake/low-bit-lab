@@ -427,6 +427,7 @@ def _installed_inventory() -> dict[str, object]:
         "cache_tag": "cpython-312",
         "abi_flags": "",
         "prefix_is_selected_environment": True,
+        "selected_executable_within_expected_root": True,
         "selected_executable_sha256": hashlib.sha256(b"python-executable").hexdigest(),
         "distributions": [{"name": "example-dependency", "version": "1.0.0"}],
     }
