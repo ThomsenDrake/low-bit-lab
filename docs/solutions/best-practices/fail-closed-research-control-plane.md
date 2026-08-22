@@ -1,6 +1,7 @@
 ---
 title: Fail-closed boundaries for a research control plane
 date: 2026-08-21
+last_updated: 2026-08-21
 category: best-practices
 module: experiment-control-plane
 problem_type: best_practice
@@ -24,6 +25,22 @@ Encode frozen values independently in code, then require the machine-readable po
 
 Runtime lineage must describe the executing tree even before the first commit. Record both dirty state and a deterministic digest over the control-plane sources, lockfile, policy, and entrypoints. Keep configured capabilities separate from demonstrated results: a context length, GPU name, or package install is not proof of useful long-context operation.
 
+Bind every decision-bearing local artifact into activation authority, including the runtime
+selection input. A retry must not reuse completed evidence unless the implementation binds the
+full preceding evidence chain. Until that chain exists, rerunning all bounded local gates is the
+safer and simpler contract.
+
+Apply the same closed URL policy to the lock, every redirect, and the final response. Reject
+credentials, query strings, fragments, and non-default ports. Scan Git path names as well as blob
+and commit content before publication, because a private identifier can leak through either
+surface. Persist only bounded, sanitized HTTP facts; raw server-controlled headers do not belong
+in durable evidence.
+
+Framework readiness should verify the exact Python and direct framework versions from the runtime
+lock. It still does not prove model inference or kernel compatibility. A scheduled controller needs
+an additional installed-environment receipt because version agreement alone does not attest every
+installed byte.
+
 Paid execution needs a second boundary beyond authorization: atomically reserve worst-case cost from resource count and timeout before submission, settle actual cost at terminal state, and block overlap. A plan-only wrapper should contain no provider SDK or submit call until that transaction exists.
 
 ## Why This Matters
@@ -41,6 +58,8 @@ These invariants make silent policy drift, config mutation, preflight failure lo
 - `src/lowbit_lab/constants.py` freezes zero-spend defaults independently of editable policy files.
 - `src/lowbit_lab/db.py` binds experiment IDs to config digests and stores pre-validation attempts.
 - `src/lowbit_lab/runtime.py` records dirty state plus a deterministic control-plane digest.
+- `src/lowbit_lab/activation.py` binds decision artifacts and reruns all bounded gates.
+- `src/lowbit_lab/publication.py` scans Git paths and contents before public publication.
 
 ## Related
 

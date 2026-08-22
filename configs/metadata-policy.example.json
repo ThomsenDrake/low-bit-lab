@@ -1,0 +1,25 @@
+{
+  "cache_root": "artifacts/local/provenance",
+  "limits": {
+    "aggregate_bytes": 33554432,
+    "per_file_bytes": 25165824
+  },
+  "network": {
+    "allowed_hosts": [
+      "metadata.example.invalid"
+    ],
+    "connect_timeout_seconds": 3,
+    "metadata_format": "normalized_v1",
+    "metadata_url": "https://metadata.example.invalid/api/repositories/org/example-model/revision/0000000000000000000000000000000000000000",
+    "read_timeout_seconds": 5
+  },
+  "repository": {
+    "architectures": [
+      "ExampleForCausalLM"
+    ],
+    "identifier": "org/example-model",
+    "license": "Apache-2.0",
+    "revision": "0000000000000000000000000000000000000000"
+  },
+  "schema_version": 1
+}

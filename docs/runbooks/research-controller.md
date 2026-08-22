@@ -19,3 +19,43 @@ After manual approval, a local project task may invoke the same manual cycle eve
 ## State machine
 
 Attempts use `received -> linked|failed`. Runs use `created -> validated -> running -> completed|failed`. Terminal states do not transition. A new attempt receives a new run ID and retains the prior failure.
+
+## Phase 1 local activation
+
+The activation entry point is `lowbit-activate`. It is preview-only unless `--apply` is
+present. Preview reads and validates the ignored local authority bundle, reports repository-relative
+authority paths and hashes, lists the exact gate order and stop conditions, and reports both the
+runtime and metadata byte caps. It does not initialize SQLite, call a runtime adapter, install
+anything, or open a network connection.
+
+```powershell
+uv run lowbit-activate `
+  --root . `
+  --config configs/local/phase1-activation.yaml `
+  --db results/local/phase1-activation.sqlite `
+  --publication-manifest configs/local/publication.yaml `
+  --approved-plan docs/plans/local/phase1-approved.md `
+  --runtime-decision configs/local/phase1-runtime-decision.json `
+  --runtime-lock configs/local/phase1-runtime-lock.json `
+  --metadata-policy configs/local/phase1-metadata-policy.json `
+  --evaluation-lock eval/local/phase1-evaluation-lock.json
+```
+
+Review the JSON before any apply invocation. `--apply` authorizes only the local adapters already
+supplied to the activation pipeline; an absent adapter fails closed. It does not authorize weight
+downloads, uploads, cloud submission, scheduling, destructive cleanup, global installation, or
+nonzero spend. Runtime, provenance, and evaluation adapters are dependency-injected so tests and
+controllers can use deterministic implementations without hidden network or installation behavior.
+
+The durable order is publication, configuration/authority, zero budget, runtime decision, verified
+local runtime, runtime probe, provenance, and evaluation lock. Publication, configuration, and
+budget failures close the attempt before any run is linked. Once linked, every child gate and its
+parent must become `completed` or `failed`; a failure marks all unvisited children failed without
+calling later adapters. A pending evaluation lock may complete activation, but records
+`promotion_authorized:false` and does not authorize candidate execution.
+
+Each session owns a lease and heartbeat. At startup, expired nonterminal activation sessions and
+their child gates are reconciled to `failed` with the sanitized interruption reason. Retrying always
+creates a new run ID and reruns publication, configuration, budget, and preceding local guards.
+Only completed downstream evidence with identical input and authority bindings may be referenced;
+binding drift invalidates dependent evidence for that activation lineage.
