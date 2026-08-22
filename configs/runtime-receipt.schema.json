@@ -1,0 +1,75 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/low-bit-lab/runtime-receipt.schema.json",
+  "title": "Installed environment receipt",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "runtime_lock_sha256",
+    "selected_executable",
+    "selected_executable_sha256",
+    "interpreter",
+    "installed_distributions",
+    "package_tree",
+    "cuda_driver_observations"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "runtime_lock_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "selected_executable": {"type": "string", "pattern": "^artifacts/local/runtime/.+/bin/python$"},
+    "selected_executable_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "interpreter": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["implementation", "python_version", "cache_tag", "abi_flags", "prefix_is_selected_environment"],
+      "properties": {
+        "implementation": {"const": "CPython"},
+        "python_version": {"type": "string", "pattern": "^3\\.12\\.[0-9]+$"},
+        "cache_tag": {"type": "string", "pattern": "^cpython-312$"},
+        "abi_flags": {"type": "string", "maxLength": 16},
+        "prefix_is_selected_environment": {"const": true}
+      }
+    },
+    "installed_distributions": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "version"],
+        "properties": {
+          "name": {"type": "string", "pattern": "^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$"},
+          "version": {"type": "string", "minLength": 1, "maxLength": 128}
+        }
+      }
+    },
+    "package_tree": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["root", "file_count", "size_bytes", "sha256"],
+      "properties": {
+        "root": {"type": "string", "pattern": "^artifacts/local/runtime/.+/site-packages$"},
+        "file_count": {"type": "integer", "minimum": 1},
+        "size_bytes": {"type": "integer", "minimum": 1},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "cuda_driver_observations": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "driver_version", "cuda_build_version", "device_capability", "gpu_memory_bytes"],
+      "properties": {
+        "status": {"const": "observed"},
+        "driver_version": {"type": "string", "minLength": 1, "maxLength": 64},
+        "cuda_build_version": {"type": "string", "minLength": 1, "maxLength": 64},
+        "device_capability": {
+          "type": "array",
+          "prefixItems": [{"type": "integer", "minimum": 0}, {"type": "integer", "minimum": 0}],
+          "items": false
+        },
+        "gpu_memory_bytes": {"type": "integer", "minimum": 1}
+      }
+    }
+  }
+}

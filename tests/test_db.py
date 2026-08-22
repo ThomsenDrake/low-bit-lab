@@ -1,3 +1,4 @@
+import hashlib
 import json
 from pathlib import Path
 
@@ -298,7 +299,7 @@ def test_populated_v2_database_migrates_additively_without_losing_u2_rows(
         connection.executescript(_v2_schema())
     ResultsDatabase(path).initialize()
     with sqlite3.connect(path) as connection:
-        assert connection.execute("SELECT max(version) FROM schema_info").fetchone()[0] == 3
+        assert connection.execute("SELECT max(version) FROM schema_info").fetchone()[0] == 4
         assert connection.execute("SELECT count(*) FROM experiments").fetchone()[0] == 1
         columns = {
             row[1] for row in connection.execute("PRAGMA table_info('experiments')").fetchall()
@@ -323,3 +324,233 @@ def test_failed_v2_to_v3_migration_rolls_back_added_columns(tmp_path: Path) -> N
         }
         assert "owner_id" not in columns
         assert connection.execute("SELECT count(*) FROM experiments").fetchone()[0] == 1
+
+
+def _reserve(
+    database: ResultsDatabase,
+    *,
+    suffix: str,
+    amount: str = "4.00",
+    attach_approval: bool = True,
+    tamper_config_after_challenge: bool = False,
+    hardware: dict[str, object] | None = None,
+) -> None:
+    inputs = {
+        "weight_inventory_sha256": "1" * 64,
+        "weight_inventory_tensor_bytes": 55,
+        "provenance_manifest_sha256": "2" * 64,
+        "runtime_receipt_sha256": "3" * 64,
+        "evaluation_lock_sha256": "4" * 64,
+        "evaluation_max_context_tokens": 32768,
+        "formula_authority_sha256": "5" * 64,
+        "reviewed_commit_sha256": "6" * 40,
+        "control_plane_sha256": "7" * 64,
+    }
+    raw = {
+        "schema_version": 1,
+        "kind": "modal_reference_preview",
+        "experiment_id": f"reference-{suffix}",
+        "approved_plan_path": "docs/plans/local/approved.md",
+        "approved_plan_sha256": "8" * 64,
+        "budget_policy_path": "configs/local/reference-budget.json",
+        "inputs": inputs,
+        "authority_files": {
+            "weight_inventory_path": None,
+            "source_shard_metadata_path": None,
+            "provenance_manifest_path": None,
+            "runtime_lock_path": None,
+            "runtime_receipt_path": None,
+            "evaluation_lock_path": None,
+            "evaluation_fixture_root": None,
+        },
+        "resources": {
+            "gpu_type": "A100-80GB",
+            "gpu_count": 1,
+            "cpu_cores": 8,
+            "memory_gib": 96,
+            "ephemeral_disk_gib": 90,
+            "timeout_seconds": 2700,
+            "startup_timeout_seconds": None,
+            "retries": 0,
+        },
+        "provider": {
+            "submit": False,
+            "scheduling_enabled": False,
+            "cloud_upload": False,
+            "mounts": [],
+            "volumes": [],
+            "secrets": [],
+            "credentials_source": "provider_local",
+            "safety_evidence_path": None,
+            "safety_evidence_sha256": None,
+        },
+        "gates": {
+            "memory_fit_evidence_path": None,
+            "memory_fit_evidence_sha256": None,
+            "cold_path_time_evidence_path": None,
+            "cold_path_time_evidence_sha256": None,
+        },
+        "approval_artifact_path": None,
+    }
+    config_json = json.dumps(raw, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    config_sha256 = hashlib.sha256(config_json.encode()).hexdigest()
+    challenge_material = dict(raw)
+    challenge_material.pop("approval_artifact_path")
+    challenge = hashlib.sha256(
+        json.dumps(
+            challenge_material, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+        ).encode()
+    ).hexdigest()
+    if tamper_config_after_challenge:
+        raw["experiment_id"] = f"tampered-{suffix}"
+        config_json = json.dumps(raw, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+        config_sha256 = hashlib.sha256(config_json.encode()).hexdigest()
+    approval = (suffix[-1] if suffix else "b") * 64
+    if not approval[0].isalnum() or approval[0].lower() not in "abcdef0123456789":
+        approval = "b" * 63 + str(len(suffix) % 10)
+    database.register_reference_challenge(
+        challenge_sha256=challenge,
+        packet_sha256="c" * 64,
+        created_at="2026-08-22T00:00:00+00:00",
+    )
+    if attach_approval:
+        database.attach_reference_approval(
+            challenge_sha256=challenge,
+            approval_digest=approval,
+            expires_at="2026-08-22T01:00:00+00:00",
+        )
+    database.create_attempt(
+        attempt_id=f"attempt-{suffix}",
+        config_path="configs/local/reference.yaml",
+        raw_config_sha256="a" * 64,
+        started_at="2026-08-22T00:00:00+00:00",
+    )
+    database.reserve_reference_run(
+        reservation_id=f"reservation-{suffix}",
+        attempt_id=f"attempt-{suffix}",
+        run_id=f"run-{suffix}",
+        experiment_id=f"reference-{suffix}",
+        config_sha256=config_sha256,
+        config_json=config_json,
+        source_hashes={
+            name: value
+            for name, value in inputs.items()
+            if name not in {"weight_inventory_tensor_bytes", "evaluation_max_context_tokens"}
+            and value is not None
+        },
+        runtime={"receipt_sha256": inputs["runtime_receipt_sha256"]},
+        hardware=hardware or {},
+        requested_cost_usd=amount,
+        phase_cap_usd="4.00",
+        total_cap_usd="4.00",
+        single_job_cap_usd="4.00",
+        idempotency_key=f"idempotency-{suffix}",
+        owner_id="owner",
+        lease_expires_at="2026-08-22T00:05:00+00:00",
+        started_at="2026-08-22T00:00:00+00:00",
+        challenge_sha256=challenge,
+        approval_digest=approval,
+    )
+
+
+def test_reference_reservation_is_atomic_and_prevents_cap_overlap(tmp_path: Path) -> None:
+    database = ResultsDatabase(tmp_path / "results.sqlite")
+    database.initialize()
+    _reserve(database, suffix="one")
+    with pytest.raises(DatabaseError, match="cap"):
+        _reserve(database, suffix="two")
+    assert database.get_attempt("attempt-two")["status"] == "received"
+    assert database.get_reservation("reservation-one")["status"] == "reserved"
+    with database.connect() as connection:
+        assert connection.execute(
+            "SELECT count(*) FROM experiments WHERE run_id = 'run-two'"
+        ).fetchone()[0] == 0
+
+
+def test_reference_reservation_requires_unconsumed_unexpired_approval(tmp_path: Path) -> None:
+    database = ResultsDatabase(tmp_path / "results.sqlite")
+    database.initialize()
+    with pytest.raises(DatabaseError, match="approval"):
+        _reserve(database, suffix="missing", attach_approval=False)
+    assert database.get_attempt("attempt-missing")["status"] == "received"
+
+
+def test_reference_reservation_binds_config_cap_expiry_and_private_data(tmp_path: Path) -> None:
+    database = ResultsDatabase(tmp_path / "results.sqlite")
+    database.initialize()
+    with pytest.raises(DatabaseError, match="bound to the canonical config"):
+        _reserve(database, suffix="drift", tamper_config_after_challenge=True)
+
+    database = ResultsDatabase(tmp_path / "cap.sqlite")
+    database.initialize()
+    with pytest.raises(DatabaseError, match="USD 4.00"):
+        _reserve(database, suffix="cap", amount="3.99")
+
+    database = ResultsDatabase(tmp_path / "private.sqlite")
+    database.initialize()
+    with pytest.raises(DatabaseError, match="credential-shaped"):
+        _reserve(database, suffix="private", hardware={"api_key": "do-not-store"})
+
+    database = ResultsDatabase(tmp_path / "expiry.sqlite")
+    database.initialize()
+    database.register_reference_challenge(
+        challenge_sha256="a" * 64,
+        packet_sha256="b" * 64,
+        created_at="2026-08-22T00:00:00+00:00",
+    )
+    with pytest.raises(DatabaseError, match="timezone-aware"):
+        database.attach_reference_approval(
+            challenge_sha256="a" * 64,
+            approval_digest="c" * 64,
+            expires_at="2026-08-22T01:00:00",
+        )
+
+
+def test_reference_settlement_is_exactly_once_and_provider_attributed(tmp_path: Path) -> None:
+    database = ResultsDatabase(tmp_path / "results.sqlite")
+    database.initialize()
+    _reserve(database, suffix="settle")
+    database.mark_reservation_submitted(
+        "reservation-settle",
+        provider_job_id="job-1",
+        app_identity="isolated-app-1",
+        occurred_at="2026-08-22T00:01:00+00:00",
+    )
+    database.mark_settlement_pending(
+        "reservation-settle", occurred_at="2026-08-22T00:02:00+00:00"
+    )
+    database.settle_reservation(
+        "reservation-settle",
+        actual_cost_usd="2.50",
+        settlement_identity="billing-export-row-1",
+        occurred_at="2026-08-22T01:00:00+00:00",
+    )
+    reservation = database.get_reservation("reservation-settle")
+    assert reservation["status"] == "settled"
+    assert reservation["provider_actual_cost_usd"] == "2.50"
+    with pytest.raises(DatabaseError, match="cannot settle"):
+        database.settle_reservation(
+            "reservation-settle",
+            actual_cost_usd="2.50",
+            settlement_identity="billing-export-row-1",
+            occurred_at="2026-08-22T01:00:01+00:00",
+        )
+
+
+def test_stale_reference_reservations_release_only_before_submission(tmp_path: Path) -> None:
+    database = ResultsDatabase(tmp_path / "results.sqlite")
+    database.initialize()
+    _reserve(database, suffix="pre")
+    released = database.reconcile_stale_reservations(now="2026-08-22T00:10:00+00:00")
+    assert released == {"released": ["reservation-pre"], "audit_blocked": []}
+    assert database.get_run("run-pre")["status"] == "failed"
+
+    _reserve(database, suffix="post")
+    database.mark_reservation_submitted(
+        "reservation-post",
+        provider_job_id="job-post",
+        app_identity="isolated-app-post",
+        occurred_at="2026-08-22T00:01:00+00:00",
+    )
+    blocked = database.reconcile_stale_reservations(now="2026-08-22T00:10:00+00:00")
+    assert blocked == {"released": [], "audit_blocked": ["reservation-post"]}

@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "python_version": "3.12.12",
+  "packages": {
+    "modal": "1.5.3",
+    "safetensors": "0.8.0",
+    "torch": "2.13.0+cu130",
+    "transformers": "5.15.1"
+  },
+  "source_execution": {
+    "safetensors_only": true,
+    "trust_remote_code": false
+  },
+  "status": "declared_unproven"
+}

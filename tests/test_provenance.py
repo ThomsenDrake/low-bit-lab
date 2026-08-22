@@ -21,11 +21,177 @@ from lowbit_lab.provenance import (
     _AllowlistedRedirects,
     load_metadata_policy,
     parse_metadata_policy,
+    parse_weight_inventory,
     verify_metadata_repository,
 )
 
 HOST = "metadata.example.invalid"
 REVISION = "1" * 40
+
+
+def _weight_index(*paths: str, total_size: int | float = 200) -> bytes:
+    return json.dumps(
+        {
+            "metadata": {"total_size": total_size},
+            "weight_map": {f"layer.{index}": path for index, path in enumerate(paths)},
+        },
+        sort_keys=True,
+    ).encode()
+
+
+def _weight_inventory(index_bytes: bytes) -> dict[str, object]:
+    digest = hashlib.sha256(index_bytes).hexdigest()
+    shards = ["model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors"]
+    return {
+        "schema_version": 1,
+        "source": {"identifier": "org/example-model", "revision": REVISION},
+        "bindings": {
+            "provenance_manifest_sha256": "2" * 64,
+            "tokenizer_sha256": "3" * 64,
+            "runtime_lock_sha256": "4" * 64,
+            "evaluation_lock_sha256": "5" * 64,
+            "source_index_sha256": digest,
+        },
+        "limits": {
+            "max_shards": 8,
+            "per_shard_bytes": 1_000,
+            "aggregate_bytes": 2_000,
+        },
+        "index": {
+            "path": "model.safetensors.index.json",
+            "sha256": digest,
+            "tensor_bytes": 200,
+        },
+        "shards": [
+            {
+                "path": path,
+                "size_bytes": 110,
+                "lfs_sha256": str(index + 6) * 64,
+                "content_sha256": str(index + 6) * 64,
+            }
+            for index, path in enumerate(shards)
+        ],
+        "aggregate_bytes": 220,
+    }
+
+
+def _expected_weight_bindings(raw: dict[str, object]) -> dict[str, str]:
+    bindings = raw["bindings"]
+    assert isinstance(bindings, dict)
+    return {str(key): str(value) for key, value in bindings.items()}
+
+
+def _source_weight_shards(raw: dict[str, object]) -> dict[str, tuple[int, str]]:
+    shards = raw["shards"]
+    assert isinstance(shards, list)
+    return {
+        str(shard["path"]): (int(shard["size_bytes"]), str(shard["lfs_sha256"])) for shard in shards
+    }
+
+
+def test_weight_inventory_binds_exact_index_shards_without_body_transfer() -> None:
+    paths = ("model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors")
+    index_bytes = _weight_index(*paths)
+    raw = _weight_inventory(index_bytes)
+
+    inventory = parse_weight_inventory(
+        raw,
+        source_index_bytes=index_bytes,
+        source_shards=_source_weight_shards(raw),
+        expected_bindings=_expected_weight_bindings(raw),
+    )
+
+    assert inventory.source_revision == REVISION
+    assert tuple(shard.path for shard in inventory.shards) == paths
+    assert inventory.aggregate_bytes == 220
+    assert inventory.index_tensor_bytes == 200
+    assert inventory.bindings.source_index_sha256 == hashlib.sha256(index_bytes).hexdigest()
+    assert len(inventory.sha256) == 64
+
+
+def test_weight_inventory_accepts_integral_float_from_real_index_metadata() -> None:
+    paths = ("model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors")
+    index_bytes = _weight_index(*paths, total_size=200.0)
+    raw = _weight_inventory(index_bytes)
+    inventory = parse_weight_inventory(
+        raw,
+        source_index_bytes=index_bytes,
+        source_shards=_source_weight_shards(raw),
+    )
+    assert inventory.index_tensor_bytes == 200
+
+
+@pytest.mark.parametrize(
+    ("mutation", "match"),
+    [
+        (lambda raw: raw.update({"unknown": True}), "unknown keys"),
+        (lambda raw: raw["source"].update({"revision": "main"}), "immutable"),
+        (
+            lambda raw: raw["shards"].append(dict(raw["shards"][0])),
+            "duplicate",
+        ),
+        (lambda raw: raw["shards"].pop(), "missing index-declared"),
+        (
+            lambda raw: raw["shards"].append(
+                {
+                    "path": "model-00003-of-00003.safetensors",
+                    "size_bytes": 1,
+                    "lfs_sha256": "a" * 64,
+                    "content_sha256": "a" * 64,
+                }
+            ),
+            "not declared by the source index",
+        ),
+        (lambda raw: raw["shards"][0].update({"path": "weights.bin"}), "safetensors"),
+        (lambda raw: raw["shards"][0].update({"size_bytes": 1_001}), "per-shard"),
+        (lambda raw: raw.update({"aggregate_bytes": 219}), "aggregate"),
+        (
+            lambda raw: raw["shards"][0].update({"content_sha256": "f" * 64}),
+            "LFS/content",
+        ),
+        (lambda raw: raw["index"].update({"tensor_bytes": 201}), "tensor byte"),
+    ],
+)
+def test_weight_inventory_fails_closed_before_transfer(mutation: object, match: str) -> None:
+    index_bytes = _weight_index(
+        "model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors"
+    )
+    raw = _weight_inventory(index_bytes)
+    source_shards = _source_weight_shards(raw)
+    mutation(raw)
+
+    with pytest.raises(ProvenanceError, match=match):
+        parse_weight_inventory(raw, source_index_bytes=index_bytes, source_shards=source_shards)
+
+
+def test_weight_inventory_rejects_index_and_external_binding_mismatch() -> None:
+    index_bytes = _weight_index(
+        "model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors"
+    )
+    raw = _weight_inventory(index_bytes)
+    source_shards = _source_weight_shards(raw)
+    expected = _expected_weight_bindings(raw)
+    expected["runtime_lock_sha256"] = "f" * 64
+
+    with pytest.raises(ProvenanceError, match="runtime_lock_sha256 binding mismatch"):
+        parse_weight_inventory(
+            raw,
+            source_index_bytes=index_bytes,
+            expected_bindings=expected,
+            source_shards=source_shards,
+        )
+
+    changed_index = _weight_index(
+        "model-00001-of-00002.safetensors",
+        "model-00002-of-00002.safetensors",
+        total_size=201,
+    )
+    with pytest.raises(ProvenanceError, match="source index SHA-256 mismatch"):
+        parse_weight_inventory(raw, source_index_bytes=changed_index, source_shards=source_shards)
+
+    source_shards["model-00001-of-00002.safetensors"] = (111, "6" * 64)
+    with pytest.raises(ProvenanceError, match="source metadata mismatch"):
+        parse_weight_inventory(raw, source_index_bytes=index_bytes, source_shards=source_shards)
 
 
 def _policy(**overrides: object) -> dict[str, object]:
@@ -252,9 +418,7 @@ def test_huggingface_api_adapter_builds_root_inventory_without_target_code(
 
     assert result["repository"]["revision"] == REVISION
     assert result["tokenizer"]["root_only"] is True
-    assert all(
-        entry["path"] != "model-00001-of-00002.safetensors" for entry in result["files"]
-    )
+    assert all(entry["path"] != "model-00001-of-00002.safetensors" for entry in result["files"])
 
 
 def test_nested_text_config_records_configured_context_only(tmp_path: Path) -> None:

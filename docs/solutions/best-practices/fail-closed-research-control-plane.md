@@ -1,7 +1,7 @@
 ---
 title: Fail-closed boundaries for a research control plane
 date: 2026-08-21
-last_updated: 2026-08-21
+last_updated: 2026-08-22
 category: best-practices
 module: experiment-control-plane
 problem_type: best_practice
@@ -43,6 +43,12 @@ installed byte.
 
 Paid execution needs a second boundary beyond authorization: atomically reserve worst-case cost from resource count and timeout before submission, settle actual cost at terminal state, and block overlap. A plan-only wrapper should contain no provider SDK or submit call until that transaction exists.
 
+Treat digest-shaped values as claims, not verified lineage. Recompute approval challenges from the canonical config, verify every authority path against its declared hash, and cross-bind evidence to the inventory, runtime receipt, evaluation lock, reviewed commit, and resource envelope. Provider-safety flags must point to hashed evidence; a self-asserted boolean is not an independent gate.
+
+Use compare-and-set state changes inside `BEGIN IMMEDIATE` transactions for reservation settlement and stale-run reconciliation. Reserve the exact worst-case cap, consume approval and reserve cost atomically, and move unknown submitted work to an audit-blocked state rather than releasing its reservation. Avoid SQLite `executescript` inside an explicit migration transaction because its implicit commit behavior can defeat the intended atomic boundary.
+
+Evidence formulas must be versioned and hashed. Memory and cold-path timing evidence should name the method digest and bind the exact evaluation context; otherwise a valid-looking report can be replayed against a larger context or a different accounting method. Promotion-threshold compilation remains a separate authority step and should be mechanically unavailable until implemented and approved.
+
 ## Why This Matters
 
 These invariants make silent policy drift, config mutation, preflight failure loss, and concurrent overspend observable or impossible. They also let later agents resume from durable state without inheriting hidden judgment from an earlier session.
@@ -57,9 +63,11 @@ These invariants make silent policy drift, config mutation, preflight failure lo
 
 - `src/lowbit_lab/constants.py` freezes zero-spend defaults independently of editable policy files.
 - `src/lowbit_lab/db.py` binds experiment IDs to config digests and stores pre-validation attempts.
+- `src/lowbit_lab/db.py` atomically consumes approval challenges, reserves exact worst-case cost, and settles reservations with compare-and-set transitions.
 - `src/lowbit_lab/runtime.py` records dirty state plus a deterministic control-plane digest.
 - `src/lowbit_lab/activation.py` binds decision artifacts and reruns all bounded gates.
 - `src/lowbit_lab/publication.py` scans Git paths and contents before public publication.
+- `src/lowbit_lab/reference_gates.py` verifies method-bound memory and timing evidence without enabling submission.
 
 ## Related
 

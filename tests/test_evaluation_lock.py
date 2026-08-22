@@ -22,7 +22,7 @@ METRICS = {
     "long_context_retrieval": ["retrieval_accuracy"],
     "throughput": ["decode_tokens_per_second"],
     "memory": ["peak_vram_bytes"],
-    "soak": ["failure_free_rate"],
+    "soak": ["failure_free_rate", "runtime_errors", "completed_minutes"],
 }
 
 
@@ -57,17 +57,26 @@ def _raw_lock(materials: dict[str, bytes] | None = None) -> dict[str, object]:
             }
         )
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "suite_id": "generic-evaluation-suite",
-        "suite_version": "1.0.0",
+        "suite_version": "2.0.0",
         "fixtures": fixtures,
+        "fixture_order": [fixture["fixture_id"] for fixture in fixtures],
         "scorer": {
             "id": "deterministic-json-scorer",
             "version": "1.0.0",
             "sha256": "a" * 64,
             "runtime": {"id": "python", "version": "3.12", "sha256": "b" * 64},
         },
-        "metrics": METRICS,
+        "generation": {
+            "batch_size": 1,
+            "do_sample": False,
+            "temperature": "0",
+            "top_p": "1",
+            "response_caps_tokens": {family: 128 for family in EVALUATION_FAMILIES},
+            "response_caps_bytes": {family: 4096 for family in EVALUATION_FAMILIES},
+        },
+        "metrics": copy.deepcopy(METRICS),
         "aggregation": {"method": "arithmetic_mean", "missing": "fail"},
         "confidence": {
             "method": "bootstrap_percentile",
@@ -77,6 +86,8 @@ def _raw_lock(materials: dict[str, bytes] | None = None) -> dict[str, object]:
         },
         "context": {
             "configured_tokens": 8192,
+            "ladder_tokens": [8192],
+            "stop_on_first_failure": True,
             "runtime_initialized": False,
             "usefulness_proven": False,
             "retrieval_evidence_sha256": None,
@@ -117,7 +128,7 @@ def _bytes_by_id(raw: dict[str, object], materials: dict[str, bytes]) -> dict[st
 
 def _extension(pending_sha256: str) -> dict[str, object]:
     extension: dict[str, object] = {
-        "schema_version": 1,
+        "schema_version": 2,
         "base_lock_sha256": pending_sha256,
         "authority_id": "human-approved-threshold-contract",
         "authority_version": "1.0.0",
@@ -131,8 +142,15 @@ def _extension(pending_sha256: str) -> dict[str, object]:
         },
         "aggregation": {"method": "arithmetic_mean", "missing": "fail"},
         "thresholds": [
-            {"family": family, "metric": METRICS[family][0], "operator": "gte", "value": 0.5}
+            {
+                "family": family,
+                "metric": metric,
+                "context_level_tokens": 8192,
+                "operator": "gte",
+                "value": 0.5,
+            }
             for family in EVALUATION_FAMILIES
+            for metric in METRICS[family]
         ],
     }
     payload = {
@@ -179,15 +197,11 @@ def test_valid_six_family_lock_is_reproducible_and_pending() -> None:
         (lambda raw: raw["fixtures"][1].pop("seed"), "missing keys"),
         (lambda raw: raw["fixtures"][1].update({"scorer_id": "drifted"}), "scorer"),
         (
-            lambda raw: raw["fixtures"][1].update(
-                {"fixture_id": raw["fixtures"][0]["fixture_id"]}
-            ),
+            lambda raw: raw["fixtures"][1].update({"fixture_id": raw["fixtures"][0]["fixture_id"]}),
             "fixture_id",
         ),
         (
-            lambda raw: raw["fixtures"][1].update(
-                {"version": raw["fixtures"][0]["version"]}
-            ),
+            lambda raw: raw["fixtures"][1].update({"version": raw["fixtures"][0]["version"]}),
             "version",
         ),
         (lambda raw: raw["fixtures"][1].update({"sha256": raw["fixtures"][0]["sha256"]}), "sha256"),
@@ -274,17 +288,37 @@ def test_context_usefulness_requires_runtime_and_retrieval_evidence() -> None:
         validate_pending_evaluation_lock(raw, fixture_bytes=_bytes_by_id(raw, materials))
 
 
-def test_compatible_authority_creates_new_full_identity() -> None:
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        (
+            lambda raw: raw["metrics"].update({"soak": ["failure_free_rate"]}),
+            "soak metrics",
+        ),
+        (
+            lambda raw: raw["context"].update({"ladder_tokens": [8192, 4096]}),
+            "context ladder",
+        ),
+        (lambda raw: raw.update({"fixture_order": []}), "fixture_order"),
+        (lambda raw: raw["generation"].update({"do_sample": True}), "generation"),
+    ],
+)
+def test_reference_protocol_dimensions_fail_closed(mutation, message: str) -> None:
+    materials = _materials()
+    raw = _raw_lock(materials)
+    mutation(raw)
+    with pytest.raises(EvaluationLockError, match=message):
+        validate_pending_evaluation_lock(raw, fixture_bytes=_bytes_by_id(raw, materials))
+
+
+def test_u1_u7_cannot_create_candidate_authority() -> None:
     materials = _materials()
     raw = _raw_lock(materials)
     pending = validate_pending_evaluation_lock(raw, fixture_bytes=_bytes_by_id(raw, materials))
-    full = apply_threshold_authority(pending, _extension(pending.sha256))
-
-    assert full.base_lock_sha256 == pending.sha256
-    assert full.sha256 != pending.sha256
-    assert full.status == "locked"
-    assert full.promotion_authorized is True
-    assert_candidate_execution_allowed(full)
+    with pytest.raises(EvaluationLockError, match="not implemented or authorized"):
+        apply_threshold_authority(pending, _extension(pending.sha256))
+    with pytest.raises(CandidateExecutionBlocked):
+        assert_candidate_execution_allowed(pending)
 
 
 def test_full_lock_cannot_be_constructed_or_tampered_with_directly() -> None:
@@ -309,6 +343,11 @@ def test_full_lock_cannot_be_constructed_or_tampered_with_directly() -> None:
         (lambda ext: ext["scorer"].update({"version": "2.0.0"}), "scorer"),
         (lambda ext: ext["aggregation"].update({"method": "maximum"}), "aggregation"),
         (lambda ext: ext["thresholds"][0].update({"operator": "approximately"}), "operator"),
+        (
+            lambda ext: ext["thresholds"][0].update({"context_level_tokens": 4096}),
+            "context level",
+        ),
+        (lambda ext: ext["thresholds"].pop(), "cover every declared metric"),
         (lambda ext: ext.update({"approved_by_human": False}), "human approval"),
         (lambda ext: ext.update({"authority_sha256": "f" * 64}), "content hash"),
     ],
@@ -321,7 +360,7 @@ def test_incompatible_authority_cannot_reinterpret_pending_lock(mutation, messag
     mutation(extension)
     original_sha256 = pending.sha256
 
-    with pytest.raises(EvaluationLockError, match=message):
+    with pytest.raises(EvaluationLockError, match="not implemented or authorized"):
         apply_threshold_authority(pending, extension)
 
     assert pending.sha256 == original_sha256
@@ -337,7 +376,9 @@ def test_public_example_is_closed_and_pending() -> None:
         "suite_id",
         "suite_version",
         "fixtures",
+        "fixture_order",
         "scorer",
+        "generation",
         "metrics",
         "aggregation",
         "confidence",

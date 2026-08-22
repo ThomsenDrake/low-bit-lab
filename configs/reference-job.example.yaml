@@ -1,0 +1,49 @@
+schema_version: 1
+kind: modal_reference_preview
+experiment_id: example-reference-preview-v1
+approved_plan_path: docs/plans/local/approved-reference-plan.md
+approved_plan_sha256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+budget_policy_path: configs/local/reference-budget.json
+inputs:
+  weight_inventory_sha256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  weight_inventory_tensor_bytes: 1
+  provenance_manifest_sha256: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+  runtime_receipt_sha256: cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+  evaluation_lock_sha256: dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+  evaluation_max_context_tokens: 1
+  formula_authority_sha256: null
+  reviewed_commit_sha256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  control_plane_sha256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+authority_files:
+  weight_inventory_path: null
+  source_shard_metadata_path: null
+  provenance_manifest_path: null
+  runtime_lock_path: null
+  runtime_receipt_path: null
+  evaluation_lock_path: null
+  evaluation_fixture_root: null
+resources:
+  gpu_type: A100-80GB
+  gpu_count: 1
+  cpu_cores: 8
+  memory_gib: 96
+  ephemeral_disk_gib: 90
+  timeout_seconds: 2700
+  startup_timeout_seconds: null
+  retries: 0
+provider:
+  submit: false
+  scheduling_enabled: false
+  cloud_upload: false
+  mounts: []
+  volumes: []
+  secrets: []
+  credentials_source: provider_local
+  safety_evidence_path: null
+  safety_evidence_sha256: null
+gates:
+  memory_fit_evidence_path: null
+  memory_fit_evidence_sha256: null
+  cold_path_time_evidence_path: null
+  cold_path_time_evidence_sha256: null
+approval_artifact_path: null

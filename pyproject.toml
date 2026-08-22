@@ -16,6 +16,9 @@ dev = [
   "pytest==8.4.1",
   "ruff==0.12.9",
 ]
+remote = [
+  "modal==1.5.3",
+]
 
 [project.scripts]
 lowbit-db = "lowbit_lab.db:main"
