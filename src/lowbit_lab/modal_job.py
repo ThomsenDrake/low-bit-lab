@@ -30,6 +30,9 @@ from lowbit_lab.provenance import parse_weight_inventory
 from lowbit_lab.reference_contract import (
     APPROVED_PROVIDER_AMENDMENT_PATH,
     APPROVED_PROVIDER_AMENDMENT_SHA256,
+    APPROVED_TRUST_OVERRIDE_PLAN_PATH,
+    APPROVED_TRUST_OVERRIDE_PLAN_SHA256,
+    APPROVED_TRUST_OVERRIDE_STATEMENT_SHA256,
     ORIGINAL_APPROVED_PLAN_PATH,
     ORIGINAL_APPROVED_PLAN_SHA256,
     PROVIDER_APPROVAL_OBSERVATION_MAX_AGE_SECONDS,
@@ -44,6 +47,8 @@ from lowbit_lab.reference_gates import (
     verify_provider_billing_authority,
     verify_provider_constraint_contract,
     verify_provider_observation_receipt,
+    verify_provider_observation_receipt_for_trust_override,
+    verify_provider_observation_trust_override,
 )
 from lowbit_lab.runtime import (
     hardware_metadata,
@@ -60,6 +65,8 @@ REFERENCE_FIELDS = {
     "original_approved_plan_sha256",
     "approved_amendment_path",
     "approved_amendment_sha256",
+    "approved_trust_override_plan_path",
+    "approved_trust_override_plan_sha256",
     "budget_policy_path",
     "inputs",
     "authority_files",
@@ -81,6 +88,8 @@ class ReferenceJobConfig:
     original_approved_plan_sha256: str
     approved_amendment_path: str
     approved_amendment_sha256: str
+    approved_trust_override_plan_path: str
+    approved_trust_override_plan_sha256: str
     budget_policy_path: str
     inputs: dict[str, str | int | None]
     authority_files: dict[str, str | None]
@@ -102,6 +111,7 @@ class ReferenceJobConfig:
             weight_inventory_sha256=str(self.inputs["weight_inventory_sha256"]),
             evaluation_lock_sha256=str(self.inputs["evaluation_lock_sha256"]),
             formula_authority_sha256=str(formula_authority_sha256),
+            trust_override_sha256=self.provider["trust_override_sha256"],
         )
 
 
@@ -171,7 +181,7 @@ def load_reference_job_config(path: Path, *, root: Path) -> ReferenceJobConfig:
         raise ReferenceJobError(f"cannot read reference config: {exc}") from exc
     _reject_credential_fields(raw)
     top = _closed(raw, REFERENCE_FIELDS, "reference config")
-    if top["schema_version"] != 2 or top["kind"] != "modal_reference_preview":
+    if top["schema_version"] != 3 or top["kind"] != "modal_reference_preview":
         raise ReferenceJobError("unsupported reference config")
     if not isinstance(top["experiment_id"], str) or not top["experiment_id"]:
         raise ReferenceJobError("reference experiment_id is required")
@@ -201,6 +211,19 @@ def load_reference_job_config(path: Path, *, root: Path) -> ReferenceJobConfig:
         raise ReferenceJobError("approved amendment hash is not accepted")
     if _file_sha256(root / amendment_path) != amendment_sha:
         raise ReferenceJobError("approved amendment hash mismatch")
+    trust_plan_path = _repo_path(
+        root,
+        top["approved_trust_override_plan_path"],
+        "approved_trust_override_plan_path",
+        "docs/plans/local/",
+    )
+    trust_plan_sha = top["approved_trust_override_plan_sha256"]
+    if trust_plan_path != APPROVED_TRUST_OVERRIDE_PLAN_PATH:
+        raise ReferenceJobError("approved trust override plan path is not accepted")
+    if trust_plan_sha != APPROVED_TRUST_OVERRIDE_PLAN_SHA256:
+        raise ReferenceJobError("approved trust override plan hash is not accepted")
+    if _file_sha256(root / trust_plan_path) != trust_plan_sha:
+        raise ReferenceJobError("approved trust override plan hash mismatch")
     budget_path = _repo_path(
         root, top["budget_policy_path"], "budget_policy_path", "configs/local/"
     )
@@ -263,6 +286,10 @@ def load_reference_job_config(path: Path, *, root: Path) -> ReferenceJobConfig:
         "constraint_contract_sha256",
         "observation_receipt_path",
         "observation_receipt_sha256",
+        "observation_screenshot_sha256",
+        "trust_override_path",
+        "trust_override_sha256",
+        "human_approval_statement_sha256",
         "billing_authority_path",
         "billing_authority_sha256",
         "authoritative_report_identity_sha256",
@@ -284,6 +311,10 @@ def load_reference_job_config(path: Path, *, root: Path) -> ReferenceJobConfig:
         digest = provider[digest_name]
         if not isinstance(digest, str) or SHA256_RE.fullmatch(digest) is None:
             raise ReferenceJobError(f"{digest_name} must be lowercase SHA-256")
+    if not isinstance(provider["observation_screenshot_sha256"], str) or SHA256_RE.fullmatch(
+        provider["observation_screenshot_sha256"]
+    ) is None:
+        raise ReferenceJobError("observation_screenshot_sha256 must be lowercase SHA-256")
     if (
         not isinstance(provider["authoritative_report_identity_sha256"], str)
         or SHA256_RE.fullmatch(provider["authoritative_report_identity_sha256"]) is None
@@ -299,6 +330,7 @@ def load_reference_job_config(path: Path, *, root: Path) -> ReferenceJobConfig:
         ("constraint_contract_path", "constraint_contract_sha256"),
         ("observation_receipt_path", "observation_receipt_sha256"),
         ("billing_authority_path", "billing_authority_sha256"),
+        ("trust_override_path", "trust_override_sha256"),
     ):
         evidence_path = provider[path_name]
         evidence_sha = provider[digest_name]
@@ -312,6 +344,19 @@ def load_reference_job_config(path: Path, *, root: Path) -> ReferenceJobConfig:
             )
             if not isinstance(evidence_sha, str) or SHA256_RE.fullmatch(evidence_sha) is None:
                 raise ReferenceJobError(f"{digest_name} must be lowercase SHA-256")
+    if (provider["trust_override_sha256"] is None) != (
+        provider["human_approval_statement_sha256"] is None
+    ):
+        raise ReferenceJobError(
+            "trust override and human approval statement must be supplied together"
+        )
+    if provider["human_approval_statement_sha256"] is not None and (
+        not isinstance(provider["human_approval_statement_sha256"], str)
+        or SHA256_RE.fullmatch(provider["human_approval_statement_sha256"]) is None
+        or provider["human_approval_statement_sha256"]
+        != APPROVED_TRUST_OVERRIDE_STATEMENT_SHA256
+    ):
+        raise ReferenceJobError("human_approval_statement_sha256 must be lowercase SHA-256")
     gates = _closed(
         top["gates"],
         {
@@ -366,6 +411,8 @@ def load_reference_job_config(path: Path, *, root: Path) -> ReferenceJobConfig:
         original_approved_plan_sha256=original_plan_sha,
         approved_amendment_path=amendment_path,
         approved_amendment_sha256=amendment_sha,
+        approved_trust_override_plan_path=trust_plan_path,
+        approved_trust_override_plan_sha256=trust_plan_sha,
         budget_policy_path=budget_path,
         inputs=dict(inputs),
         authority_files=dict(authority_files),
@@ -424,6 +471,8 @@ def plan_reference_preview(config: ReferenceJobConfig, *, root: Path) -> dict[st
     elif not formula_human_approved:
         blockers.append("formula_authority_review_pending")
     provider_concurrency_proven = False
+    provider_constraint_authority = "unproven"
+    trust_override_accepted = False
     provider_billing_scope_proven = False
     constraint_path = config.provider["constraint_contract_path"]
     constraint_sha = config.provider["constraint_contract_sha256"]
@@ -431,6 +480,7 @@ def plan_reference_preview(config: ReferenceJobConfig, *, root: Path) -> dict[st
     observation_sha = config.provider["observation_receipt_sha256"]
     billing_path = config.provider["billing_authority_path"]
     billing_sha = config.provider["billing_authority_sha256"]
+    constraint: dict[str, object] | None = None
     if all(
         isinstance(value, str)
         for value in (constraint_path, constraint_sha, observation_path, observation_sha)
@@ -464,8 +514,63 @@ def plan_reference_preview(config: ReferenceJobConfig, *, root: Path) -> dict[st
             provider_concurrency_proven = bool(
                 constraint["proven"] and observation["proven"]
             )
+            provider_constraint_authority = "fresh_observation"
         except ReferenceGateError:
-            provider_concurrency_proven = False
+            trust_path = config.provider["trust_override_path"]
+            trust_sha = config.provider["trust_override_sha256"]
+            statement_sha = config.provider["human_approval_statement_sha256"]
+            if isinstance(constraint, dict) and all(
+                isinstance(value, str) for value in (trust_path, trust_sha, statement_sha)
+            ):
+                try:
+                    observation = verify_provider_observation_receipt_for_trust_override(
+                        root / str(observation_path),
+                        expected_sha256=str(observation_sha),
+                        expected_contract_sha256=str(constraint_sha),
+                        expected_workspace_scope_sha256=str(
+                            config.provider["workspace_scope_sha256"]
+                        ),
+                        expected_environment_scope_sha256=str(
+                            config.provider["environment_scope_sha256"]
+                        ),
+                        expected_amendment_sha256=config.approved_amendment_sha256,
+                        validated_at=_now_datetime(),
+                    )
+                    override = verify_provider_observation_trust_override(
+                        root / str(trust_path),
+                        expected_sha256=str(trust_sha),
+                        expected_original_plan_sha256=config.original_approved_plan_sha256,
+                        expected_provider_amendment_sha256=config.approved_amendment_sha256,
+                        expected_trust_override_plan_sha256=(
+                            config.approved_trust_override_plan_sha256
+                        ),
+                        expected_contract_sha256=str(constraint_sha),
+                        expected_observation_receipt_sha256=str(observation_sha),
+                        expected_screenshot_sha256=str(
+                            config.provider["observation_screenshot_sha256"]
+                        ),
+                        expected_workspace_scope_sha256=str(
+                            config.provider["workspace_scope_sha256"]
+                        ),
+                        expected_environment_scope_sha256=str(
+                            config.provider["environment_scope_sha256"]
+                        ),
+                        expected_human_statement_sha256=(
+                            APPROVED_TRUST_OVERRIDE_STATEMENT_SHA256
+                        ),
+                    )
+                    provider_concurrency_proven = bool(
+                        constraint["proven"]
+                        and observation["proven"]
+                        and observation["screenshot_sha256"]
+                        == config.provider["observation_screenshot_sha256"]
+                        and override["proven"]
+                    )
+                    trust_override_accepted = provider_concurrency_proven
+                    if provider_concurrency_proven:
+                        provider_constraint_authority = "human_trust_override"
+                except ReferenceGateError:
+                    provider_concurrency_proven = False
     if isinstance(billing_path, str) and isinstance(billing_sha, str):
         try:
             billing_authority = verify_provider_billing_authority(
@@ -538,7 +643,7 @@ def plan_reference_preview(config: ReferenceJobConfig, *, root: Path) -> dict[st
     if not time_budget_proven:
         blockers.append("cold_path_time_budget_unproven")
     approval_valid = False
-    residual_risk_accepted = False
+    residual_risk_accepted = trust_override_accepted
     if config.approval_artifact_path is not None:
         try:
             approval = validate_reference_approval(
@@ -546,6 +651,9 @@ def plan_reference_preview(config: ReferenceJobConfig, *, root: Path) -> dict[st
                 expected_challenge_sha256=config.challenge_sha256,
                 expected_original_plan_sha256=config.original_approved_plan_sha256,
                 expected_amendment_sha256=config.approved_amendment_sha256,
+                expected_trust_override_plan_sha256=(
+                    config.approved_trust_override_plan_sha256
+                ),
                 expected_provider={
                     name: config.provider[name]
                     for name in (
@@ -556,6 +664,7 @@ def plan_reference_preview(config: ReferenceJobConfig, *, root: Path) -> dict[st
                         "environment_scope_sha256",
                         "authoritative_report_identity_sha256",
                         "billing_completeness_delay_seconds",
+                        "trust_override_sha256",
                     )
                 },
                 now=_now_datetime(),
@@ -563,7 +672,7 @@ def plan_reference_preview(config: ReferenceJobConfig, *, root: Path) -> dict[st
             approval_valid = approval["reviewed_commit_sha256"] == config.inputs[
                 "reviewed_commit_sha256"
             ]
-            residual_risk_accepted = approval_valid
+            residual_risk_accepted = residual_risk_accepted or approval_valid
         except ReferenceJobError:
             approval_valid = False
     if not residual_risk_accepted:
@@ -571,7 +680,7 @@ def plan_reference_preview(config: ReferenceJobConfig, *, root: Path) -> dict[st
     if not approval_valid:
         blockers.append("execution_approval_missing")
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "kind": "modal_reference_preview",
         "submit": False,
         "scheduling_enabled": False,
@@ -586,6 +695,7 @@ def plan_reference_preview(config: ReferenceJobConfig, *, root: Path) -> dict[st
         "challenge_sha256": config.challenge_sha256,
         "config_sha256": config.sha256,
         "reference_execution_scope_sha256": config.reference_execution_scope_sha256,
+        "provider_constraint_authority": provider_constraint_authority,
         "blockers": blockers,
     }
 
@@ -681,6 +791,7 @@ def validate_reference_approval(
     expected_challenge_sha256: str,
     expected_original_plan_sha256: str,
     expected_amendment_sha256: str,
+    expected_trust_override_plan_sha256: str,
     expected_provider: dict[str, object],
     now: datetime,
 ) -> dict[str, str]:
@@ -688,6 +799,8 @@ def validate_reference_approval(
         raise ReferenceJobError("reference approval original plan authority is not accepted")
     if expected_amendment_sha256 != APPROVED_PROVIDER_AMENDMENT_SHA256:
         raise ReferenceJobError("reference approval amendment authority is not accepted")
+    if expected_trust_override_plan_sha256 != APPROVED_TRUST_OVERRIDE_PLAN_SHA256:
+        raise ReferenceJobError("reference approval trust override authority is not accepted")
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
@@ -699,6 +812,7 @@ def validate_reference_approval(
         "reviewed_commit_sha256",
         "original_approved_plan_sha256",
         "approved_amendment_sha256",
+        "approved_trust_override_plan_sha256",
         "constraint_contract_sha256",
         "observation_receipt_sha256",
         "billing_authority_sha256",
@@ -706,12 +820,13 @@ def validate_reference_approval(
         "environment_scope_sha256",
         "authoritative_report_identity_sha256",
         "billing_completeness_delay_seconds",
+        "trust_override_sha256",
         "provider_residual_cost_risk_accepted",
         "local_reservation_limit_usd",
         "expires_at",
     }
     approval = _closed(raw, fields, "reference approval")
-    if approval["schema_version"] != 2 or approval["kind"] != "reference_execution_approval":
+    if approval["schema_version"] != 3 or approval["kind"] != "reference_execution_approval":
         raise ReferenceJobError("unsupported reference approval")
     if approval["challenge_sha256"] != expected_challenge_sha256:
         raise ReferenceJobError("reference approval challenge mismatch")
@@ -719,6 +834,11 @@ def validate_reference_approval(
         raise ReferenceJobError("reference approval original plan mismatch")
     if approval["approved_amendment_sha256"] != expected_amendment_sha256:
         raise ReferenceJobError("reference approval amendment mismatch")
+    if (
+        approval["approved_trust_override_plan_sha256"]
+        != expected_trust_override_plan_sha256
+    ):
+        raise ReferenceJobError("reference approval trust override plan mismatch")
     for field in (
         "constraint_contract_sha256",
         "observation_receipt_sha256",
@@ -726,9 +846,12 @@ def validate_reference_approval(
         "workspace_scope_sha256",
         "environment_scope_sha256",
         "authoritative_report_identity_sha256",
+        "trust_override_sha256",
     ):
         if approval[field] != expected_provider.get(field):
             raise ReferenceJobError(f"reference approval {field} mismatch")
+        if field == "trust_override_sha256" and approval[field] is None:
+            continue
         if not isinstance(approval[field], str) or SHA256_RE.fullmatch(approval[field]) is None:
             raise ReferenceJobError(f"reference approval {field} is invalid")
     if approval["billing_completeness_delay_seconds"] != expected_provider.get(

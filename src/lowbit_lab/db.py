@@ -17,13 +17,16 @@ from lowbit_lab.jsonio import emit
 from lowbit_lab.reference_contract import (
     APPROVED_PROVIDER_AMENDMENT_PATH,
     APPROVED_PROVIDER_AMENDMENT_SHA256,
+    APPROVED_TRUST_OVERRIDE_PLAN_PATH,
+    APPROVED_TRUST_OVERRIDE_PLAN_SHA256,
+    APPROVED_TRUST_OVERRIDE_STATEMENT_SHA256,
     ORIGINAL_APPROVED_PLAN_PATH,
     ORIGINAL_APPROVED_PLAN_SHA256,
     REFERENCE_RESOURCES,
     reference_execution_scope_sha256,
 )
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 REFERENCE_RESERVATION_USD = Decimal("4.00")
 TERMINAL_STATES = {"completed", "failed"}
 TRANSITIONS = {
@@ -153,6 +156,8 @@ CREATE TABLE IF NOT EXISTS budget_reservations (
     reference_execution_scope_sha256 TEXT
         CHECK(reference_execution_scope_sha256 IS NULL
               OR length(reference_execution_scope_sha256) = 64),
+    trust_override_sha256 TEXT
+        CHECK(trust_override_sha256 IS NULL OR length(trust_override_sha256) = 64),
     phase INTEGER NOT NULL CHECK(phase = 1),
     status TEXT NOT NULL CHECK(status IN (
         'reserved', 'submitted', 'settlement_pending', 'settled',
@@ -397,6 +402,8 @@ def _reference_challenge(config_json: str, config_sha256: str) -> tuple[str, dic
         "original_approved_plan_sha256",
         "approved_amendment_path",
         "approved_amendment_sha256",
+        "approved_trust_override_plan_path",
+        "approved_trust_override_plan_sha256",
         "budget_policy_path",
         "inputs",
         "authority_files",
@@ -440,6 +447,10 @@ def _reference_challenge(config_json: str, config_sha256: str) -> tuple[str, dic
         "constraint_contract_sha256",
         "observation_receipt_path",
         "observation_receipt_sha256",
+        "observation_screenshot_sha256",
+        "trust_override_path",
+        "trust_override_sha256",
+        "human_approval_statement_sha256",
         "billing_authority_path",
         "billing_authority_sha256",
         "authoritative_report_identity_sha256",
@@ -455,7 +466,7 @@ def _reference_challenge(config_json: str, config_sha256: str) -> tuple[str, dic
     if (
         not isinstance(raw, dict)
         or set(raw) != top_fields
-        or raw.get("schema_version") != 2
+        or raw.get("schema_version") != 3
         or raw.get("kind") != "modal_reference_preview"
         or not isinstance(raw.get("inputs"), dict)
         or set(raw["inputs"]) != input_fields
@@ -484,6 +495,9 @@ def _reference_challenge(config_json: str, config_sha256: str) -> tuple[str, dic
         or raw["original_approved_plan_sha256"] != ORIGINAL_APPROVED_PLAN_SHA256
         or raw["approved_amendment_path"] != APPROVED_PROVIDER_AMENDMENT_PATH
         or raw["approved_amendment_sha256"] != APPROVED_PROVIDER_AMENDMENT_SHA256
+        or raw["approved_trust_override_plan_path"] != APPROVED_TRUST_OVERRIDE_PLAN_PATH
+        or raw["approved_trust_override_plan_sha256"]
+        != APPROVED_TRUST_OVERRIDE_PLAN_SHA256
         or not str(raw["budget_policy_path"]).startswith("configs/local/")
         or (
             raw["approval_artifact_path"] is not None
@@ -497,6 +511,21 @@ def _reference_challenge(config_json: str, config_sha256: str) -> tuple[str, dic
             or SHA256_RE.fullmatch(provider[digest_name]) is None
         ):
             raise DatabaseError("reference provider authority is invalid")
+    for digest_name in (
+        "observation_screenshot_sha256",
+        "trust_override_sha256",
+        "human_approval_statement_sha256",
+    ):
+        if (
+            not isinstance(provider[digest_name], str)
+            or SHA256_RE.fullmatch(provider[digest_name]) is None
+        ):
+            raise DatabaseError("reference provider trust override is invalid")
+    if (
+        provider["human_approval_statement_sha256"]
+        != APPROVED_TRUST_OVERRIDE_STATEMENT_SHA256
+    ):
+        raise DatabaseError("reference provider human approval statement is invalid")
     if (
         not isinstance(provider["authoritative_report_identity_sha256"], str)
         or SHA256_RE.fullmatch(provider["authoritative_report_identity_sha256"]) is None
@@ -525,6 +554,7 @@ def _reference_challenge(config_json: str, config_sha256: str) -> tuple[str, dic
         ("constraint_contract_path", "constraint_contract_sha256"),
         ("observation_receipt_path", "observation_receipt_sha256"),
         ("billing_authority_path", "billing_authority_sha256"),
+        ("trust_override_path", "trust_override_sha256"),
     ):
         authority_path = provider[path_name]
         if (
@@ -667,8 +697,27 @@ class ResultsDatabase:
             if existing == 4:
                 self._migrate_v4_to_v5(connection)
                 existing = 5
+            if existing == 5:
+                self._migrate_v5_to_v6(connection)
+                existing = 6
             if existing != SCHEMA_VERSION:
                 raise DatabaseError(f"database schema {existing} != supported {SCHEMA_VERSION}")
+
+    def _migrate_v5_to_v6(self, connection: sqlite3.Connection) -> None:
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """ALTER TABLE budget_reservations ADD COLUMN trust_override_sha256 TEXT
+                CHECK(trust_override_sha256 IS NULL OR length(trust_override_sha256) = 64)"""
+            )
+            connection.execute(
+                """INSERT INTO schema_info(version, applied_at)
+                VALUES (6, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))"""
+            )
+            connection.commit()
+        except Exception as exc:
+            connection.rollback()
+            raise DatabaseError(f"database schema v6 migration failed: {exc}") from exc
 
     def _migrate_v1_to_v2(self, connection: sqlite3.Connection) -> None:
         connection.commit()
@@ -1271,6 +1320,7 @@ class ResultsDatabase:
                 weight_inventory_sha256=str(inputs["weight_inventory_sha256"]),
                 evaluation_lock_sha256=str(inputs["evaluation_lock_sha256"]),
                 formula_authority_sha256=str(inputs["formula_authority_sha256"]),
+                trust_override_sha256=str(parsed_config["provider"]["trust_override_sha256"]),
             )
         except ValueError as exc:
             raise DatabaseError(f"reference execution scope is invalid: {exc}") from exc
@@ -1417,17 +1467,19 @@ class ResultsDatabase:
             connection.execute(
                 """INSERT INTO budget_reservations(
                     reservation_id, run_id, experiment_id, reference_execution_scope_sha256,
+                    trust_override_sha256,
                     phase, status, requested_cost_usd, billing_authority_sha256,
                     authoritative_report_identity_sha256,
                     billing_completeness_delay_seconds,
                     idempotency_key, owner_id, lease_expires_at, heartbeat_at,
                     created_at, updated_at
-                ) VALUES (?, ?, ?, ?, 1, 'reserved', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                ) VALUES (?, ?, ?, ?, ?, 1, 'reserved', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     reservation_id,
                     run_id,
                     experiment_id,
                     execution_scope_sha256,
+                    parsed_config["provider"]["trust_override_sha256"],
                     requested_cost_usd,
                     parsed_config["provider"]["billing_authority_sha256"],
                     parsed_config["provider"]["authoritative_report_identity_sha256"],

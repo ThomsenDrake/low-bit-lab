@@ -10,6 +10,9 @@ from lowbit_lab.db import SCHEMA_VERSION, DatabaseError, ResultsDatabase
 from lowbit_lab.reference_contract import (
     APPROVED_PROVIDER_AMENDMENT_PATH,
     APPROVED_PROVIDER_AMENDMENT_SHA256,
+    APPROVED_TRUST_OVERRIDE_PLAN_PATH,
+    APPROVED_TRUST_OVERRIDE_PLAN_SHA256,
+    APPROVED_TRUST_OVERRIDE_STATEMENT_SHA256,
     ORIGINAL_APPROVED_PLAN_PATH,
     ORIGINAL_APPROVED_PLAN_SHA256,
     reference_execution_scope_sha256,
@@ -364,13 +367,15 @@ def _reserve(
         "control_plane_sha256": "7" * 64,
     }
     raw = {
-        "schema_version": 2,
+        "schema_version": 3,
         "kind": "modal_reference_preview",
         "experiment_id": f"reference-{suffix}",
         "original_approved_plan_path": ORIGINAL_APPROVED_PLAN_PATH,
         "original_approved_plan_sha256": ORIGINAL_APPROVED_PLAN_SHA256,
         "approved_amendment_path": APPROVED_PROVIDER_AMENDMENT_PATH,
         "approved_amendment_sha256": APPROVED_PROVIDER_AMENDMENT_SHA256,
+        "approved_trust_override_plan_path": APPROVED_TRUST_OVERRIDE_PLAN_PATH,
+        "approved_trust_override_plan_sha256": APPROVED_TRUST_OVERRIDE_PLAN_SHA256,
         "budget_policy_path": "configs/local/reference-budget.json",
         "inputs": inputs,
         "authority_files": {
@@ -406,6 +411,10 @@ def _reserve(
             "constraint_contract_sha256": "a" * 64,
             "observation_receipt_path": "reports/local/observation.json",
             "observation_receipt_sha256": observation_receipt_sha256,
+            "observation_screenshot_sha256": "2" * 64,
+            "trust_override_path": "reports/local/trust-override.json",
+            "trust_override_sha256": "3" * 64,
+            "human_approval_statement_sha256": APPROVED_TRUST_OVERRIDE_STATEMENT_SHA256,
             "billing_authority_path": "reports/local/billing.json",
             "billing_authority_sha256": "c" * 64,
             "authoritative_report_identity_sha256": "1" * 64,
@@ -593,12 +602,13 @@ def test_populated_v4_migration_preserves_legacy_rows_without_scope_authority(
     database = ResultsDatabase(path)
     database.initialize()
     with database.connect() as connection:
-        assert connection.execute("SELECT max(version) FROM schema_info").fetchone()[0] == 5
+        assert connection.execute("SELECT max(version) FROM schema_info").fetchone()[0] == 6
         assert connection.execute("SELECT count(*) FROM experiments").fetchone()[0] == 1
         assert connection.execute("SELECT count(*) FROM budget_reservations").fetchone()[0] == 1
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
         legacy = connection.execute(
-            """SELECT reference_execution_scope_sha256, billing_authority_sha256,
+            """SELECT reference_execution_scope_sha256, trust_override_sha256,
+                billing_authority_sha256,
                 authoritative_report_identity_sha256,
                 billing_completeness_delay_seconds, submitted_at, settlement_pending_at
             FROM budget_reservations"""
@@ -606,7 +616,7 @@ def test_populated_v4_migration_preserves_legacy_rows_without_scope_authority(
         actual = connection.execute(
             "SELECT modal_cost_actual_usd FROM experiments"
         ).fetchone()[0]
-    assert tuple(legacy) == (None, None, None, None, None, None)
+    assert tuple(legacy) == (None, None, None, None, None, None, None)
     assert actual == "0"
 
 
@@ -684,6 +694,7 @@ def test_reference_reservation_is_atomic_and_prevents_cap_overlap(tmp_path: Path
         _reserve(database, suffix="two")
     assert database.get_attempt("attempt-two")["status"] == "received"
     assert database.get_reservation("reservation-one")["status"] == "reserved"
+    assert database.get_reservation("reservation-one")["trust_override_sha256"] == "3" * 64
     assert database.get_run("run-one")["modal_cost_actual_usd"] is None
     with database.connect() as connection:
         assert connection.execute(
@@ -756,6 +767,10 @@ def _set_provider_field(raw: dict[str, object], field: str, value: object) -> No
             ),
             "authority",
         ),
+        (
+            lambda raw: raw.__setitem__("approved_trust_override_plan_sha256", "f" * 64),
+            "authority",
+        ),
         (lambda raw: _remove_provider_field(raw, "constraint_contract_path"), "schema"),
         (
             lambda raw: _set_provider_field(raw, "observation_receipt_sha256", None),
@@ -769,6 +784,16 @@ def _set_provider_field(raw: dict[str, object], field: str, value: object) -> No
         (
             lambda raw: _set_provider_field(raw, "constraint_contract_sha256", 1),
             "provider authority",
+        ),
+        (
+            lambda raw: _set_provider_field(raw, "trust_override_sha256", None),
+            "trust override",
+        ),
+        (
+            lambda raw: _set_provider_field(
+                raw, "human_approval_statement_sha256", "f" * 64
+            ),
+            "human approval statement",
         ),
         (
             lambda raw: raw["inputs"].__setitem__("source_revision", 1),

@@ -17,6 +17,15 @@ APPROVED_PROVIDER_AMENDMENT_SHA256 = (
 APPROVED_PROVIDER_AMENDMENT_PATH = (
     "docs/plans/local/2026-08-22-1126-feat-provider-constraint-amendment-plan.md"
 )
+APPROVED_TRUST_OVERRIDE_PLAN_SHA256 = (
+    "277e2359b33f334e96aa60a4e146bb57a640c21b5e24d63d34d9f811c06b048e"
+)
+APPROVED_TRUST_OVERRIDE_PLAN_PATH = (
+    "docs/plans/local/2026-08-23-provider-observation-trust-override-plan.md"
+)
+APPROVED_TRUST_OVERRIDE_STATEMENT_SHA256 = (
+    "4c34af650985ed9846d6fdfbba0547fa257c41d079cb0cc15c79d1bebe56effb"
+)
 PROVIDER_APPROVAL_OBSERVATION_MAX_AGE_SECONDS = 15 * 60
 
 REFERENCE_RESOURCES: dict[str, object] = {
@@ -37,6 +46,7 @@ def reference_execution_scope_sha256(
     weight_inventory_sha256: str,
     evaluation_lock_sha256: str,
     formula_authority_sha256: str,
+    trust_override_sha256: str | None = None,
 ) -> str:
     """Bind the immutable inputs that define the one-attempt reference scope."""
     if IMMUTABLE_REVISION_RE.fullmatch(source_revision) is None:
@@ -48,13 +58,17 @@ def reference_execution_scope_sha256(
     ):
         if SHA256_RE.fullmatch(value) is None:
             raise ValueError(f"{label} must be lowercase SHA-256")
+    if trust_override_sha256 is not None and SHA256_RE.fullmatch(trust_override_sha256) is None:
+        raise ValueError("trust override must be lowercase SHA-256")
     material = {
         "approved_amendment_sha256": APPROVED_PROVIDER_AMENDMENT_SHA256,
+        "approved_trust_override_plan_sha256": APPROVED_TRUST_OVERRIDE_PLAN_SHA256,
         "evaluation_lock_sha256": evaluation_lock_sha256,
         "formula_authority_sha256": formula_authority_sha256,
         "original_approved_plan_sha256": ORIGINAL_APPROVED_PLAN_SHA256,
         "resources": REFERENCE_RESOURCES,
         "source_revision": source_revision,
+        "trust_override_sha256": trust_override_sha256,
         "weight_inventory_sha256": weight_inventory_sha256,
     }
     canonical = json.dumps(material, sort_keys=True, separators=(",", ":"), ensure_ascii=True)

@@ -20,6 +20,8 @@ from lowbit_lab.modal_job import (
 )
 from lowbit_lab.reference_contract import (
     APPROVED_PROVIDER_AMENDMENT_SHA256,
+    APPROVED_TRUST_OVERRIDE_PLAN_SHA256,
+    APPROVED_TRUST_OVERRIDE_STATEMENT_SHA256,
     ORIGINAL_APPROVED_PLAN_SHA256,
 )
 from lowbit_lab.reference_gates import A100_80GB_BYTES, MEMORY_FORMULA, TIME_FORMULA
@@ -27,6 +29,9 @@ from lowbit_lab.reference_gates import A100_80GB_BYTES, MEMORY_FORMULA, TIME_FOR
 ORIGINAL_PLAN_PATH = "docs/plans/local/2026-08-21-2358-feat-full-weight-baseline-plan.md"
 AMENDMENT_PATH = (
     "docs/plans/local/2026-08-22-1126-feat-provider-constraint-amendment-plan.md"
+)
+TRUST_OVERRIDE_PLAN_PATH = (
+    "docs/plans/local/2026-08-23-provider-observation-trust-override-plan.md"
 )
 
 
@@ -58,17 +63,23 @@ def _config(tmp_path: Path, **changes: object) -> Path:
     plans = tmp_path / "docs" / "plans" / "local"
     plans.mkdir(parents=True, exist_ok=True)
     repository_plans = Path(__file__).resolve().parents[1] / "docs" / "plans" / "local"
-    for name in (Path(ORIGINAL_PLAN_PATH).name, Path(AMENDMENT_PATH).name):
+    for name in (
+        Path(ORIGINAL_PLAN_PATH).name,
+        Path(AMENDMENT_PATH).name,
+        Path(TRUST_OVERRIDE_PLAN_PATH).name,
+    ):
         (plans / name).write_bytes((repository_plans / name).read_bytes())
     _budget(configs / "reference-budget.json", ORIGINAL_APPROVED_PLAN_SHA256)
     raw = {
-        "schema_version": 2,
+        "schema_version": 3,
         "kind": "modal_reference_preview",
         "experiment_id": "reference-preview-v1",
         "original_approved_plan_path": ORIGINAL_PLAN_PATH,
         "original_approved_plan_sha256": ORIGINAL_APPROVED_PLAN_SHA256,
         "approved_amendment_path": AMENDMENT_PATH,
         "approved_amendment_sha256": APPROVED_PROVIDER_AMENDMENT_SHA256,
+        "approved_trust_override_plan_path": TRUST_OVERRIDE_PLAN_PATH,
+        "approved_trust_override_plan_sha256": APPROVED_TRUST_OVERRIDE_PLAN_SHA256,
         "budget_policy_path": "configs/local/reference-budget.json",
         "inputs": {
             "source_revision": "d" * 40,
@@ -115,6 +126,10 @@ def _config(tmp_path: Path, **changes: object) -> Path:
             "constraint_contract_sha256": None,
             "observation_receipt_path": None,
             "observation_receipt_sha256": None,
+            "observation_screenshot_sha256": "b" * 64,
+            "trust_override_path": None,
+            "trust_override_sha256": None,
+            "human_approval_statement_sha256": None,
             "billing_authority_path": None,
             "billing_authority_sha256": None,
             "authoritative_report_identity_sha256": "1" * 64,
@@ -138,7 +153,7 @@ def _config(tmp_path: Path, **changes: object) -> Path:
 def test_reference_preview_is_exact_non_submitting_and_zero_actual(tmp_path: Path) -> None:
     config = load_reference_job_config(_config(tmp_path), root=tmp_path)
     preview = plan_reference_preview(config, root=tmp_path)
-    assert preview["schema_version"] == 2
+    assert preview["schema_version"] == 3
     assert preview["submit"] is False
     assert preview["actual_cost_usd"] == "0"
     assert preview["local_reservation_limit_usd"] == "4.00"
@@ -431,6 +446,75 @@ def test_reference_preview_rejects_observation_older_than_fifteen_minutes(
     assert "provider_concurrency_unproven" in blockers
 
 
+def test_reference_preview_accepts_bound_human_trust_override_for_stale_observation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    validated_at = datetime(2026, 8, 23, 12, 0, tzinfo=UTC)
+    path = _config(tmp_path)
+    raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+    raw["provider"].update(
+        _write_provider_evidence(tmp_path, observed_at=validated_at - timedelta(days=1))
+    )
+    statement_sha = APPROVED_TRUST_OVERRIDE_STATEMENT_SHA256
+    override = {
+        "schema_version": 1,
+        "kind": "provider_observation_trust_override",
+        "original_approved_plan_sha256": ORIGINAL_APPROVED_PLAN_SHA256,
+        "approved_provider_amendment_sha256": APPROVED_PROVIDER_AMENDMENT_SHA256,
+        "approved_trust_override_plan_sha256": APPROVED_TRUST_OVERRIDE_PLAN_SHA256,
+        "constraint_contract_sha256": raw["provider"]["constraint_contract_sha256"],
+        "observation_receipt_sha256": raw["provider"]["observation_receipt_sha256"],
+        "screenshot_sha256": raw["provider"]["observation_screenshot_sha256"],
+        "workspace_scope_sha256": raw["provider"]["workspace_scope_sha256"],
+        "environment_scope_sha256": raw["provider"]["environment_scope_sha256"],
+        "human_approval_statement_sha256": statement_sha,
+        "human_approved": True,
+        "observation_is_stale": True,
+        "configuration_drift_risk_accepted": True,
+        "provider_residual_cost_risk_accepted": True,
+        "provider_hard_budget_available": False,
+    }
+    override_path = tmp_path / "reports" / "local" / "trust-override.json"
+    override_path.write_text(json.dumps(override), encoding="utf-8")
+    raw["provider"].update(
+        {
+            "trust_override_path": "reports/local/trust-override.json",
+            "trust_override_sha256": hashlib.sha256(override_path.read_bytes()).hexdigest(),
+            "human_approval_statement_sha256": statement_sha,
+        }
+    )
+    path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    monkeypatch.setattr("lowbit_lab.modal_job._now_datetime", lambda: validated_at)
+
+    preview = plan_reference_preview(load_reference_job_config(path, root=tmp_path), root=tmp_path)
+    assert preview["provider_constraint_authority"] == "human_trust_override"
+    assert "provider_concurrency_unproven" not in preview["blockers"]
+    assert "provider_residual_cost_risk_unaccepted" not in preview["blockers"]
+    assert "execution_approval_missing" in preview["blockers"]
+
+    constraint_path = tmp_path / "reports" / "local" / "constraint.json"
+    constraint_bytes = constraint_path.read_bytes()
+    constraint_path.write_text("{}", encoding="utf-8")
+    blocked = plan_reference_preview(
+        load_reference_job_config(path, root=tmp_path), root=tmp_path
+    )
+    assert blocked["provider_constraint_authority"] == "unproven"
+    assert "provider_concurrency_unproven" in blocked["blockers"]
+    constraint_path.write_bytes(constraint_bytes)
+
+    override["configuration_drift_risk_accepted"] = False
+    override_path.write_text(json.dumps(override), encoding="utf-8")
+    raw["provider"]["trust_override_sha256"] = hashlib.sha256(
+        override_path.read_bytes()
+    ).hexdigest()
+    path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    blocked = plan_reference_preview(
+        load_reference_job_config(path, root=tmp_path), root=tmp_path
+    )
+    assert blocked["provider_constraint_authority"] == "unproven"
+    assert "provider_concurrency_unproven" in blocked["blockers"]
+
+
 def test_reference_preview_clears_each_provider_blocker_with_bound_approval(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -446,12 +530,13 @@ def test_reference_preview_clears_each_provider_blocker_with_bound_approval(
     approval.write_text(
         json.dumps(
             {
-                "schema_version": 2,
+                "schema_version": 3,
                 "kind": "reference_execution_approval",
                 "challenge_sha256": config.challenge_sha256,
                 "reviewed_commit_sha256": "a" * 40,
                 "original_approved_plan_sha256": ORIGINAL_APPROVED_PLAN_SHA256,
                 "approved_amendment_sha256": APPROVED_PROVIDER_AMENDMENT_SHA256,
+                "approved_trust_override_plan_sha256": APPROVED_TRUST_OVERRIDE_PLAN_SHA256,
                 "constraint_contract_sha256": raw["provider"][
                     "constraint_contract_sha256"
                 ],
@@ -467,6 +552,7 @@ def test_reference_preview_clears_each_provider_blocker_with_bound_approval(
                 "billing_completeness_delay_seconds": raw["provider"][
                     "billing_completeness_delay_seconds"
                 ],
+                "trust_override_sha256": None,
                 "provider_residual_cost_risk_accepted": True,
                 "local_reservation_limit_usd": "4.00",
                 "expires_at": "2026-08-22T12:30:00+00:00",
@@ -542,12 +628,13 @@ def test_reference_approval_is_separate_bound_and_expiring(tmp_path: Path) -> No
     approval.write_text(
         json.dumps(
             {
-                "schema_version": 2,
+                "schema_version": 3,
                 "kind": "reference_execution_approval",
                 "challenge_sha256": "a" * 64,
                 "reviewed_commit_sha256": "b" * 40,
                 "original_approved_plan_sha256": ORIGINAL_APPROVED_PLAN_SHA256,
                 "approved_amendment_sha256": APPROVED_PROVIDER_AMENDMENT_SHA256,
+                "approved_trust_override_plan_sha256": APPROVED_TRUST_OVERRIDE_PLAN_SHA256,
                 "constraint_contract_sha256": "c" * 64,
                 "observation_receipt_sha256": "d" * 64,
                 "billing_authority_sha256": "e" * 64,
@@ -555,6 +642,7 @@ def test_reference_approval_is_separate_bound_and_expiring(tmp_path: Path) -> No
                 "environment_scope_sha256": "9" * 64,
                 "authoritative_report_identity_sha256": "1" * 64,
                 "billing_completeness_delay_seconds": 3600,
+                "trust_override_sha256": None,
                 "provider_residual_cost_risk_accepted": True,
                 "local_reservation_limit_usd": "4.00",
                 "expires_at": "2026-08-22T01:00:00+00:00",
@@ -567,6 +655,7 @@ def test_reference_approval_is_separate_bound_and_expiring(tmp_path: Path) -> No
         expected_challenge_sha256="a" * 64,
         expected_original_plan_sha256=ORIGINAL_APPROVED_PLAN_SHA256,
         expected_amendment_sha256=APPROVED_PROVIDER_AMENDMENT_SHA256,
+        expected_trust_override_plan_sha256=APPROVED_TRUST_OVERRIDE_PLAN_SHA256,
         expected_provider={
             "constraint_contract_sha256": "c" * 64,
             "observation_receipt_sha256": "d" * 64,
@@ -575,6 +664,7 @@ def test_reference_approval_is_separate_bound_and_expiring(tmp_path: Path) -> No
             "environment_scope_sha256": "9" * 64,
             "authoritative_report_identity_sha256": "1" * 64,
             "billing_completeness_delay_seconds": 3600,
+            "trust_override_sha256": None,
         },
         now=datetime(2026, 8, 22, 0, 0, tzinfo=UTC),
     )
@@ -585,6 +675,7 @@ def test_reference_approval_is_separate_bound_and_expiring(tmp_path: Path) -> No
             expected_challenge_sha256="a" * 64,
             expected_original_plan_sha256=ORIGINAL_APPROVED_PLAN_SHA256,
             expected_amendment_sha256=APPROVED_PROVIDER_AMENDMENT_SHA256,
+            expected_trust_override_plan_sha256=APPROVED_TRUST_OVERRIDE_PLAN_SHA256,
             expected_provider={
                 "constraint_contract_sha256": "c" * 64,
                 "observation_receipt_sha256": "d" * 64,
@@ -593,6 +684,7 @@ def test_reference_approval_is_separate_bound_and_expiring(tmp_path: Path) -> No
                 "environment_scope_sha256": "9" * 64,
                 "authoritative_report_identity_sha256": "1" * 64,
                 "billing_completeness_delay_seconds": 3600,
+                "trust_override_sha256": None,
             },
             now=datetime(2026, 8, 22, 2, 0, tzinfo=UTC),
         )
@@ -602,6 +694,7 @@ def test_reference_approval_is_separate_bound_and_expiring(tmp_path: Path) -> No
             expected_challenge_sha256="c" * 64,
             expected_original_plan_sha256=ORIGINAL_APPROVED_PLAN_SHA256,
             expected_amendment_sha256=APPROVED_PROVIDER_AMENDMENT_SHA256,
+            expected_trust_override_plan_sha256=APPROVED_TRUST_OVERRIDE_PLAN_SHA256,
             expected_provider={
                 "constraint_contract_sha256": "c" * 64,
                 "observation_receipt_sha256": "d" * 64,
@@ -610,6 +703,7 @@ def test_reference_approval_is_separate_bound_and_expiring(tmp_path: Path) -> No
                 "environment_scope_sha256": "9" * 64,
                 "authoritative_report_identity_sha256": "1" * 64,
                 "billing_completeness_delay_seconds": 3600,
+                "trust_override_sha256": None,
             },
             now=datetime(2026, 8, 22, 0, 0, tzinfo=UTC),
         )
@@ -624,6 +718,7 @@ def test_reference_approval_is_separate_bound_and_expiring(tmp_path: Path) -> No
             expected_challenge_sha256="a" * 64,
             expected_original_plan_sha256=ORIGINAL_APPROVED_PLAN_SHA256,
             expected_amendment_sha256=APPROVED_PROVIDER_AMENDMENT_SHA256,
+            expected_trust_override_plan_sha256=APPROVED_TRUST_OVERRIDE_PLAN_SHA256,
             expected_provider={
                 "constraint_contract_sha256": "c" * 64,
                 "observation_receipt_sha256": "d" * 64,
@@ -632,6 +727,7 @@ def test_reference_approval_is_separate_bound_and_expiring(tmp_path: Path) -> No
                 "environment_scope_sha256": "9" * 64,
                 "authoritative_report_identity_sha256": "1" * 64,
                 "billing_completeness_delay_seconds": 3600,
+                "trust_override_sha256": None,
             },
             now=datetime(2026, 8, 22, 0, 0, tzinfo=UTC),
         )

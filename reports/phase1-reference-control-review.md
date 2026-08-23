@@ -9,6 +9,8 @@ Scope: the target-neutral public control plane for U1–U7. U8 submission remain
 - Inventory, provenance, runtime receipt, evaluation lock, reviewed commit, resource specification, scorer, and executor runtime are digest-bound.
 - The SQLite schema records immutable config identity, attempts, source hashes, hardware/runtime metadata, reservations, metrics, artifacts, and sanitized failures.
 - Approval challenges are recomputed from canonical config rather than accepted as caller-provided identity.
+- A human trust override is a distinct immutable authority mode; the historical receipt remains
+  labeled stale and its digest enters the challenge, execution scope, approval, and reservation.
 
 ## Remote-credit safety and failure containment
 
@@ -61,18 +63,22 @@ Scope: the target-neutral public control plane for U1–U7. U8 submission remain
   syntax-aware, and rejected non-string digest claims at the database boundary.
 - Bound settlement to the approved billing authority, authoritative report identity, completeness
   delay, and owner-checked renewable leases.
+- Added schema-v3 trust-override authority and schema-v6 reservation persistence without weakening
+  formula, memory-fit, cold-path, billing, privacy, or exact execution-approval gates.
+- Froze the exact human-approval statement digest independently in code so mutually controlled config
+  and evidence files cannot manufacture trust authority merely by agreeing with each other.
 
 ## Remaining blockers by design
 
 - Source, evaluation, inventory, and installed-runtime authority can be cross-verified without
   transferring weight shards.
 - The resource-accounting formula remains pending human review.
-- The stored provider screenshot is historical and cannot satisfy the 15-minute approval freshness
-  gate. A fresh local observation receipt and regenerated packet are required.
+- The operator explicitly accepted the historical provider observation and configuration-drift risk
+  under the separately approved trust-override plan. This clears only provider concurrency and
+  residual-risk blockers and is never represented as fresh evidence.
 - Billing authority can describe attribution and completeness, but no pre-submission value can prove
   actual provider cost. Unknown post-submission billing remains audit-blocked.
-- No conservative memory-fit evidence, cold-path-time evidence, residual-risk approval, or U8
-  approval exists.
+- No conservative memory-fit evidence, cold-path-time evidence, or exact U8 approval exists.
 - No model weights have been downloaded or transferred, and no remote job has been submitted.
 
 ## Evidence-remediation addendum

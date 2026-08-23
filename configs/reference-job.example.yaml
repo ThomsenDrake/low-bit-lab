@@ -1,10 +1,12 @@
-schema_version: 2
+schema_version: 3
 kind: modal_reference_preview
 experiment_id: example-reference-preview-v1
 original_approved_plan_path: docs/plans/local/approved-reference-plan.md
 original_approved_plan_sha256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 approved_amendment_path: docs/plans/local/approved-provider-constraint-amendment.md
 approved_amendment_sha256: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+approved_trust_override_plan_path: docs/plans/local/approved-provider-trust-override.md
+approved_trust_override_plan_sha256: cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
 budget_policy_path: configs/local/reference-budget.json
 inputs:
   source_revision: dddddddddddddddddddddddddddddddddddddddd
@@ -48,6 +50,10 @@ provider:
   constraint_contract_sha256: null
   observation_receipt_path: null
   observation_receipt_sha256: null
+  observation_screenshot_sha256: eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+  trust_override_path: null
+  trust_override_sha256: null
+  human_approval_statement_sha256: null
   billing_authority_path: null
   billing_authority_sha256: null
   authoritative_report_identity_sha256: cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc

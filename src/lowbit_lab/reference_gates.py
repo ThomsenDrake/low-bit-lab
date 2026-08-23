@@ -324,7 +324,7 @@ def verify_provider_constraint_contract(
     }
 
 
-def verify_provider_observation_receipt(
+def _verify_provider_observation_receipt(
     path: Path,
     *,
     expected_sha256: str,
@@ -333,7 +333,7 @@ def verify_provider_observation_receipt(
     expected_environment_scope_sha256: str,
     expected_amendment_sha256: str,
     validated_at: datetime,
-    maximum_age_seconds: int,
+    maximum_age_seconds: int | None,
 ) -> dict[str, object]:
     raw, digest = _load(path, expected_sha256)
     receipt = _closed(
@@ -373,7 +373,7 @@ def verify_provider_observation_receipt(
     contract_sha256 = _sha256(
         receipt["constraint_contract_sha256"], "constraint_contract_sha256"
     )
-    _sha256(receipt["screenshot_sha256"], "screenshot_sha256")
+    screenshot_sha256 = _sha256(receipt["screenshot_sha256"], "screenshot_sha256")
     if workspace_scope != expected_workspace_scope_sha256:
         raise ReferenceGateError("provider workspace scope mismatch")
     if environment_scope != expected_environment_scope_sha256:
@@ -409,11 +409,12 @@ def verify_provider_observation_receipt(
         raise ReferenceGateError("provider observation time must be timezone-aware")
     if validated_at.tzinfo is None or validated_at.utcoffset() is None:
         raise ReferenceGateError("validation time must be timezone-aware")
-    maximum_age = _positive_int(maximum_age_seconds, "maximum_age_seconds")
     age_seconds = (validated_at - observed_at).total_seconds()
     if age_seconds < 0:
         raise ReferenceGateError("provider observation time is in the future")
-    if age_seconds > maximum_age:
+    if maximum_age_seconds is not None and age_seconds > _positive_int(
+        maximum_age_seconds, "maximum_age_seconds"
+    ):
         raise ReferenceGateError("provider observation receipt is stale")
 
     return {
@@ -423,13 +424,61 @@ def verify_provider_observation_receipt(
         "environment_scope_sha256": environment_scope,
         "approved_amendment_sha256": amendment_sha256,
         "constraint_contract_sha256": contract_sha256,
+        "screenshot_sha256": screenshot_sha256,
         "maximum_concurrent_containers": maximum_containers,
         "maximum_concurrent_gpus": maximum_gpus,
         "active_containers": active_containers,
         "active_gpus": active_gpus,
         "observed_at": observed_at.isoformat(),
         "age_seconds": age_seconds,
+        "fresh": maximum_age_seconds is not None,
     }
+
+
+def verify_provider_observation_receipt(
+    path: Path,
+    *,
+    expected_sha256: str,
+    expected_contract_sha256: str,
+    expected_workspace_scope_sha256: str,
+    expected_environment_scope_sha256: str,
+    expected_amendment_sha256: str,
+    validated_at: datetime,
+    maximum_age_seconds: int,
+) -> dict[str, object]:
+    return _verify_provider_observation_receipt(
+        path,
+        expected_sha256=expected_sha256,
+        expected_contract_sha256=expected_contract_sha256,
+        expected_workspace_scope_sha256=expected_workspace_scope_sha256,
+        expected_environment_scope_sha256=expected_environment_scope_sha256,
+        expected_amendment_sha256=expected_amendment_sha256,
+        validated_at=validated_at,
+        maximum_age_seconds=maximum_age_seconds,
+    )
+
+
+def verify_provider_observation_receipt_for_trust_override(
+    path: Path,
+    *,
+    expected_sha256: str,
+    expected_contract_sha256: str,
+    expected_workspace_scope_sha256: str,
+    expected_environment_scope_sha256: str,
+    expected_amendment_sha256: str,
+    validated_at: datetime,
+) -> dict[str, object]:
+    """Verify every observation claim except freshness for a separately approved override."""
+    return _verify_provider_observation_receipt(
+        path,
+        expected_sha256=expected_sha256,
+        expected_contract_sha256=expected_contract_sha256,
+        expected_workspace_scope_sha256=expected_workspace_scope_sha256,
+        expected_environment_scope_sha256=expected_environment_scope_sha256,
+        expected_amendment_sha256=expected_amendment_sha256,
+        validated_at=validated_at,
+        maximum_age_seconds=None,
+    )
 
 
 def verify_provider_billing_authority(
@@ -482,6 +531,82 @@ def verify_provider_billing_authority(
         "attribution_method_sha256": attribution_method,
         "authoritative_report_identity_sha256": report_identity,
         "billing_completeness_delay_seconds": completeness_delay,
+    }
+
+
+def verify_provider_observation_trust_override(
+    path: Path,
+    *,
+    expected_sha256: str,
+    expected_original_plan_sha256: str,
+    expected_provider_amendment_sha256: str,
+    expected_trust_override_plan_sha256: str,
+    expected_contract_sha256: str,
+    expected_observation_receipt_sha256: str,
+    expected_screenshot_sha256: str,
+    expected_workspace_scope_sha256: str,
+    expected_environment_scope_sha256: str,
+    expected_human_statement_sha256: str,
+) -> dict[str, object]:
+    raw, digest = _load(path, expected_sha256)
+    override = _closed(
+        raw,
+        {
+            "schema_version",
+            "kind",
+            "original_approved_plan_sha256",
+            "approved_provider_amendment_sha256",
+            "approved_trust_override_plan_sha256",
+            "constraint_contract_sha256",
+            "observation_receipt_sha256",
+            "screenshot_sha256",
+            "workspace_scope_sha256",
+            "environment_scope_sha256",
+            "human_approval_statement_sha256",
+            "human_approved",
+            "observation_is_stale",
+            "configuration_drift_risk_accepted",
+            "provider_residual_cost_risk_accepted",
+            "provider_hard_budget_available",
+        },
+        "provider observation trust override",
+    )
+    if (
+        override["schema_version"] != 1
+        or override["kind"] != "provider_observation_trust_override"
+    ):
+        raise ReferenceGateError("unsupported provider observation trust override")
+    expected = {
+        "original_approved_plan_sha256": expected_original_plan_sha256,
+        "approved_provider_amendment_sha256": expected_provider_amendment_sha256,
+        "approved_trust_override_plan_sha256": expected_trust_override_plan_sha256,
+        "constraint_contract_sha256": expected_contract_sha256,
+        "observation_receipt_sha256": expected_observation_receipt_sha256,
+        "screenshot_sha256": expected_screenshot_sha256,
+        "workspace_scope_sha256": expected_workspace_scope_sha256,
+        "environment_scope_sha256": expected_environment_scope_sha256,
+        "human_approval_statement_sha256": expected_human_statement_sha256,
+    }
+    for field, expected_value in expected.items():
+        if _sha256(override[field], field) != expected_value:
+            raise ReferenceGateError(f"provider trust override {field} mismatch")
+    required_true = (
+        "human_approved",
+        "observation_is_stale",
+        "configuration_drift_risk_accepted",
+        "provider_residual_cost_risk_accepted",
+    )
+    if any(override[field] is not True for field in required_true):
+        raise ReferenceGateError("provider trust override risk acceptance is incomplete")
+    if override["provider_hard_budget_available"] is not False:
+        raise ReferenceGateError("provider trust override cannot claim a hard budget")
+    return {
+        "proven": True,
+        "evidence_sha256": digest,
+        "authority_mode": "human_trust_override",
+        "observation_is_stale": True,
+        "configuration_drift_risk_accepted": True,
+        "provider_residual_cost_risk_accepted": True,
     }
 
 

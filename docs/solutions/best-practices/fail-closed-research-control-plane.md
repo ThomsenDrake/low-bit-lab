@@ -62,6 +62,14 @@ dollar cap when one exists. When it does not, treat observed one-container/one-G
 strictly weaker control: bind it to a fresh receipt and a separately approved residual-risk
 amendment, never describe it as a cumulative cost cap, and keep unknown billing audit-blocked.
 
+When a human deliberately overrides observation freshness, encode that decision as a separate
+closed artifact rather than mutating the original receipt. Bind the stale receipt, screenshot,
+environment identities, every controlling plan, explicit drift-risk acceptance, and the human
+statement digest. Emit a distinct authority mode so downstream reports cannot confuse accepted
+human trust with fresh mechanical observation. The override should clear only the gate it names.
+Freeze the approved statement digest independently in code; comparing two caller-controlled files
+to each other does not establish human authority.
+
 Make the reference execution scope a canonical digest over source revision, weight inventory,
 evaluation lock, formula authority, resource envelope, and every controlling plan. A released
 never-submitted reservation may retry only with a fresh observation, packet, challenge, and

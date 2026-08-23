@@ -18,6 +18,7 @@ from lowbit_lab.reference_gates import (
     verify_provider_billing_authority,
     verify_provider_constraint_contract,
     verify_provider_observation_receipt,
+    verify_provider_observation_trust_override,
     verify_provider_safety_evidence,
 )
 
@@ -74,6 +75,83 @@ def _provider_billing_authority() -> dict[str, object]:
         "authoritative_report_identity_sha256": "1" * 64,
         "billing_completeness_delay_seconds": 3600,
     }
+
+
+def _provider_trust_override() -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "kind": "provider_observation_trust_override",
+        "original_approved_plan_sha256": "1" * 64,
+        "approved_provider_amendment_sha256": "2" * 64,
+        "approved_trust_override_plan_sha256": "3" * 64,
+        "constraint_contract_sha256": "4" * 64,
+        "observation_receipt_sha256": "5" * 64,
+        "screenshot_sha256": "6" * 64,
+        "workspace_scope_sha256": "7" * 64,
+        "environment_scope_sha256": "8" * 64,
+        "human_approval_statement_sha256": "9" * 64,
+        "human_approved": True,
+        "observation_is_stale": True,
+        "configuration_drift_risk_accepted": True,
+        "provider_residual_cost_risk_accepted": True,
+        "provider_hard_budget_available": False,
+    }
+
+
+def test_provider_trust_override_is_closed_explicit_and_fully_bound(tmp_path: Path) -> None:
+    override = _provider_trust_override()
+    path = tmp_path / "override.json"
+    digest = _write(path, override)
+    result = verify_provider_observation_trust_override(
+        path,
+        expected_sha256=digest,
+        expected_original_plan_sha256="1" * 64,
+        expected_provider_amendment_sha256="2" * 64,
+        expected_trust_override_plan_sha256="3" * 64,
+        expected_contract_sha256="4" * 64,
+        expected_observation_receipt_sha256="5" * 64,
+        expected_screenshot_sha256="6" * 64,
+        expected_workspace_scope_sha256="7" * 64,
+        expected_environment_scope_sha256="8" * 64,
+        expected_human_statement_sha256="9" * 64,
+    )
+    assert result["proven"] is True
+    assert result["authority_mode"] == "human_trust_override"
+    assert result["observation_is_stale"] is True
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("human_approved", False),
+        ("observation_is_stale", False),
+        ("configuration_drift_risk_accepted", False),
+        ("provider_residual_cost_risk_accepted", False),
+        ("provider_hard_budget_available", True),
+        ("unknown", True),
+    ],
+)
+def test_provider_trust_override_rejects_false_or_open_claims(
+    tmp_path: Path, field: str, value: object
+) -> None:
+    override = _provider_trust_override()
+    override[field] = value
+    path = tmp_path / "override.json"
+    digest = _write(path, override)
+    with pytest.raises(ReferenceGateError):
+        verify_provider_observation_trust_override(
+            path,
+            expected_sha256=digest,
+            expected_original_plan_sha256="1" * 64,
+            expected_provider_amendment_sha256="2" * 64,
+            expected_trust_override_plan_sha256="3" * 64,
+            expected_contract_sha256="4" * 64,
+            expected_observation_receipt_sha256="5" * 64,
+            expected_screenshot_sha256="6" * 64,
+            expected_workspace_scope_sha256="7" * 64,
+            expected_environment_scope_sha256="8" * 64,
+            expected_human_statement_sha256="9" * 64,
+        )
 
 
 def test_formula_authority_is_closed_exact_and_reviewable(tmp_path: Path) -> None:
