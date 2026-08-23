@@ -1,6 +1,7 @@
 import hashlib
 import json
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -11,6 +12,7 @@ from lowbit_lab.reference_contract import (
     APPROVED_PROVIDER_AMENDMENT_SHA256,
     ORIGINAL_APPROVED_PLAN_PATH,
     ORIGINAL_APPROVED_PLAN_SHA256,
+    reference_execution_scope_sha256,
 )
 
 
@@ -306,7 +308,10 @@ def test_populated_v2_database_migrates_additively_without_losing_u2_rows(
         connection.executescript(_v2_schema())
     ResultsDatabase(path).initialize()
     with sqlite3.connect(path) as connection:
-        assert connection.execute("SELECT max(version) FROM schema_info").fetchone()[0] == 4
+        assert (
+            connection.execute("SELECT max(version) FROM schema_info").fetchone()[0]
+            == SCHEMA_VERSION
+        )
         assert connection.execute("SELECT count(*) FROM experiments").fetchone()[0] == 1
         columns = {
             row[1] for row in connection.execute("PRAGMA table_info('experiments')").fetchall()
@@ -342,8 +347,10 @@ def _reserve(
     tamper_config_after_challenge: bool = False,
     hardware: dict[str, object] | None = None,
     mutate_config: Callable[[dict[str, object]], None] | None = None,
+    observation_receipt_sha256: str = "b" * 64,
 ) -> None:
     inputs = {
+        "source_revision": "d" * 40,
         "weight_inventory_sha256": "1" * 64,
         "weight_inventory_tensor_bytes": 55,
         "provenance_manifest_sha256": "2" * 64,
@@ -396,7 +403,7 @@ def _reserve(
             "constraint_contract_path": "reports/local/constraint.json",
             "constraint_contract_sha256": "a" * 64,
             "observation_receipt_path": "reports/local/observation.json",
-            "observation_receipt_sha256": "b" * 64,
+            "observation_receipt_sha256": observation_receipt_sha256,
             "billing_authority_path": "reports/local/billing.json",
             "billing_authority_sha256": "c" * 64,
         },
@@ -424,9 +431,7 @@ def _reserve(
         raw["experiment_id"] = f"tampered-{suffix}"
         config_json = json.dumps(raw, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
         config_sha256 = hashlib.sha256(config_json.encode()).hexdigest()
-    approval = (suffix[-1] if suffix else "b") * 64
-    if not approval[0].isalnum() or approval[0].lower() not in "abcdef0123456789":
-        approval = "b" * 63 + str(len(suffix) % 10)
+    approval = hashlib.sha256(f"approval-{suffix}".encode()).hexdigest()
     database.register_reference_challenge(
         challenge_sha256=challenge,
         packet_sha256="c" * 64,
@@ -472,6 +477,132 @@ def _reserve(
     )
 
 
+def _downgrade_populated_database_to_v4(path: Path) -> None:
+    database = ResultsDatabase(path)
+    database.initialize()
+    _reserve(database, suffix="legacy-v4")
+    import sqlite3
+
+    with sqlite3.connect(path) as connection:
+        connection.execute("PRAGMA foreign_keys = OFF")
+        connection.executescript(
+            """
+            CREATE TABLE experiments_v4_legacy (
+                run_id TEXT PRIMARY KEY,
+                experiment_id TEXT NOT NULL REFERENCES experiment_configs(experiment_id),
+                config_sha256 TEXT NOT NULL, config_json TEXT NOT NULL,
+                source_hashes_json TEXT NOT NULL, runtime_json TEXT NOT NULL,
+                hardware_json TEXT NOT NULL, phase INTEGER NOT NULL, mode TEXT NOT NULL,
+                status TEXT NOT NULL, modal_cost_requested_usd TEXT NOT NULL,
+                modal_cost_actual_usd TEXT NOT NULL DEFAULT '0', failure_reason TEXT,
+                owner_id TEXT, lease_expires_at TEXT, heartbeat_at TEXT,
+                started_at TEXT NOT NULL, ended_at TEXT
+            );
+            INSERT INTO experiments_v4_legacy
+            SELECT run_id, experiment_id, config_sha256, config_json, source_hashes_json,
+                   runtime_json, hardware_json, phase, mode, status,
+                   modal_cost_requested_usd, coalesce(modal_cost_actual_usd, '0'),
+                   failure_reason, owner_id, lease_expires_at, heartbeat_at, started_at, ended_at
+            FROM experiments;
+            CREATE TABLE budget_reservations_v4_legacy (
+                reservation_id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL UNIQUE REFERENCES experiments_v4_legacy(run_id),
+                experiment_id TEXT NOT NULL, phase INTEGER NOT NULL, status TEXT NOT NULL,
+                requested_cost_usd TEXT NOT NULL, provider_actual_cost_usd TEXT,
+                provider_job_id TEXT UNIQUE, app_identity TEXT,
+                idempotency_key TEXT NOT NULL UNIQUE, settlement_identity TEXT UNIQUE,
+                owner_id TEXT NOT NULL, lease_expires_at TEXT NOT NULL,
+                heartbeat_at TEXT NOT NULL, failure_reason TEXT,
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+            );
+            INSERT INTO budget_reservations_v4_legacy
+            SELECT reservation_id, run_id, experiment_id, phase, status, requested_cost_usd,
+                   provider_actual_cost_usd, provider_job_id, app_identity, idempotency_key,
+                   settlement_identity, owner_id, lease_expires_at, heartbeat_at,
+                   failure_reason, created_at, updated_at
+            FROM budget_reservations;
+            DROP INDEX budget_reservations_active_experiment;
+            DROP INDEX budget_reservations_reference_scope;
+            DROP TABLE budget_reservations;
+            DROP INDEX experiments_config_sha;
+            DROP TABLE experiments;
+            ALTER TABLE experiments_v4_legacy RENAME TO experiments;
+            ALTER TABLE budget_reservations_v4_legacy RENAME TO budget_reservations;
+            CREATE INDEX experiments_config_sha ON experiments(config_sha256);
+            CREATE UNIQUE INDEX budget_reservations_active_experiment
+            ON budget_reservations(experiment_id)
+            WHERE status IN ('reserved', 'submitted', 'settlement_pending', 'audit_blocked');
+            DELETE FROM schema_info;
+            INSERT INTO schema_info(version, applied_at) VALUES (4, '2026-08-22T00:00:00Z');
+            """
+        )
+
+
+def test_populated_v4_migration_preserves_legacy_rows_without_scope_authority(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "v4.sqlite"
+    _downgrade_populated_database_to_v4(path)
+    database = ResultsDatabase(path)
+    database.initialize()
+    with database.connect() as connection:
+        assert connection.execute("SELECT max(version) FROM schema_info").fetchone()[0] == 5
+        assert connection.execute("SELECT count(*) FROM experiments").fetchone()[0] == 1
+        assert connection.execute("SELECT count(*) FROM budget_reservations").fetchone()[0] == 1
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+        legacy = connection.execute(
+            "SELECT reference_execution_scope_sha256 FROM budget_reservations"
+        ).fetchone()[0]
+        actual = connection.execute(
+            "SELECT modal_cost_actual_usd FROM experiments"
+        ).fetchone()[0]
+    assert legacy is None
+    assert actual == "0"
+
+
+def test_v4_to_v5_migration_rolls_back_on_unknown_schema_state(tmp_path: Path) -> None:
+    path = tmp_path / "rollback.sqlite"
+    _downgrade_populated_database_to_v4(path)
+    import sqlite3
+
+    with sqlite3.connect(path) as connection:
+        connection.execute("CREATE TABLE experiments_v5(blocker INTEGER)")
+    with pytest.raises(DatabaseError, match="v5 migration failed"):
+        ResultsDatabase(path).initialize()
+    with sqlite3.connect(path) as connection:
+        assert connection.execute("SELECT max(version) FROM schema_info").fetchone()[0] == 4
+        assert connection.execute("SELECT count(*) FROM experiments").fetchone()[0] == 1
+        assert connection.execute("SELECT count(*) FROM budget_reservations").fetchone()[0] == 1
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+        columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(budget_reservations)")
+        }
+    assert "reference_execution_scope_sha256" not in columns
+
+
+def test_reference_execution_scope_is_canonical_and_source_bound() -> None:
+    scope = reference_execution_scope_sha256(
+        source_revision="d" * 40,
+        weight_inventory_sha256="1" * 64,
+        evaluation_lock_sha256="4" * 64,
+        formula_authority_sha256="5" * 64,
+    )
+    assert len(scope) == 64
+    assert scope == reference_execution_scope_sha256(
+        source_revision="d" * 40,
+        weight_inventory_sha256="1" * 64,
+        evaluation_lock_sha256="4" * 64,
+        formula_authority_sha256="5" * 64,
+    )
+    with pytest.raises(ValueError, match="source revision"):
+        reference_execution_scope_sha256(
+            source_revision="D" * 40,
+            weight_inventory_sha256="1" * 64,
+            evaluation_lock_sha256="4" * 64,
+            formula_authority_sha256="5" * 64,
+        )
+
+
 def test_reference_reservation_is_atomic_and_prevents_cap_overlap(tmp_path: Path) -> None:
     database = ResultsDatabase(tmp_path / "results.sqlite")
     database.initialize()
@@ -480,6 +611,7 @@ def test_reference_reservation_is_atomic_and_prevents_cap_overlap(tmp_path: Path
         _reserve(database, suffix="two")
     assert database.get_attempt("attempt-two")["status"] == "received"
     assert database.get_reservation("reservation-one")["status"] == "reserved"
+    assert database.get_run("run-one")["modal_cost_actual_usd"] is None
     with database.connect() as connection:
         assert connection.execute(
             "SELECT count(*) FROM experiments WHERE run_id = 'run-two'"
@@ -602,6 +734,7 @@ def test_reference_settlement_is_exactly_once_and_provider_attributed(tmp_path: 
     reservation = database.get_reservation("reservation-settle")
     assert reservation["status"] == "settled"
     assert reservation["provider_actual_cost_usd"] == "2.50"
+    assert database.get_run("run-settle")["modal_cost_actual_usd"] == "2.50"
     with pytest.raises(DatabaseError, match="cannot settle"):
         database.settle_reservation(
             "reservation-settle",
@@ -619,7 +752,7 @@ def test_stale_reference_reservations_release_only_before_submission(tmp_path: P
     assert released == {"released": ["reservation-pre"], "audit_blocked": []}
     assert database.get_run("run-pre")["status"] == "failed"
 
-    _reserve(database, suffix="post")
+    _reserve(database, suffix="post", observation_receipt_sha256="e" * 64)
     database.mark_reservation_submitted(
         "reservation-post",
         provider_job_id="job-post",
@@ -628,3 +761,157 @@ def test_stale_reference_reservations_release_only_before_submission(tmp_path: P
     )
     blocked = database.reconcile_stale_reservations(now="2026-08-22T00:10:00+00:00")
     assert blocked == {"released": [], "audit_blocked": ["reservation-post"]}
+    assert database.get_run("run-post")["modal_cost_actual_usd"] is None
+
+
+def test_released_scope_requires_new_observation_challenge_and_approval(tmp_path: Path) -> None:
+    database = ResultsDatabase(tmp_path / "results.sqlite")
+    database.initialize()
+    _reserve(database, suffix="first")
+    database.reconcile_stale_reservations(now="2026-08-22T00:10:00+00:00")
+
+    with pytest.raises(DatabaseError, match="observation"):
+        _reserve(database, suffix="same-observation")
+
+    _reserve(
+        database,
+        suffix="fresh",
+        observation_receipt_sha256="e" * 64,
+    )
+    assert database.get_reservation("reservation-fresh")["status"] == "reserved"
+    with database.connect() as connection:
+        consumed = connection.execute(
+            "SELECT count(*) FROM reference_approval_challenges WHERE consumed_at IS NOT NULL"
+        ).fetchone()[0]
+    assert consumed == 2
+
+
+@pytest.mark.parametrize(
+    "terminal", ["submitted", "settlement_pending", "settled", "audit_blocked", "failed"]
+)
+def test_submitted_or_later_scope_is_permanently_consumed(
+    tmp_path: Path, terminal: str
+) -> None:
+    database = ResultsDatabase(tmp_path / f"{terminal}.sqlite")
+    database.initialize()
+    _reserve(database, suffix=f"used-{terminal}")
+    reservation_id = f"reservation-used-{terminal}"
+    database.mark_reservation_submitted(
+        reservation_id,
+        provider_job_id=f"job-{terminal}",
+        app_identity=f"app-{terminal}",
+        occurred_at="2026-08-22T00:01:00+00:00",
+    )
+    if terminal == "settlement_pending":
+        database.mark_settlement_pending(
+            reservation_id, occurred_at="2026-08-22T00:02:00+00:00"
+        )
+    elif terminal == "settled":
+        database.settle_reservation(
+            reservation_id,
+            actual_cost_usd="4.00",
+            settlement_identity=f"bill-{terminal}",
+            occurred_at="2026-08-22T00:03:00+00:00",
+        )
+    elif terminal == "audit_blocked":
+        database.reconcile_stale_reservations(now="2026-08-22T00:10:00+00:00")
+    elif terminal == "failed":
+        with pytest.raises(DatabaseError, match="budget failure"):
+            database.settle_reservation(
+                reservation_id,
+                actual_cost_usd="4.01",
+                settlement_identity=f"bill-{terminal}",
+                occurred_at="2026-08-22T00:03:00+00:00",
+            )
+
+    with pytest.raises(DatabaseError, match="scope"):
+        _reserve(
+            database,
+            suffix=f"retry-{terminal}",
+            observation_receipt_sha256="e" * 64,
+        )
+
+
+def test_concurrent_connections_cannot_reserve_the_same_scope_twice(tmp_path: Path) -> None:
+    path = tmp_path / "race.sqlite"
+    ResultsDatabase(path).initialize()
+
+    def reserve(suffix: str, observation: str) -> str:
+        try:
+            _reserve(
+                ResultsDatabase(path),
+                suffix=suffix,
+                observation_receipt_sha256=observation,
+            )
+        except DatabaseError as exc:
+            return str(exc)
+        return "ok"
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        outcomes = list(
+            pool.map(
+                lambda args: reserve(*args),
+                [("race-a", "e" * 64), ("race-b", "f" * 64)],
+            )
+        )
+    assert outcomes.count("ok") == 1
+    assert any("cap" in outcome for outcome in outcomes if outcome != "ok")
+
+
+def test_over_cap_settlement_is_durable_and_unambiguously_fails(tmp_path: Path) -> None:
+    database = ResultsDatabase(tmp_path / "results.sqlite")
+    database.initialize()
+    _reserve(database, suffix="over")
+    database.mark_reservation_submitted(
+        "reservation-over",
+        provider_job_id="job-over",
+        app_identity="app-over",
+        occurred_at="2026-08-22T00:01:00+00:00",
+    )
+    with pytest.raises(DatabaseError, match="budget failure"):
+        database.settle_reservation(
+            "reservation-over",
+            actual_cost_usd="4.01",
+            settlement_identity="billing-over",
+            occurred_at="2026-08-22T00:03:00+00:00",
+        )
+    reservation = database.get_reservation("reservation-over")
+    assert reservation["status"] == "failed"
+    assert reservation["provider_actual_cost_usd"] == "4.01"
+    assert reservation["settlement_identity"] == "billing-over"
+    run = database.get_run("run-over")
+    assert run["status"] == "failed"
+    assert run["modal_cost_actual_usd"] == "4.01"
+    with pytest.raises(DatabaseError, match="cap"):
+        _reserve(
+            database,
+            suffix="different-scope-after-over",
+            observation_receipt_sha256="e" * 64,
+            mutate_config=lambda raw: raw["inputs"].__setitem__(
+                "source_revision", "e" * 40
+            ),
+        )
+
+
+def test_delayed_authoritative_billing_can_settle_an_audit_blocked_run(
+    tmp_path: Path,
+) -> None:
+    database = ResultsDatabase(tmp_path / "results.sqlite")
+    database.initialize()
+    _reserve(database, suffix="delayed")
+    database.mark_reservation_submitted(
+        "reservation-delayed",
+        provider_job_id="job-delayed",
+        app_identity="app-delayed",
+        occurred_at="2026-08-22T00:01:00+00:00",
+    )
+    database.reconcile_stale_reservations(now="2026-08-22T00:10:00+00:00")
+    assert database.get_run("run-delayed")["modal_cost_actual_usd"] is None
+    database.settle_reservation(
+        "reservation-delayed",
+        actual_cost_usd="4.00",
+        settlement_identity="billing-delayed",
+        occurred_at="2026-08-22T01:00:00+00:00",
+    )
+    assert database.get_reservation("reservation-delayed")["status"] == "settled"
+    assert database.get_run("run-delayed")["modal_cost_actual_usd"] == "4.00"

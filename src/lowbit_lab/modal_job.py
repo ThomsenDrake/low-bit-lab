@@ -34,6 +34,7 @@ from lowbit_lab.reference_contract import (
     ORIGINAL_APPROVED_PLAN_SHA256,
     PROVIDER_APPROVAL_OBSERVATION_MAX_AGE_SECONDS,
     REFERENCE_RESOURCES,
+    reference_execution_scope_sha256,
 )
 from lowbit_lab.reference_gates import (
     ReferenceGateError,
@@ -90,6 +91,7 @@ class ReferenceJobConfig:
     canonical_json: str
     sha256: str
     challenge_sha256: str
+    reference_execution_scope_sha256: str | None
 
 
 def _closed(value: Any, fields: set[str], label: str) -> dict[str, Any]:
@@ -192,6 +194,7 @@ def load_reference_job_config(path: Path, *, root: Path) -> ReferenceJobConfig:
         root, top["budget_policy_path"], "budget_policy_path", "configs/local/"
     )
     input_fields = {
+        "source_revision",
         "weight_inventory_sha256",
         "weight_inventory_tensor_bytes",
         "provenance_manifest_sha256",
@@ -210,9 +213,9 @@ def load_reference_job_config(path: Path, *, root: Path) -> ReferenceJobConfig:
             continue
         if digest is None and name == "formula_authority_sha256":
             continue
-        if name == "reviewed_commit_sha256":
+        if name in {"source_revision", "reviewed_commit_sha256"}:
             if not isinstance(digest, str) or IMMUTABLE_REVISION_RE.fullmatch(digest) is None:
-                raise ReferenceJobError("reviewed_commit_sha256 must be a commit identity")
+                raise ReferenceJobError(f"{name} must be a commit identity")
             continue
         if not isinstance(digest, str) or SHA256_RE.fullmatch(digest) is None:
             raise ReferenceJobError(f"{name} must be lowercase SHA-256")
@@ -333,6 +336,14 @@ def load_reference_job_config(path: Path, *, root: Path) -> ReferenceJobConfig:
     challenge_json = json.dumps(
         challenge_material, sort_keys=True, separators=(",", ":"), ensure_ascii=True
     )
+    execution_scope = None
+    if inputs["formula_authority_sha256"] is not None:
+        execution_scope = reference_execution_scope_sha256(
+            source_revision=str(inputs["source_revision"]),
+            weight_inventory_sha256=str(inputs["weight_inventory_sha256"]),
+            evaluation_lock_sha256=str(inputs["evaluation_lock_sha256"]),
+            formula_authority_sha256=str(inputs["formula_authority_sha256"]),
+        )
     return ReferenceJobConfig(
         experiment_id=top["experiment_id"],
         original_approved_plan_path=original_plan_path,
@@ -349,6 +360,7 @@ def load_reference_job_config(path: Path, *, root: Path) -> ReferenceJobConfig:
         canonical_json=canonical,
         sha256=hashlib.sha256(canonical.encode()).hexdigest(),
         challenge_sha256=hashlib.sha256(challenge_json.encode()).hexdigest(),
+        reference_execution_scope_sha256=execution_scope,
     )
 
 
@@ -544,11 +556,14 @@ def plan_reference_preview(config: ReferenceJobConfig, *, root: Path) -> dict[st
         "cloud_upload": False,
         "weights_transferred": False,
         "actual_cost_usd": "0",
-        "local_reservation_limit_usd": format(budget_preview.maximum_cost_usd, "f"),
+        "local_reservation_limit_usd": format(
+            budget_preview.local_reservation_limit_usd, "f"
+        ),
         "estimated_cost_usd": format(budget_preview.estimated_cost_usd, "f"),
         "resources": config.resources,
         "challenge_sha256": config.challenge_sha256,
         "config_sha256": config.sha256,
+        "reference_execution_scope_sha256": config.reference_execution_scope_sha256,
         "blockers": blockers,
     }
 
@@ -606,6 +621,7 @@ def _verify_reference_authorities(config: ReferenceJobConfig, *, root: Path) -> 
         if (
             inventory.sha256 != config.inputs["weight_inventory_sha256"]
             or inventory.index_tensor_bytes != config.inputs["weight_inventory_tensor_bytes"]
+            or inventory.source_revision != config.inputs["source_revision"]
         ):
             return False
         receipt = json.loads(paths["runtime_receipt_path"].read_text(encoding="utf-8"))

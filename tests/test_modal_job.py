@@ -70,6 +70,7 @@ def _config(tmp_path: Path, **changes: object) -> Path:
         "approved_amendment_sha256": APPROVED_PROVIDER_AMENDMENT_SHA256,
         "budget_policy_path": "configs/local/reference-budget.json",
         "inputs": {
+            "source_revision": "d" * 40,
             "weight_inventory_sha256": "1" * 64,
             "weight_inventory_tensor_bytes": 55,
             "provenance_manifest_sha256": "2" * 64,
@@ -155,6 +156,17 @@ def test_reference_preview_is_exact_non_submitting_and_zero_actual(tmp_path: Pat
     assert "provider_billing_scope_unproven" in preview["blockers"]
     assert "execution_approval_missing" in preview["blockers"]
     assert len(preview["challenge_sha256"]) == 64
+
+
+def test_reference_source_revision_is_closed_and_immutable(tmp_path: Path) -> None:
+    config = load_reference_job_config(_config(tmp_path), root=tmp_path)
+    assert config.inputs["source_revision"] == "d" * 40
+    raw = yaml.safe_load(_config(tmp_path).read_text(encoding="utf-8"))
+    raw["inputs"]["source_revision"] = "D" * 40
+    path = tmp_path / "configs" / "local" / "bad-revision.yaml"
+    path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    with pytest.raises(ReferenceJobError, match="source_revision"):
+        load_reference_job_config(path, root=tmp_path)
 
 
 def test_reference_preview_derives_gates_from_hashed_evidence(tmp_path: Path) -> None:

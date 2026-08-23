@@ -34,7 +34,7 @@ class BudgetAuthorization:
 class ReferenceBudgetPreview:
     phase: int
     estimated_cost_usd: Decimal
-    maximum_cost_usd: Decimal
+    local_reservation_limit_usd: Decimal
     submission_authorized: bool
     approved_plan_sha256: str
 
@@ -146,7 +146,7 @@ class BudgetGuard:
 class ReferenceBudgetGuard:
     """Validate a local reference-run budget without weakening the public zero ledger."""
 
-    MAXIMUM_REFERENCE_CAP = Decimal("4.00")
+    LOCAL_RESERVATION_LIMIT = Decimal("4.00")
     _FIELDS = {
         "schema_version",
         "kind",
@@ -197,11 +197,11 @@ class ReferenceBudgetGuard:
         )
         self.submission_authorized = raw["submission_authorized"]
         if (
-            self.phase_cap > self.MAXIMUM_REFERENCE_CAP
-            or self.total_cap > self.MAXIMUM_REFERENCE_CAP
-            or self.single_job_cap > self.MAXIMUM_REFERENCE_CAP
+            self.phase_cap > self.LOCAL_RESERVATION_LIMIT
+            or self.total_cap > self.LOCAL_RESERVATION_LIMIT
+            or self.single_job_cap > self.LOCAL_RESERVATION_LIMIT
         ):
-            raise BudgetError("reference budget exceeds maximum reference cap")
+            raise BudgetError("reference budget exceeds the local reservation limit")
         if not (self.single_job_cap <= self.phase_cap <= self.total_cap):
             raise BudgetError("reference budget caps are inconsistent")
 
@@ -221,7 +221,7 @@ class ReferenceBudgetGuard:
         return ReferenceBudgetPreview(
             phase=self.phase,
             estimated_cost_usd=estimated,
-            maximum_cost_usd=self.single_job_cap,
+            local_reservation_limit_usd=self.single_job_cap,
             submission_authorized=self.submission_authorized,
             approved_plan_sha256=self.approved_plan_sha256,
         )
@@ -230,7 +230,7 @@ class ReferenceBudgetGuard:
         if not self.submission_authorized:
             raise BudgetError("reference submission is not authorized")
         requested = _money(requested_cost_usd, "requested_cost_usd")
-        if requested != self.single_job_cap or requested != self.MAXIMUM_REFERENCE_CAP:
+        if requested != self.single_job_cap or requested != self.LOCAL_RESERVATION_LIMIT:
             raise BudgetError("reference submission must reserve exactly USD 4.00")
         return BudgetAuthorization(
             phase=self.phase,

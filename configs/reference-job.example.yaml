@@ -7,6 +7,7 @@ approved_amendment_path: docs/plans/local/approved-provider-constraint-amendment
 approved_amendment_sha256: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 budget_policy_path: configs/local/reference-budget.json
 inputs:
+  source_revision: dddddddddddddddddddddddddddddddddddddddd
   weight_inventory_sha256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
   weight_inventory_tensor_bytes: 1
   provenance_manifest_sha256: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb

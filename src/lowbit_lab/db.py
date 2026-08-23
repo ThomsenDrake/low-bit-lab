@@ -20,9 +20,10 @@ from lowbit_lab.reference_contract import (
     ORIGINAL_APPROVED_PLAN_PATH,
     ORIGINAL_APPROVED_PLAN_SHA256,
     REFERENCE_RESOURCES,
+    reference_execution_scope_sha256,
 )
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 REFERENCE_RESERVATION_USD = Decimal("4.00")
 TERMINAL_STATES = {"completed", "failed"}
 TRANSITIONS = {
@@ -61,7 +62,7 @@ CREATE TABLE IF NOT EXISTS experiments (
         status IN ('created', 'validated', 'running', 'completed', 'failed')
     ),
     modal_cost_requested_usd TEXT NOT NULL DEFAULT '0',
-    modal_cost_actual_usd TEXT NOT NULL DEFAULT '0',
+    modal_cost_actual_usd TEXT DEFAULT '0',
     failure_reason TEXT,
     owner_id TEXT,
     lease_expires_at TEXT,
@@ -70,7 +71,11 @@ CREATE TABLE IF NOT EXISTS experiments (
     ended_at TEXT,
     CHECK((status IN ('completed', 'failed') AND ended_at IS NOT NULL) OR
           (status NOT IN ('completed', 'failed') AND ended_at IS NULL)),
-    CHECK((status = 'failed' AND failure_reason IS NOT NULL) OR status != 'failed')
+    CHECK((status = 'failed' AND failure_reason IS NOT NULL) OR status != 'failed'),
+    CHECK((mode = 'modal_reference' AND status NOT IN ('completed', 'failed'))
+          OR modal_cost_actual_usd IS NOT NULL),
+    CHECK(mode = 'modal_reference' OR
+          (modal_cost_requested_usd = '0' AND modal_cost_actual_usd = '0'))
 );
 CREATE INDEX IF NOT EXISTS experiments_config_sha ON experiments(config_sha256);
 CREATE TABLE IF NOT EXISTS state_transitions (
@@ -145,6 +150,9 @@ CREATE TABLE IF NOT EXISTS budget_reservations (
     reservation_id TEXT PRIMARY KEY,
     run_id TEXT NOT NULL UNIQUE REFERENCES experiments(run_id) ON DELETE RESTRICT,
     experiment_id TEXT NOT NULL,
+    reference_execution_scope_sha256 TEXT
+        CHECK(reference_execution_scope_sha256 IS NULL
+              OR length(reference_execution_scope_sha256) = 64),
     phase INTEGER NOT NULL CHECK(phase = 1),
     status TEXT NOT NULL CHECK(status IN (
         'reserved', 'submitted', 'settlement_pending', 'settled',
@@ -171,6 +179,8 @@ CREATE TABLE IF NOT EXISTS budget_reservations (
 CREATE UNIQUE INDEX IF NOT EXISTS budget_reservations_active_experiment
 ON budget_reservations(experiment_id)
 WHERE status IN ('reserved', 'submitted', 'settlement_pending', 'audit_blocked');
+CREATE INDEX IF NOT EXISTS budget_reservations_reference_scope
+ON budget_reservations(reference_execution_scope_sha256, status);
 CREATE TABLE IF NOT EXISTS reference_approval_challenges (
     challenge_sha256 TEXT PRIMARY KEY CHECK(length(challenge_sha256) = 64),
     packet_sha256 TEXT NOT NULL CHECK(length(packet_sha256) = 64),
@@ -341,6 +351,7 @@ def _reference_challenge(config_json: str, config_sha256: str) -> tuple[str, dic
         "approval_artifact_path",
     }
     input_fields = {
+        "source_revision",
         "weight_inventory_sha256",
         "weight_inventory_tensor_bytes",
         "provenance_manifest_sha256",
@@ -426,6 +437,16 @@ def _reference_challenge(config_json: str, config_sha256: str) -> tuple[str, dic
     for digest_name in ("workspace_scope_sha256", "environment_scope_sha256"):
         if SHA256_RE.fullmatch(str(provider[digest_name])) is None:
             raise DatabaseError("reference provider authority is invalid")
+    inputs = raw["inputs"]
+    if IMMUTABLE_REVISION_RE.fullmatch(str(inputs["source_revision"])) is None:
+        raise DatabaseError("reference source_revision is not an immutable revision")
+    for digest_name in (
+        "weight_inventory_sha256",
+        "evaluation_lock_sha256",
+        "formula_authority_sha256",
+    ):
+        if SHA256_RE.fullmatch(str(inputs[digest_name])) is None:
+            raise DatabaseError("reference execution scope authority is incomplete")
     for path_name, digest_name in (
         ("constraint_contract_path", "constraint_contract_sha256"),
         ("observation_receipt_path", "observation_receipt_sha256"),
@@ -567,7 +588,11 @@ class ResultsDatabase:
                 existing = 3
             if existing == 3:
                 self._migrate_v3_to_v4(connection)
-            elif existing != SCHEMA_VERSION:
+                existing = 4
+            if existing == 4:
+                self._migrate_v4_to_v5(connection)
+                existing = 5
+            if existing != SCHEMA_VERSION:
                 raise DatabaseError(f"database schema {existing} != supported {SCHEMA_VERSION}")
 
     def _migrate_v1_to_v2(self, connection: sqlite3.Connection) -> None:
@@ -809,6 +834,166 @@ class ResultsDatabase:
         finally:
             connection.execute("PRAGMA foreign_keys = ON")
 
+    def _migrate_v4_to_v5(self, connection: sqlite3.Connection) -> None:
+        connection.commit()
+        connection.execute("PRAGMA foreign_keys = OFF")
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            before = {
+                "experiments": connection.execute(
+                    "SELECT count(*) FROM experiments"
+                ).fetchone()[0],
+                "budget_reservations": connection.execute(
+                    "SELECT count(*) FROM budget_reservations"
+                ).fetchone()[0],
+            }
+            connection.execute(
+                """CREATE TABLE experiments_v5 (
+                    run_id TEXT PRIMARY KEY,
+                    experiment_id TEXT NOT NULL
+                        REFERENCES experiment_configs(experiment_id) ON DELETE RESTRICT,
+                    config_sha256 TEXT NOT NULL CHECK(length(config_sha256) = 64),
+                    config_json TEXT NOT NULL,
+                    source_hashes_json TEXT NOT NULL,
+                    runtime_json TEXT NOT NULL,
+                    hardware_json TEXT NOT NULL,
+                    phase INTEGER NOT NULL CHECK(phase >= 0),
+                    mode TEXT NOT NULL CHECK(mode IN (
+                        'local_dry_run', 'modal_dry_run', 'local_activation', 'modal_reference'
+                    )),
+                    status TEXT NOT NULL CHECK(
+                        status IN ('created', 'validated', 'running', 'completed', 'failed')
+                    ),
+                    modal_cost_requested_usd TEXT NOT NULL DEFAULT '0',
+                    modal_cost_actual_usd TEXT DEFAULT '0',
+                    failure_reason TEXT,
+                    owner_id TEXT,
+                    lease_expires_at TEXT,
+                    heartbeat_at TEXT,
+                    started_at TEXT NOT NULL,
+                    ended_at TEXT,
+                    CHECK((status IN ('completed', 'failed') AND ended_at IS NOT NULL) OR
+                          (status NOT IN ('completed', 'failed') AND ended_at IS NULL)),
+                    CHECK((status = 'failed' AND failure_reason IS NOT NULL)
+                          OR status != 'failed'),
+                    CHECK((mode = 'modal_reference'
+                           AND status NOT IN ('completed', 'failed'))
+                          OR modal_cost_actual_usd IS NOT NULL),
+                    CHECK(mode = 'modal_reference' OR
+                          (modal_cost_requested_usd = '0' AND modal_cost_actual_usd = '0'))
+                )"""
+            )
+            experiment_columns = (
+                "run_id, experiment_id, config_sha256, config_json, source_hashes_json, "
+                "runtime_json, hardware_json, phase, mode, status, modal_cost_requested_usd, "
+                "modal_cost_actual_usd, failure_reason, owner_id, lease_expires_at, heartbeat_at, "
+                "started_at, ended_at"
+            )
+            connection.execute(
+                f"INSERT INTO experiments_v5 ({experiment_columns}) "
+                f"SELECT {experiment_columns} FROM experiments"
+            )
+            connection.execute(
+                """CREATE TABLE budget_reservations_v5 (
+                    reservation_id TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL UNIQUE
+                        REFERENCES experiments_v5(run_id) ON DELETE RESTRICT,
+                    experiment_id TEXT NOT NULL,
+                    reference_execution_scope_sha256 TEXT
+                        CHECK(reference_execution_scope_sha256 IS NULL
+                              OR length(reference_execution_scope_sha256) = 64),
+                    phase INTEGER NOT NULL CHECK(phase = 1),
+                    status TEXT NOT NULL CHECK(status IN (
+                        'reserved', 'submitted', 'settlement_pending', 'settled',
+                        'released', 'failed', 'audit_blocked'
+                    )),
+                    requested_cost_usd TEXT NOT NULL,
+                    provider_actual_cost_usd TEXT,
+                    provider_job_id TEXT UNIQUE,
+                    app_identity TEXT,
+                    idempotency_key TEXT NOT NULL UNIQUE,
+                    settlement_identity TEXT UNIQUE,
+                    owner_id TEXT NOT NULL,
+                    lease_expires_at TEXT NOT NULL,
+                    heartbeat_at TEXT NOT NULL,
+                    failure_reason TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    CHECK((status = 'settled' AND provider_actual_cost_usd IS NOT NULL
+                           AND settlement_identity IS NOT NULL) OR status != 'settled'),
+                    CHECK((status IN (
+                              'submitted', 'settlement_pending', 'settled', 'audit_blocked'
+                           ) AND provider_job_id IS NOT NULL AND app_identity IS NOT NULL)
+                          OR status NOT IN (
+                              'submitted', 'settlement_pending', 'settled', 'audit_blocked'
+                          ))
+                )"""
+            )
+            reservation_columns = (
+                "reservation_id, run_id, experiment_id, phase, status, requested_cost_usd, "
+                "provider_actual_cost_usd, provider_job_id, app_identity, idempotency_key, "
+                "settlement_identity, owner_id, lease_expires_at, heartbeat_at, failure_reason, "
+                "created_at, updated_at"
+            )
+            connection.execute(
+                f"INSERT INTO budget_reservations_v5 ({reservation_columns}) "
+                f"SELECT {reservation_columns} FROM budget_reservations"
+            )
+            copied = {
+                "experiments": connection.execute(
+                    "SELECT count(*) FROM experiments_v5"
+                ).fetchone()[0],
+                "budget_reservations": connection.execute(
+                    "SELECT count(*) FROM budget_reservations_v5"
+                ).fetchone()[0],
+            }
+            if before != copied:
+                raise DatabaseError("schema v5 row-count validation failed")
+            if connection.execute("PRAGMA foreign_key_check('experiments_v5')").fetchall():
+                raise DatabaseError("schema v5 foreign-key validation failed")
+            if connection.execute("PRAGMA foreign_key_check('budget_reservations_v5')").fetchall():
+                raise DatabaseError("schema v5 foreign-key validation failed")
+
+            connection.execute("DROP INDEX IF EXISTS budget_reservations_active_experiment")
+            connection.execute("DROP TABLE budget_reservations")
+            connection.execute("DROP INDEX IF EXISTS experiments_config_sha")
+            connection.execute("DROP TABLE experiments")
+            connection.execute("ALTER TABLE experiments_v5 RENAME TO experiments")
+            connection.execute(
+                "ALTER TABLE budget_reservations_v5 RENAME TO budget_reservations"
+            )
+            connection.execute("CREATE INDEX experiments_config_sha ON experiments(config_sha256)")
+            connection.execute(
+                """CREATE UNIQUE INDEX budget_reservations_active_experiment
+                ON budget_reservations(experiment_id)
+                WHERE status IN ('reserved', 'submitted', 'settlement_pending', 'audit_blocked')"""
+            )
+            connection.execute(
+                """CREATE INDEX budget_reservations_reference_scope
+                ON budget_reservations(reference_execution_scope_sha256, status)"""
+            )
+            if before != {
+                "experiments": connection.execute(
+                    "SELECT count(*) FROM experiments"
+                ).fetchone()[0],
+                "budget_reservations": connection.execute(
+                    "SELECT count(*) FROM budget_reservations"
+                ).fetchone()[0],
+            } or connection.execute("PRAGMA foreign_key_check").fetchall():
+                raise DatabaseError("schema v5 final validation failed")
+            connection.execute(
+                """INSERT INTO schema_info(version, applied_at)
+                VALUES (5, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))"""
+            )
+            connection.commit()
+        except Exception as exc:
+            connection.rollback()
+            if isinstance(exc, DatabaseError):
+                raise
+            raise DatabaseError(f"database schema v5 migration failed: {exc}") from exc
+        finally:
+            connection.execute("PRAGMA foreign_keys = ON")
+
     def create_run(
         self,
         *,
@@ -830,6 +1015,8 @@ class ResultsDatabase:
     ) -> None:
         if mode == "local_activation":
             _validate_activation_run_config(config_json, requested_cost)
+        if mode == "modal_reference":
+            raise DatabaseError("modal_reference runs require an atomic budget reservation")
         with self.connect() as connection:
             registered = connection.execute(
                 "SELECT config_sha256, config_json FROM experiment_configs WHERE experiment_id = ?",
@@ -983,6 +1170,15 @@ class ResultsDatabase:
             raise DatabaseError("reference source lineage does not match the canonical config")
         if runtime != {"receipt_sha256": inputs.get("runtime_receipt_sha256")}:
             raise DatabaseError("reference runtime lineage does not match the canonical config")
+        try:
+            execution_scope_sha256 = reference_execution_scope_sha256(
+                source_revision=str(inputs["source_revision"]),
+                weight_inventory_sha256=str(inputs["weight_inventory_sha256"]),
+                evaluation_lock_sha256=str(inputs["evaluation_lock_sha256"]),
+                formula_authority_sha256=str(inputs["formula_authority_sha256"]),
+            )
+        except ValueError as exc:
+            raise DatabaseError(f"reference execution scope is invalid: {exc}") from exc
         for label, value in (
             ("config", parsed_config),
             ("source_hashes", source_hashes),
@@ -1011,15 +1207,50 @@ class ResultsDatabase:
                 raise DatabaseError(
                     "reference approval is missing, expired, mismatched, or consumed"
                 )
+            prior_scope_rows = connection.execute(
+                """SELECT br.status, e.config_json, rac.challenge_sha256, rac.approval_digest
+                FROM budget_reservations AS br
+                JOIN experiments AS e ON e.run_id = br.run_id
+                LEFT JOIN reference_approval_challenges AS rac ON rac.run_id = br.run_id
+                WHERE br.reference_execution_scope_sha256 = ?""",
+                (execution_scope_sha256,),
+            ).fetchall()
+            for prior in prior_scope_rows:
+                if prior["status"] in {
+                    "submitted",
+                    "settlement_pending",
+                    "settled",
+                    "failed",
+                    "audit_blocked",
+                }:
+                    raise DatabaseError("reference execution scope is permanently consumed")
+                if prior["status"] == "released":
+                    prior_config = json.loads(prior["config_json"])
+                    prior_observation = prior_config["provider"]["observation_receipt_sha256"]
+                    current_observation = parsed_config["provider"][
+                        "observation_receipt_sha256"
+                    ]
+                    if prior_observation == current_observation:
+                        raise DatabaseError(
+                            "released reference scope requires a fresh observation receipt"
+                        )
+                    if (
+                        prior["challenge_sha256"] == challenge_sha256
+                        or prior["approval_digest"] == approval_digest
+                    ):
+                        raise DatabaseError(
+                            "released reference scope requires a new challenge and approval"
+                        )
             committed = Decimal("0")
             for row in connection.execute(
                 """SELECT status, requested_cost_usd, provider_actual_cost_usd
                 FROM budget_reservations
-                WHERE status NOT IN ('released', 'failed')"""
+                WHERE status != 'released'"""
             ):
                 value = (
                     row["provider_actual_cost_usd"]
-                    if row["status"] == "settled"
+                    if row["status"] in {"settled", "failed"}
+                    and row["provider_actual_cost_usd"] is not None
                     else row["requested_cost_usd"]
                 )
                 committed += _database_money(value, "stored reservation cost")
@@ -1054,7 +1285,7 @@ class ResultsDatabase:
                     modal_cost_requested_usd, modal_cost_actual_usd, owner_id,
                     lease_expires_at, heartbeat_at, started_at
                 ) VALUES (
-                    ?, ?, ?, ?, ?, ?, ?, 1, 'modal_reference', 'created', ?, '0', ?, ?, ?, ?
+                    ?, ?, ?, ?, ?, ?, ?, 1, 'modal_reference', 'created', ?, NULL, ?, ?, ?, ?
                 )""",
                 (
                     run_id,
@@ -1083,14 +1314,16 @@ class ResultsDatabase:
             )
             connection.execute(
                 """INSERT INTO budget_reservations(
-                    reservation_id, run_id, experiment_id, phase, status, requested_cost_usd,
+                    reservation_id, run_id, experiment_id, reference_execution_scope_sha256,
+                    phase, status, requested_cost_usd,
                     idempotency_key, owner_id, lease_expires_at, heartbeat_at,
                     created_at, updated_at
-                ) VALUES (?, ?, ?, 1, 'reserved', ?, ?, ?, ?, ?, ?, ?)""",
+                ) VALUES (?, ?, ?, ?, 1, 'reserved', ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     reservation_id,
                     run_id,
                     experiment_id,
+                    execution_scope_sha256,
                     requested_cost_usd,
                     idempotency_key,
                     owner_id,
@@ -1180,6 +1413,7 @@ class ResultsDatabase:
         actual = _database_money(actual_cost_usd, "actual_cost_usd")
         if not settlement_identity:
             raise DatabaseError("settlement requires provider attribution")
+        budget_failure = False
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
@@ -1187,22 +1421,75 @@ class ResultsDatabase:
                 WHERE reservation_id = ?""",
                 (reservation_id,),
             ).fetchone()
-            if row is None or row["status"] not in {"submitted", "settlement_pending"}:
+            if row is None or row["status"] not in {
+                "submitted",
+                "settlement_pending",
+                "audit_blocked",
+            }:
                 raise DatabaseError(f"reservation cannot settle: {reservation_id}")
             if actual > _database_money(row["requested_cost_usd"], "requested_cost_usd"):
-                raise DatabaseError("provider actual cost exceeds reserved cap")
-            cursor = connection.execute(
-                """UPDATE budget_reservations SET status = 'settled',
-                    provider_actual_cost_usd = ?, settlement_identity = ?, heartbeat_at = ?,
-                    updated_at = ? WHERE reservation_id = ?
-                    AND status IN ('submitted', 'settlement_pending')""",
-                (actual_cost_usd, settlement_identity, occurred_at, occurred_at, reservation_id),
-            )
-            if cursor.rowcount != 1:
-                raise DatabaseError(f"reservation cannot settle: {reservation_id}")
-            connection.execute(
-                "UPDATE experiments SET modal_cost_actual_usd = ? WHERE run_id = ?",
-                (actual_cost_usd, row["run_id"]),
+                reason = (
+                    "authoritative provider actual cost exceeds the USD 4.00 local reservation; "
+                    "budget failure"
+                )
+                cursor = connection.execute(
+                    """UPDATE budget_reservations SET status = 'failed',
+                        provider_actual_cost_usd = ?, settlement_identity = ?, failure_reason = ?,
+                        heartbeat_at = ?, updated_at = ? WHERE reservation_id = ?
+                        AND status IN ('submitted', 'settlement_pending', 'audit_blocked')""",
+                    (
+                        actual_cost_usd,
+                        settlement_identity,
+                        reason,
+                        occurred_at,
+                        occurred_at,
+                        reservation_id,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise DatabaseError(f"reservation cannot settle: {reservation_id}")
+                run = connection.execute(
+                    "SELECT status FROM experiments WHERE run_id = ?", (row["run_id"],)
+                ).fetchone()
+                if run is None:
+                    raise DatabaseError(f"reservation run is missing: {reservation_id}")
+                connection.execute(
+                    """UPDATE experiments SET status = 'failed', modal_cost_actual_usd = ?,
+                        failure_reason = ?, ended_at = ? WHERE run_id = ?""",
+                    (actual_cost_usd, reason, occurred_at, row["run_id"]),
+                )
+                connection.execute(
+                    """INSERT INTO state_transitions(
+                        run_id, from_state, to_state, reason, occurred_at
+                    ) VALUES (?, ?, 'failed', ?, ?)""",
+                    (row["run_id"], run["status"], reason, occurred_at),
+                )
+                budget_failure = True
+            else:
+                cursor = connection.execute(
+                    """UPDATE budget_reservations SET status = 'settled',
+                        provider_actual_cost_usd = ?, settlement_identity = ?,
+                        failure_reason = NULL, heartbeat_at = ?, updated_at = ?
+                        WHERE reservation_id = ?
+                        AND status IN ('submitted', 'settlement_pending', 'audit_blocked')""",
+                    (
+                        actual_cost_usd,
+                        settlement_identity,
+                        occurred_at,
+                        occurred_at,
+                        reservation_id,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise DatabaseError(f"reservation cannot settle: {reservation_id}")
+                connection.execute(
+                    """UPDATE experiments SET modal_cost_actual_usd = ?, failure_reason = NULL
+                    WHERE run_id = ?""",
+                    (actual_cost_usd, row["run_id"]),
+                )
+        if budget_failure:
+            raise DatabaseError(
+                "authoritative provider cost was recorded as a terminal budget failure"
             )
 
     def get_reservation(self, reservation_id: str) -> dict[str, Any]:
@@ -1218,6 +1505,7 @@ class ResultsDatabase:
     def reconcile_stale_reservations(self, *, now: str) -> dict[str, list[str]]:
         result: dict[str, list[str]] = {"released": [], "audit_blocked": []}
         with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
             rows = connection.execute(
                 """SELECT reservation_id, status FROM budget_reservations
                 WHERE status IN ('reserved', 'submitted', 'settlement_pending')
@@ -1246,7 +1534,8 @@ class ResultsDatabase:
                     if run is not None and run["status"] not in TERMINAL_STATES:
                         if next_state == "released":
                             connection.execute(
-                                """UPDATE experiments SET status = 'failed', failure_reason = ?,
+                                """UPDATE experiments SET status = 'failed',
+                                    modal_cost_actual_usd = '0', failure_reason = ?,
                                     ended_at = ? WHERE run_id = ?""",
                                 (reason, now, run["run_id"]),
                             )
@@ -1541,7 +1830,7 @@ class ResultsDatabase:
             for row in connection.execute(
                 "SELECT phase, modal_cost_actual_usd FROM experiments"
             ):
-                cost = Decimal(row["modal_cost_actual_usd"])
+                cost = Decimal(row["modal_cost_actual_usd"] or "0")
                 total += cost
                 if row["phase"] == phase:
                     phase_total += cost

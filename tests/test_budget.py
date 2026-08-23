@@ -73,7 +73,7 @@ def test_reference_budget_preview_is_exact_but_cannot_authorize_submission(
     )
     preview = guard.preview(cpu_cores=8, memory_gib=96, wall_clock_seconds=2700)
     assert preview.estimated_cost_usd == Decimal("2.73218400")
-    assert preview.maximum_cost_usd == Decimal("4.00")
+    assert preview.local_reservation_limit_usd == Decimal("4.00")
     assert preview.submission_authorized is False
     with pytest.raises(BudgetError, match="not authorized"):
         guard.authorize_submission(requested_cost_usd="4.00")
@@ -88,7 +88,7 @@ def test_reference_budget_is_closed_and_bound_to_approved_plan(tmp_path: Path) -
         ReferenceBudgetGuard(
             _reference_policy(tmp_path, extra=True), expected_plan_sha256="a" * 64
         )
-    with pytest.raises(BudgetError, match="maximum reference cap"):
+    with pytest.raises(BudgetError, match="local reservation limit"):
         ReferenceBudgetGuard(
             _reference_policy(tmp_path, total_cap_usd="4.01"),
             expected_plan_sha256="a" * 64,
