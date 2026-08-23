@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -14,6 +15,9 @@ from lowbit_lab.reference_gates import (
     verify_cold_path_time_evidence,
     verify_formula_authority,
     verify_memory_fit_evidence,
+    verify_provider_billing_authority,
+    verify_provider_constraint_contract,
+    verify_provider_observation_receipt,
     verify_provider_safety_evidence,
 )
 
@@ -22,6 +26,54 @@ def _write(path: Path, value: object) -> str:
     content = (json.dumps(value, sort_keys=True) + "\n").encode()
     path.write_bytes(content)
     return hashlib.sha256(content).hexdigest()
+
+
+def _provider_constraint_contract() -> dict[str, object]:
+    return {
+        "schema_version": 2,
+        "kind": "provider_constraint_contract",
+        "provider": "modal",
+        "workspace_scope_sha256": "a" * 64,
+        "environment_scope_sha256": "b" * 64,
+        "maximum_concurrent_containers": 1,
+        "maximum_concurrent_gpus": 1,
+        "provider_hard_budget_available": False,
+        "provider_crash_rescheduling_bounded": False,
+        "observation_method_sha256": "c" * 64,
+        "approved_amendment_sha256": "d" * 64,
+    }
+
+
+def _provider_observation_receipt(
+    contract_sha256: str, *, observed_at: datetime
+) -> dict[str, object]:
+    return {
+        "schema_version": 2,
+        "kind": "provider_constraint_observation_receipt",
+        "provider": "modal",
+        "workspace_scope_sha256": "a" * 64,
+        "environment_scope_sha256": "b" * 64,
+        "approved_amendment_sha256": "d" * 64,
+        "constraint_contract_sha256": contract_sha256,
+        "screenshot_sha256": "e" * 64,
+        "observed_maximum_concurrent_containers": 1,
+        "observed_maximum_concurrent_gpus": 1,
+        "active_containers": 0,
+        "active_gpus": 0,
+        "observed_at": observed_at.isoformat(),
+    }
+
+
+def _provider_billing_authority() -> dict[str, object]:
+    return {
+        "schema_version": 2,
+        "kind": "provider_billing_authority_contract",
+        "provider": "modal",
+        "environment_scope_sha256": "b" * 64,
+        "attribution_method_sha256": "f" * 64,
+        "authoritative_report_identity_sha256": "1" * 64,
+        "billing_completeness_delay_seconds": 3600,
+    }
 
 
 def test_formula_authority_is_closed_exact_and_reviewable(tmp_path: Path) -> None:
@@ -204,3 +256,257 @@ def test_provider_evidence_requires_exact_cap_billing_and_single_attempt(tmp_pat
     digest = _write(path, evidence)
     with pytest.raises(ReferenceGateError, match="one billable attempt"):
         verify_provider_safety_evidence(path, expected_sha256=digest)
+
+
+def test_provider_constraint_contract_accepts_only_the_approved_residual_risk(
+    tmp_path: Path,
+) -> None:
+    contract = _provider_constraint_contract()
+    path = tmp_path / "constraint.json"
+    digest = _write(path, contract)
+
+    result = verify_provider_constraint_contract(
+        path,
+        expected_sha256=digest,
+        expected_workspace_scope_sha256="a" * 64,
+        expected_environment_scope_sha256="b" * 64,
+        expected_amendment_sha256="d" * 64,
+    )
+
+    assert result == {
+        "proven": True,
+        "evidence_sha256": digest,
+        "workspace_scope_sha256": "a" * 64,
+        "environment_scope_sha256": "b" * 64,
+        "observation_method_sha256": "c" * 64,
+        "approved_amendment_sha256": "d" * 64,
+        "maximum_concurrent_containers": 1,
+        "maximum_concurrent_gpus": 1,
+        "provider_hard_budget_available": False,
+        "provider_crash_rescheduling_bounded": False,
+    }
+
+    for field, value, message in (
+        ("provider_hard_budget_available", True, "hard budget"),
+        ("provider_crash_rescheduling_bounded", True, "crash rescheduling"),
+        ("maximum_concurrent_containers", 2, "container"),
+        ("maximum_concurrent_gpus", 2, "GPU"),
+    ):
+        changed = dict(contract)
+        changed[field] = value
+        changed_digest = _write(path, changed)
+        with pytest.raises(ReferenceGateError, match=message):
+            verify_provider_constraint_contract(
+                path,
+                expected_sha256=changed_digest,
+                expected_workspace_scope_sha256="a" * 64,
+                expected_environment_scope_sha256="b" * 64,
+                expected_amendment_sha256="d" * 64,
+            )
+
+
+def test_provider_constraint_contract_rejects_scope_digest_and_amendment_drift(
+    tmp_path: Path,
+) -> None:
+    contract = _provider_constraint_contract()
+    path = tmp_path / "constraint.json"
+    digest = _write(path, contract)
+
+    for argument, value, message in (
+        ("expected_workspace_scope_sha256", "9" * 64, "workspace scope"),
+        ("expected_environment_scope_sha256", "8" * 64, "environment scope"),
+        ("expected_amendment_sha256", "7" * 64, "amendment"),
+    ):
+        expected = {
+            "expected_workspace_scope_sha256": "a" * 64,
+            "expected_environment_scope_sha256": "b" * 64,
+            "expected_amendment_sha256": "d" * 64,
+        }
+        expected[argument] = value
+        with pytest.raises(ReferenceGateError, match=message):
+            verify_provider_constraint_contract(path, expected_sha256=digest, **expected)
+
+    contract["unknown"] = "not allowed"
+    digest = _write(path, contract)
+    with pytest.raises(ReferenceGateError, match="closed"):
+        verify_provider_constraint_contract(
+            path,
+            expected_sha256=digest,
+            expected_workspace_scope_sha256="a" * 64,
+            expected_environment_scope_sha256="b" * 64,
+            expected_amendment_sha256="d" * 64,
+        )
+
+    contract.pop("unknown")
+    contract["schema_version"] = 1
+    digest = _write(path, contract)
+    with pytest.raises(ReferenceGateError, match="unsupported"):
+        verify_provider_constraint_contract(
+            path,
+            expected_sha256=digest,
+            expected_workspace_scope_sha256="a" * 64,
+            expected_environment_scope_sha256="b" * 64,
+            expected_amendment_sha256="d" * 64,
+        )
+
+
+def test_provider_observation_receipt_accepts_exact_fresh_boundaries(tmp_path: Path) -> None:
+    validated_at = datetime(2026, 8, 22, 12, 0, tzinfo=UTC)
+    path = tmp_path / "receipt.json"
+
+    for maximum_age_seconds in (15 * 60, 30 * 60):
+        receipt = _provider_observation_receipt(
+            "2" * 64,
+            observed_at=validated_at - timedelta(seconds=maximum_age_seconds),
+        )
+        digest = _write(path, receipt)
+        result = verify_provider_observation_receipt(
+            path,
+            expected_sha256=digest,
+            expected_contract_sha256="2" * 64,
+            expected_workspace_scope_sha256="a" * 64,
+            expected_environment_scope_sha256="b" * 64,
+            expected_amendment_sha256="d" * 64,
+            validated_at=validated_at,
+            maximum_age_seconds=maximum_age_seconds,
+        )
+        assert result["proven"] is True
+        assert result["age_seconds"] == maximum_age_seconds
+        assert "provider" not in result
+        assert "screenshot" not in result
+
+
+@pytest.mark.parametrize("maximum_age_seconds", [15 * 60, 30 * 60])
+def test_provider_observation_receipt_rejects_stale_at_each_gate(
+    tmp_path: Path, maximum_age_seconds: int
+) -> None:
+    validated_at = datetime(2026, 8, 22, 12, 0, tzinfo=UTC)
+    receipt = _provider_observation_receipt(
+        "2" * 64,
+        observed_at=validated_at - timedelta(seconds=maximum_age_seconds + 1),
+    )
+    path = tmp_path / "receipt.json"
+    digest = _write(path, receipt)
+    with pytest.raises(ReferenceGateError, match="stale"):
+        verify_provider_observation_receipt(
+            path,
+            expected_sha256=digest,
+            expected_contract_sha256="2" * 64,
+            expected_workspace_scope_sha256="a" * 64,
+            expected_environment_scope_sha256="b" * 64,
+            expected_amendment_sha256="d" * 64,
+            validated_at=validated_at,
+            maximum_age_seconds=maximum_age_seconds,
+        )
+
+
+def test_provider_observation_receipt_rejects_active_resources_and_limit_drift(
+    tmp_path: Path,
+) -> None:
+    validated_at = datetime(2026, 8, 22, 12, 0, tzinfo=UTC)
+    receipt = _provider_observation_receipt("2" * 64, observed_at=validated_at)
+    path = tmp_path / "receipt.json"
+
+    for field, value, message in (
+        ("active_containers", 1, "active resources"),
+        ("active_gpus", 1, "active resources"),
+        ("observed_maximum_concurrent_containers", 2, "container"),
+        ("observed_maximum_concurrent_gpus", 2, "GPU"),
+    ):
+        changed = dict(receipt)
+        changed[field] = value
+        digest = _write(path, changed)
+        with pytest.raises(ReferenceGateError, match=message):
+            verify_provider_observation_receipt(
+                path,
+                expected_sha256=digest,
+                expected_contract_sha256="2" * 64,
+                expected_workspace_scope_sha256="a" * 64,
+                expected_environment_scope_sha256="b" * 64,
+                expected_amendment_sha256="d" * 64,
+                validated_at=validated_at,
+                maximum_age_seconds=900,
+            )
+
+
+def test_provider_observation_receipt_rejects_identity_and_binding_mismatch(
+    tmp_path: Path,
+) -> None:
+    validated_at = datetime(2026, 8, 22, 12, 0, tzinfo=UTC)
+    receipt = _provider_observation_receipt("2" * 64, observed_at=validated_at)
+    path = tmp_path / "receipt.json"
+    digest = _write(path, receipt)
+
+    for argument, value, message in (
+        ("expected_contract_sha256", "3" * 64, "contract"),
+        ("expected_workspace_scope_sha256", "4" * 64, "workspace scope"),
+        ("expected_environment_scope_sha256", "5" * 64, "environment scope"),
+        ("expected_amendment_sha256", "6" * 64, "amendment"),
+    ):
+        expected: dict[str, object] = {
+            "expected_contract_sha256": "2" * 64,
+            "expected_workspace_scope_sha256": "a" * 64,
+            "expected_environment_scope_sha256": "b" * 64,
+            "expected_amendment_sha256": "d" * 64,
+            "validated_at": validated_at,
+            "maximum_age_seconds": 900,
+        }
+        expected[argument] = value
+        with pytest.raises(ReferenceGateError, match=message):
+            verify_provider_observation_receipt(path, expected_sha256=digest, **expected)
+
+    receipt["observed_at"] = "2026-08-22T12:00:00"
+    digest = _write(path, receipt)
+    with pytest.raises(ReferenceGateError, match="timezone-aware"):
+        verify_provider_observation_receipt(
+            path,
+            expected_sha256=digest,
+            expected_contract_sha256="2" * 64,
+            expected_workspace_scope_sha256="a" * 64,
+            expected_environment_scope_sha256="b" * 64,
+            expected_amendment_sha256="d" * 64,
+            validated_at=validated_at,
+            maximum_age_seconds=900,
+        )
+
+
+def test_provider_billing_authority_binds_scope_and_required_semantics(tmp_path: Path) -> None:
+    authority = _provider_billing_authority()
+    path = tmp_path / "billing.json"
+    digest = _write(path, authority)
+    result = verify_provider_billing_authority(
+        path,
+        expected_sha256=digest,
+        expected_environment_scope_sha256="b" * 64,
+    )
+    assert result == {
+        "proven": True,
+        "evidence_sha256": digest,
+        "environment_scope_sha256": "b" * 64,
+        "attribution_method_sha256": "f" * 64,
+        "authoritative_report_identity_sha256": "1" * 64,
+        "billing_completeness_delay_seconds": 3600,
+    }
+
+    for field, value, message in (
+        ("attribution_method_sha256", None, "attribution_method_sha256"),
+        ("authoritative_report_identity_sha256", None, "authoritative_report_identity_sha256"),
+        ("billing_completeness_delay_seconds", 0, "positive integer"),
+    ):
+        changed = dict(authority)
+        changed[field] = value
+        changed_digest = _write(path, changed)
+        with pytest.raises(ReferenceGateError, match=message):
+            verify_provider_billing_authority(
+                path,
+                expected_sha256=changed_digest,
+                expected_environment_scope_sha256="b" * 64,
+            )
+
+    digest = _write(path, authority)
+    with pytest.raises(ReferenceGateError, match="environment scope"):
+        verify_provider_billing_authority(
+            path,
+            expected_sha256=digest,
+            expected_environment_scope_sha256="9" * 64,
+        )

@@ -47,6 +47,12 @@ def _positive_int(value: object, label: str) -> int:
     return value
 
 
+def _nonnegative_int(value: object, label: str) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise ReferenceGateError(f"{label} must be a non-negative integer")
+    return value
+
+
 def _nonnegative_number(value: object, label: str) -> float:
     if (
         not isinstance(value, int | float)
@@ -241,6 +247,242 @@ def verify_cold_path_time_evidence(
     if _sha256(evidence["method_sha256"], "method_sha256") != expected_method_sha256:
         raise ReferenceGateError("cold-path method authority mismatch")
     return GateResult(required <= timeout_seconds, digest, required, timeout_seconds)
+
+
+def verify_provider_constraint_contract(
+    path: Path,
+    *,
+    expected_sha256: str,
+    expected_workspace_scope_sha256: str,
+    expected_environment_scope_sha256: str,
+    expected_amendment_sha256: str,
+) -> dict[str, object]:
+    raw, digest = _load(path, expected_sha256)
+    contract = _closed(
+        raw,
+        {
+            "schema_version",
+            "kind",
+            "provider",
+            "workspace_scope_sha256",
+            "environment_scope_sha256",
+            "maximum_concurrent_containers",
+            "maximum_concurrent_gpus",
+            "provider_hard_budget_available",
+            "provider_crash_rescheduling_bounded",
+            "observation_method_sha256",
+            "approved_amendment_sha256",
+        },
+        "provider constraint contract",
+    )
+    if contract["schema_version"] != 2 or contract["kind"] != "provider_constraint_contract":
+        raise ReferenceGateError("unsupported provider constraint contract")
+    if contract["provider"] != "modal":
+        raise ReferenceGateError("provider identity mismatch")
+
+    workspace_scope = _sha256(contract["workspace_scope_sha256"], "workspace_scope_sha256")
+    environment_scope = _sha256(
+        contract["environment_scope_sha256"], "environment_scope_sha256"
+    )
+    method_sha256 = _sha256(contract["observation_method_sha256"], "observation_method_sha256")
+    amendment_sha256 = _sha256(
+        contract["approved_amendment_sha256"], "approved_amendment_sha256"
+    )
+    if workspace_scope != expected_workspace_scope_sha256:
+        raise ReferenceGateError("provider workspace scope mismatch")
+    if environment_scope != expected_environment_scope_sha256:
+        raise ReferenceGateError("provider environment scope mismatch")
+    if amendment_sha256 != expected_amendment_sha256:
+        raise ReferenceGateError("provider amendment binding mismatch")
+
+    maximum_containers = _positive_int(
+        contract["maximum_concurrent_containers"], "maximum_concurrent_containers"
+    )
+    maximum_gpus = _positive_int(
+        contract["maximum_concurrent_gpus"], "maximum_concurrent_gpus"
+    )
+    if maximum_containers != 1:
+        raise ReferenceGateError("provider container concurrency limit must equal one")
+    if maximum_gpus != 1:
+        raise ReferenceGateError("provider GPU concurrency limit must equal one")
+    if contract["provider_hard_budget_available"] is not False:
+        raise ReferenceGateError("provider hard budget must be explicitly unavailable")
+    if contract["provider_crash_rescheduling_bounded"] is not False:
+        raise ReferenceGateError("provider crash rescheduling must be explicitly unbounded")
+
+    return {
+        "proven": True,
+        "evidence_sha256": digest,
+        "workspace_scope_sha256": workspace_scope,
+        "environment_scope_sha256": environment_scope,
+        "observation_method_sha256": method_sha256,
+        "approved_amendment_sha256": amendment_sha256,
+        "maximum_concurrent_containers": maximum_containers,
+        "maximum_concurrent_gpus": maximum_gpus,
+        "provider_hard_budget_available": False,
+        "provider_crash_rescheduling_bounded": False,
+    }
+
+
+def verify_provider_observation_receipt(
+    path: Path,
+    *,
+    expected_sha256: str,
+    expected_contract_sha256: str,
+    expected_workspace_scope_sha256: str,
+    expected_environment_scope_sha256: str,
+    expected_amendment_sha256: str,
+    validated_at: datetime,
+    maximum_age_seconds: int,
+) -> dict[str, object]:
+    raw, digest = _load(path, expected_sha256)
+    receipt = _closed(
+        raw,
+        {
+            "schema_version",
+            "kind",
+            "provider",
+            "workspace_scope_sha256",
+            "environment_scope_sha256",
+            "approved_amendment_sha256",
+            "constraint_contract_sha256",
+            "screenshot_sha256",
+            "observed_maximum_concurrent_containers",
+            "observed_maximum_concurrent_gpus",
+            "active_containers",
+            "active_gpus",
+            "observed_at",
+        },
+        "provider observation receipt",
+    )
+    if (
+        receipt["schema_version"] != 2
+        or receipt["kind"] != "provider_constraint_observation_receipt"
+    ):
+        raise ReferenceGateError("unsupported provider observation receipt")
+    if receipt["provider"] != "modal":
+        raise ReferenceGateError("provider identity mismatch")
+
+    workspace_scope = _sha256(receipt["workspace_scope_sha256"], "workspace_scope_sha256")
+    environment_scope = _sha256(
+        receipt["environment_scope_sha256"], "environment_scope_sha256"
+    )
+    amendment_sha256 = _sha256(
+        receipt["approved_amendment_sha256"], "approved_amendment_sha256"
+    )
+    contract_sha256 = _sha256(
+        receipt["constraint_contract_sha256"], "constraint_contract_sha256"
+    )
+    _sha256(receipt["screenshot_sha256"], "screenshot_sha256")
+    if workspace_scope != expected_workspace_scope_sha256:
+        raise ReferenceGateError("provider workspace scope mismatch")
+    if environment_scope != expected_environment_scope_sha256:
+        raise ReferenceGateError("provider environment scope mismatch")
+    if amendment_sha256 != expected_amendment_sha256:
+        raise ReferenceGateError("provider amendment binding mismatch")
+    if contract_sha256 != expected_contract_sha256:
+        raise ReferenceGateError("provider constraint contract mismatch")
+
+    maximum_containers = _positive_int(
+        receipt["observed_maximum_concurrent_containers"],
+        "observed_maximum_concurrent_containers",
+    )
+    maximum_gpus = _positive_int(
+        receipt["observed_maximum_concurrent_gpus"], "observed_maximum_concurrent_gpus"
+    )
+    if maximum_containers != 1:
+        raise ReferenceGateError("observed provider container limit must equal one")
+    if maximum_gpus != 1:
+        raise ReferenceGateError("observed provider GPU limit must equal one")
+    active_containers = _nonnegative_int(receipt["active_containers"], "active_containers")
+    active_gpus = _nonnegative_int(receipt["active_gpus"], "active_gpus")
+    if active_containers != 0 or active_gpus != 0:
+        raise ReferenceGateError("provider observation contains active resources")
+
+    if not isinstance(receipt["observed_at"], str):
+        raise ReferenceGateError("provider observation time is invalid")
+    try:
+        observed_at = datetime.fromisoformat(receipt["observed_at"])
+    except ValueError as exc:
+        raise ReferenceGateError("provider observation time is invalid") from exc
+    if observed_at.tzinfo is None or observed_at.utcoffset() is None:
+        raise ReferenceGateError("provider observation time must be timezone-aware")
+    if validated_at.tzinfo is None or validated_at.utcoffset() is None:
+        raise ReferenceGateError("validation time must be timezone-aware")
+    maximum_age = _positive_int(maximum_age_seconds, "maximum_age_seconds")
+    age_seconds = (validated_at - observed_at).total_seconds()
+    if age_seconds < 0:
+        raise ReferenceGateError("provider observation time is in the future")
+    if age_seconds > maximum_age:
+        raise ReferenceGateError("provider observation receipt is stale")
+
+    return {
+        "proven": True,
+        "evidence_sha256": digest,
+        "workspace_scope_sha256": workspace_scope,
+        "environment_scope_sha256": environment_scope,
+        "approved_amendment_sha256": amendment_sha256,
+        "constraint_contract_sha256": contract_sha256,
+        "maximum_concurrent_containers": maximum_containers,
+        "maximum_concurrent_gpus": maximum_gpus,
+        "active_containers": active_containers,
+        "active_gpus": active_gpus,
+        "observed_at": observed_at.isoformat(),
+        "age_seconds": age_seconds,
+    }
+
+
+def verify_provider_billing_authority(
+    path: Path,
+    *,
+    expected_sha256: str,
+    expected_environment_scope_sha256: str,
+) -> dict[str, object]:
+    raw, digest = _load(path, expected_sha256)
+    authority = _closed(
+        raw,
+        {
+            "schema_version",
+            "kind",
+            "provider",
+            "environment_scope_sha256",
+            "attribution_method_sha256",
+            "authoritative_report_identity_sha256",
+            "billing_completeness_delay_seconds",
+        },
+        "provider billing authority contract",
+    )
+    if (
+        authority["schema_version"] != 2
+        or authority["kind"] != "provider_billing_authority_contract"
+    ):
+        raise ReferenceGateError("unsupported provider billing authority contract")
+    if authority["provider"] != "modal":
+        raise ReferenceGateError("provider identity mismatch")
+    environment_scope = _sha256(
+        authority["environment_scope_sha256"], "environment_scope_sha256"
+    )
+    if environment_scope != expected_environment_scope_sha256:
+        raise ReferenceGateError("provider billing environment scope mismatch")
+    attribution_method = _sha256(
+        authority["attribution_method_sha256"], "attribution_method_sha256"
+    )
+    report_identity = _sha256(
+        authority["authoritative_report_identity_sha256"],
+        "authoritative_report_identity_sha256",
+    )
+    completeness_delay = _positive_int(
+        authority["billing_completeness_delay_seconds"],
+        "billing_completeness_delay_seconds",
+    )
+    return {
+        "proven": True,
+        "evidence_sha256": digest,
+        "environment_scope_sha256": environment_scope,
+        "attribution_method_sha256": attribution_method,
+        "authoritative_report_identity_sha256": report_identity,
+        "billing_completeness_delay_seconds": completeness_delay,
+    }
 
 
 def verify_provider_safety_evidence(path: Path, *, expected_sha256: str) -> dict[str, object]:

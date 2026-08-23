@@ -14,7 +14,13 @@ from typing import Any
 
 from lowbit_lab.config import IMMUTABLE_REVISION_RE, SHA256_RE
 from lowbit_lab.jsonio import emit
-from lowbit_lab.reference_contract import REFERENCE_RESOURCES
+from lowbit_lab.reference_contract import (
+    APPROVED_PROVIDER_AMENDMENT_PATH,
+    APPROVED_PROVIDER_AMENDMENT_SHA256,
+    ORIGINAL_APPROVED_PLAN_PATH,
+    ORIGINAL_APPROVED_PLAN_SHA256,
+    REFERENCE_RESOURCES,
+)
 
 SCHEMA_VERSION = 4
 REFERENCE_RESERVATION_USD = Decimal("4.00")
@@ -322,8 +328,10 @@ def _reference_challenge(config_json: str, config_sha256: str) -> tuple[str, dic
         "schema_version",
         "kind",
         "experiment_id",
-        "approved_plan_path",
-        "approved_plan_sha256",
+        "original_approved_plan_path",
+        "original_approved_plan_sha256",
+        "approved_amendment_path",
+        "approved_amendment_sha256",
         "budget_policy_path",
         "inputs",
         "authority_files",
@@ -360,8 +368,14 @@ def _reference_challenge(config_json: str, config_sha256: str) -> tuple[str, dic
         "volumes",
         "secrets",
         "credentials_source",
-        "safety_evidence_path",
-        "safety_evidence_sha256",
+        "workspace_scope_sha256",
+        "environment_scope_sha256",
+        "constraint_contract_path",
+        "constraint_contract_sha256",
+        "observation_receipt_path",
+        "observation_receipt_sha256",
+        "billing_authority_path",
+        "billing_authority_sha256",
     }
     gate_fields = {
         "formula_authority_path",
@@ -398,8 +412,10 @@ def _reference_challenge(config_json: str, config_sha256: str) -> tuple[str, dic
     ):
         raise DatabaseError("reference provider boundary is invalid")
     if (
-        not str(raw["approved_plan_path"]).startswith("docs/plans/local/")
-        or SHA256_RE.fullmatch(str(raw["approved_plan_sha256"])) is None
+        raw["original_approved_plan_path"] != ORIGINAL_APPROVED_PLAN_PATH
+        or raw["original_approved_plan_sha256"] != ORIGINAL_APPROVED_PLAN_SHA256
+        or raw["approved_amendment_path"] != APPROVED_PROVIDER_AMENDMENT_PATH
+        or raw["approved_amendment_sha256"] != APPROVED_PROVIDER_AMENDMENT_SHA256
         or not str(raw["budget_policy_path"]).startswith("configs/local/")
         or (
             raw["approval_artifact_path"] is not None
@@ -407,6 +423,23 @@ def _reference_challenge(config_json: str, config_sha256: str) -> tuple[str, dic
         )
     ):
         raise DatabaseError("reference authority paths or hashes are invalid")
+    for digest_name in ("workspace_scope_sha256", "environment_scope_sha256"):
+        if SHA256_RE.fullmatch(str(provider[digest_name])) is None:
+            raise DatabaseError("reference provider authority is invalid")
+    for path_name, digest_name in (
+        ("constraint_contract_path", "constraint_contract_sha256"),
+        ("observation_receipt_path", "observation_receipt_sha256"),
+        ("billing_authority_path", "billing_authority_sha256"),
+    ):
+        authority_path = provider[path_name]
+        if (
+            not isinstance(authority_path, str)
+            or Path(authority_path).is_absolute()
+            or ".." in Path(authority_path).parts
+            or not Path(authority_path).as_posix().startswith("reports/local/")
+            or SHA256_RE.fullmatch(str(provider[digest_name])) is None
+        ):
+            raise DatabaseError("reference provider authority is invalid")
     challenge_material = {
         key: value for key, value in raw.items() if key != "approval_artifact_path"
     }

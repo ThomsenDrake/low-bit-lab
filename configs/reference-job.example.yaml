@@ -1,8 +1,10 @@
 schema_version: 1
 kind: modal_reference_preview
 experiment_id: example-reference-preview-v1
-approved_plan_path: docs/plans/local/approved-reference-plan.md
-approved_plan_sha256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+original_approved_plan_path: docs/plans/local/approved-reference-plan.md
+original_approved_plan_sha256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+approved_amendment_path: docs/plans/local/approved-provider-constraint-amendment.md
+approved_amendment_sha256: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 budget_policy_path: configs/local/reference-budget.json
 inputs:
   weight_inventory_sha256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
@@ -39,8 +41,14 @@ provider:
   volumes: []
   secrets: []
   credentials_source: provider_local
-  safety_evidence_path: null
-  safety_evidence_sha256: null
+  workspace_scope_sha256: cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+  environment_scope_sha256: dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+  constraint_contract_path: null
+  constraint_contract_sha256: null
+  observation_receipt_path: null
+  observation_receipt_sha256: null
+  billing_authority_path: null
+  billing_authority_sha256: null
 gates:
   formula_authority_path: null
   memory_fit_evidence_path: null

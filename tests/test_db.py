@@ -1,10 +1,17 @@
 import hashlib
 import json
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
 
 from lowbit_lab.db import SCHEMA_VERSION, DatabaseError, ResultsDatabase
+from lowbit_lab.reference_contract import (
+    APPROVED_PROVIDER_AMENDMENT_PATH,
+    APPROVED_PROVIDER_AMENDMENT_SHA256,
+    ORIGINAL_APPROVED_PLAN_PATH,
+    ORIGINAL_APPROVED_PLAN_SHA256,
+)
 
 
 def test_schema_is_idempotent_and_transitions_are_explicit(tmp_path: Path) -> None:
@@ -334,6 +341,7 @@ def _reserve(
     attach_approval: bool = True,
     tamper_config_after_challenge: bool = False,
     hardware: dict[str, object] | None = None,
+    mutate_config: Callable[[dict[str, object]], None] | None = None,
 ) -> None:
     inputs = {
         "weight_inventory_sha256": "1" * 64,
@@ -350,8 +358,10 @@ def _reserve(
         "schema_version": 1,
         "kind": "modal_reference_preview",
         "experiment_id": f"reference-{suffix}",
-        "approved_plan_path": "docs/plans/local/approved.md",
-        "approved_plan_sha256": "8" * 64,
+        "original_approved_plan_path": ORIGINAL_APPROVED_PLAN_PATH,
+        "original_approved_plan_sha256": ORIGINAL_APPROVED_PLAN_SHA256,
+        "approved_amendment_path": APPROVED_PROVIDER_AMENDMENT_PATH,
+        "approved_amendment_sha256": APPROVED_PROVIDER_AMENDMENT_SHA256,
         "budget_policy_path": "configs/local/reference-budget.json",
         "inputs": inputs,
         "authority_files": {
@@ -381,8 +391,14 @@ def _reserve(
             "volumes": [],
             "secrets": [],
             "credentials_source": "provider_local",
-            "safety_evidence_path": None,
-            "safety_evidence_sha256": None,
+            "workspace_scope_sha256": "8" * 64,
+            "environment_scope_sha256": "9" * 64,
+            "constraint_contract_path": "reports/local/constraint.json",
+            "constraint_contract_sha256": "a" * 64,
+            "observation_receipt_path": "reports/local/observation.json",
+            "observation_receipt_sha256": "b" * 64,
+            "billing_authority_path": "reports/local/billing.json",
+            "billing_authority_sha256": "c" * 64,
         },
         "gates": {
             "formula_authority_path": None,
@@ -393,6 +409,8 @@ def _reserve(
         },
         "approval_artifact_path": None,
     }
+    if mutate_config is not None:
+        mutate_config(raw)
     config_json = json.dumps(raw, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
     config_sha256 = hashlib.sha256(config_json.encode()).hexdigest()
     challenge_material = dict(raw)
@@ -505,6 +523,61 @@ def test_reference_reservation_binds_config_cap_expiry_and_private_data(tmp_path
             approval_digest="c" * 64,
             expires_at="2026-08-22T01:00:00",
         )
+
+
+def _remove_provider_field(raw: dict[str, object], field: str) -> None:
+    provider = raw["provider"]
+    assert isinstance(provider, dict)
+    provider.pop(field)
+
+
+def _set_provider_field(raw: dict[str, object], field: str, value: object) -> None:
+    provider = raw["provider"]
+    assert isinstance(provider, dict)
+    provider[field] = value
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        (lambda raw: raw.pop("approved_amendment_sha256"), "schema"),
+        (
+            lambda raw: raw.__setitem__("approved_amendment_sha256", "f" * 64),
+            "authority",
+        ),
+        (
+            lambda raw: raw.__setitem__(
+                "approved_amendment_path", "docs/plans/local/wrong.md"
+            ),
+            "authority",
+        ),
+        (lambda raw: _remove_provider_field(raw, "constraint_contract_path"), "schema"),
+        (
+            lambda raw: _set_provider_field(raw, "observation_receipt_sha256", None),
+            "authority",
+        ),
+        (lambda raw: _remove_provider_field(raw, "workspace_scope_sha256"), "schema"),
+        (
+            lambda raw: _set_provider_field(raw, "billing_authority_path", "C:/private"),
+            "authority",
+        ),
+        (
+            lambda raw: _set_provider_field(
+                raw, "billing_authority_path", "reports/local/../private.json"
+            ),
+            "authority",
+        ),
+    ],
+)
+def test_reference_database_boundary_rejects_authority_bypass(
+    tmp_path: Path,
+    mutation: Callable[[dict[str, object]], None],
+    message: str,
+) -> None:
+    database = ResultsDatabase(tmp_path / "results.sqlite")
+    database.initialize()
+    with pytest.raises(DatabaseError, match=message):
+        _reserve(database, suffix="bypass", mutate_config=mutation)
 
 
 def test_reference_settlement_is_exactly_once_and_provider_attributed(tmp_path: Path) -> None:
