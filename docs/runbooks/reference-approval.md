@@ -47,7 +47,7 @@ every unresolved blocker. Previewing never creates or consumes an execution appr
   margin durations inside 2,700 seconds.
 - A clean reviewed tree and a short-lived approval artifact matching the canonical challenge,
   reviewed commit, all three plan authorities, every provider evidence identity including any trust
-  override, the exact USD 4.00 local reservation limit, explicit residual-risk acceptance, and expiry.
+  override, the exact cap from the ignored local ledger, explicit residual-risk acceptance, and expiry.
 
 ## Hard stop
 
@@ -57,3 +57,13 @@ a human separately approves the exact U7 packet and reviewed commit. Provider au
 configured locally, but it is not execution authority and credentials must never enter the repository.
 Unknown billing after any future submission must become `audit_blocked`; it must never release
 reusable budget. Every submitted or later state permanently consumes its execution scope.
+
+The controller handoff reads `total_ledger_ceiling_usd` from the validated ignored local ledger and separates it from
+`current_action_authorized_cap_usd:"0.00"`. The total ledger is not authority to spend it, and
+`proposed_action_cap_usd:null` means no paid evidence action has been allocated. Until a later
+approved plan supplies that allocation and a reviewed provider adapter, `command_available` remains
+false and there is no executable paid command to approve.
+
+No approval text is generated while the command and exact paid-action contract are absent. A future
+approval must bind the complete paid-action packet, exact command, challenge, cap, and reviewed
+lineage. The current readiness-packet SHA-256 is evidence for planning, not execution authority.

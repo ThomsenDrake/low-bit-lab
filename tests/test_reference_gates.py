@@ -7,12 +7,14 @@ from pathlib import Path
 
 import pytest
 
+from lowbit_lab import reference_gates
 from lowbit_lab.reference_gates import (
     A100_80GB_BYTES,
     MEMORY_FORMULA,
     TIME_FORMULA,
     ReferenceGateError,
     verify_cold_path_time_evidence,
+    verify_formula_approval_receipt,
     verify_formula_authority,
     verify_memory_fit_evidence,
     verify_provider_billing_authority,
@@ -43,6 +45,40 @@ def _provider_constraint_contract() -> dict[str, object]:
         "observation_method_sha256": "c" * 64,
         "approved_amendment_sha256": "d" * 64,
     }
+
+
+def test_formula_approval_receipt_binds_reviewed_and_approved_formula(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    formula_sha = "9" * 64
+    monkeypatch.setattr(reference_gates, "APPROVED_FORMULA_SHA256", formula_sha)
+    receipt = {
+        "schema_version": 1,
+        "kind": "formula_approval_receipt",
+        "statement_sha256": reference_gates.FORMULA_APPROVAL_STATEMENT_SHA256,
+        "reviewed_formula_sha256": reference_gates.REVIEWED_FORMULA_SHA256,
+        "approved_formula_sha256": formula_sha,
+        "formula_authority_path": "reports/local/formula.json",
+        "human_origin": "attested",
+    }
+    path = tmp_path / "receipt.json"
+    digest = _write(path, receipt)
+    assert verify_formula_approval_receipt(
+        path,
+        expected_sha256=digest,
+        expected_formula_path="reports/local/formula.json",
+        expected_formula_sha256=formula_sha,
+    )["verified"] is True
+
+    receipt["reviewed_formula_sha256"] = "0" * 64
+    digest = _write(path, receipt)
+    with pytest.raises(ReferenceGateError, match="lineage mismatch"):
+        verify_formula_approval_receipt(
+            path,
+            expected_sha256=digest,
+            expected_formula_path="reports/local/formula.json",
+            expected_formula_sha256=formula_sha,
+        )
 
 
 def _provider_observation_receipt(

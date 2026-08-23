@@ -2,6 +2,69 @@
 
 Scheduling status: **disabled**. Do not create a scheduled task until one manual cycle has been run and reviewed after Phases 0 and 1 pass.
 
+The `lowbit-controller` CLI is the only autonomous readiness entry point. It exposes exactly
+`status`, `prepare`, and `verify`. None of those operations imports a provider SDK, submits work,
+reserves a nonzero budget, transfers weights, creates approval, or enables scheduling.
+
+## Zero-spend readiness cycle
+
+Create ignored local receipts from `configs/controller-authority.example.json` and
+`configs/formula-approval.example.json`, replacing only their documented hashes and local formula
+path. Repository hashes prove that expected bytes and scope match; they do not cryptographically
+authenticate the approving human. The fixed action allowlist is the mechanical authority boundary,
+and future paid execution requires a separate authenticated approval.
+
+The standing-authority statement preimage is exactly:
+
+`Treat this message as human approval for those bounded plans without requesting approval for each regenerated SHA-256.`
+
+The formula-approval statement preimage is exactly `Approved`. Verify the frozen digests with:
+
+```powershell
+uv run python -c "import hashlib; print(hashlib.sha256('Treat this message as human approval for those bounded plans without requesting approval for each regenerated SHA-256.'.encode()).hexdigest())"
+uv run python -c "import hashlib; print(hashlib.sha256('Approved'.encode()).hexdigest())"
+```
+
+In the standing receipt, the statement digest, action lists, scope, origin label, schema, and plan
+path are fixed. Regenerate only `controlling_plan_sha256` from the tracked plan. In the formula
+receipt, every field is fixed except `formula_authority_path`, which must name the approved ignored
+artifact whose SHA-256 is the frozen `approved_formula_sha256`. The receipt file's own SHA-256 must
+also be recorded in the ignored reference configuration.
+
+```powershell
+uv run lowbit-controller status `
+  --root . `
+  --config configs/local/reference.yaml `
+  --authority configs/local/controller-authority.json `
+  --formula-approval reports/local/formula-approval.json
+
+uv run lowbit-controller prepare `
+  --root . `
+  --config configs/local/reference.yaml `
+  --db results/local/controller.sqlite `
+  --authority configs/local/controller-authority.json `
+  --formula-approval reports/local/formula-approval.json `
+  --output-dir reports/local/controller
+
+uv run lowbit-controller verify `
+  --root . `
+  --config configs/local/reference.yaml `
+  --db results/local/controller.sqlite `
+  --authority configs/local/controller-authority.json `
+  --formula-approval reports/local/formula-approval.json
+```
+
+`status` and `verify` are read-only. `prepare` alone creates a controller cycle. It writes one
+immutable per-cycle handoff and then commits its relative path and SHA-256 through an owner,
+generation, context, authority, and lease compare-and-set. Readers trust only the artifact referenced
+by the committed SQLite row; an interrupted stale writer cannot replace it.
+
+The terminal state is `paid_decision_required`, not execution readiness. The handoff reads the total
+ceiling from the validated ignored local ledger and separates it from a USD 0 current-action cap and a null proposed cap. It also
+reports `command_available:false` because `PLAN.md` forbids a provider execution primitive. The next
+plan must allocate the paid evidence action and authorize a disabled-by-default adapter before an
+executable paid command can exist.
+
 ## Manual cycle
 
 1. Read `PLAN.md`, `BUDGET.md`, `AGENTS.md`, the latest decision report, active experiment config, and relevant `docs/solutions/` notes.

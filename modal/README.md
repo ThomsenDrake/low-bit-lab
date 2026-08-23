@@ -5,6 +5,9 @@ reviewed A100-80GB resource declaration as data, not as a `modal.App` or remote 
 SDK is version-locked in the `remote` dependency group for reproducibility, but production code does
 not import it and no command in this repository can submit the declaration.
 
+The zero-spend readiness controller is local-only and treats the absence of a provider adapter as an
+explicit blocker. It cannot turn the declarative resource envelope into a remote invocation.
+
 Reference previews require exact local plan, inventory, runtime, evaluation, and budget identities.
 They record `submit:false`, zero requested/actual cost, no uploads, no mounts, no volumes, no secrets,
 and all unresolved execution blockers. U8 must add a separately reviewed adapter before any provider

@@ -1,0 +1,25 @@
+{
+  "allowed_actions": ["prepare", "status", "verify"],
+  "controlling_plan_path": "docs/plans/2026-08-23-1518-feat-zero-spend-readiness-controller-plan.md",
+  "controlling_plan_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "expires_at": null,
+  "forbidden_actions": [
+    "approval_creation",
+    "credentials",
+    "destructive_cleanup",
+    "modal_remote_execution",
+    "nonzero_budget_reservation",
+    "provider_submission",
+    "retries",
+    "scheduling",
+    "secrets",
+    "u8",
+    "volumes_or_mounts",
+    "weight_transfer"
+  ],
+  "human_origin": "attested",
+  "kind": "zero_spend_standing_authority",
+  "schema_version": 1,
+  "scope": "zero_spend_preparation",
+  "statement_sha256": "7a7648f1844dcd532bf9c34d2a47cbcd031c86efb9e6f3338c008ad873339323"
+}

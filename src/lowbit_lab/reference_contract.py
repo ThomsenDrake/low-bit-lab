@@ -46,6 +46,7 @@ def reference_execution_scope_sha256(
     weight_inventory_sha256: str,
     evaluation_lock_sha256: str,
     formula_authority_sha256: str,
+    formula_approval_sha256: str,
     trust_override_sha256: str | None = None,
 ) -> str:
     """Bind the immutable inputs that define the one-attempt reference scope."""
@@ -55,6 +56,7 @@ def reference_execution_scope_sha256(
         ("weight inventory", weight_inventory_sha256),
         ("evaluation lock", evaluation_lock_sha256),
         ("formula authority", formula_authority_sha256),
+        ("formula approval", formula_approval_sha256),
     ):
         if SHA256_RE.fullmatch(value) is None:
             raise ValueError(f"{label} must be lowercase SHA-256")
@@ -65,6 +67,7 @@ def reference_execution_scope_sha256(
         "approved_trust_override_plan_sha256": APPROVED_TRUST_OVERRIDE_PLAN_SHA256,
         "evaluation_lock_sha256": evaluation_lock_sha256,
         "formula_authority_sha256": formula_authority_sha256,
+        "formula_approval_sha256": formula_approval_sha256,
         "original_approved_plan_sha256": ORIGINAL_APPROVED_PLAN_SHA256,
         "resources": REFERENCE_RESOURCES,
         "source_revision": source_revision,

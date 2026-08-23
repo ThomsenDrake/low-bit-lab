@@ -1,4 +1,4 @@
-schema_version: 3
+schema_version: 4
 kind: modal_reference_preview
 experiment_id: example-reference-preview-v1
 original_approved_plan_path: docs/plans/local/approved-reference-plan.md
@@ -60,6 +60,8 @@ provider:
   billing_completeness_delay_seconds: 3600
 gates:
   formula_authority_path: null
+  formula_approval_path: null
+  formula_approval_sha256: null
   memory_fit_evidence_path: null
   memory_fit_evidence_sha256: null
   cold_path_time_evidence_path: null

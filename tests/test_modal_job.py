@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 import yaml
 
+from lowbit_lab import reference_gates
 from lowbit_lab.modal_job import (
     ReferenceJobError,
     load_reference_job_config,
@@ -71,7 +72,7 @@ def _config(tmp_path: Path, **changes: object) -> Path:
         (plans / name).write_bytes((repository_plans / name).read_bytes())
     _budget(configs / "reference-budget.json", ORIGINAL_APPROVED_PLAN_SHA256)
     raw = {
-        "schema_version": 3,
+        "schema_version": 4,
         "kind": "modal_reference_preview",
         "experiment_id": "reference-preview-v1",
         "original_approved_plan_path": ORIGINAL_PLAN_PATH,
@@ -137,6 +138,8 @@ def _config(tmp_path: Path, **changes: object) -> Path:
         },
         "gates": {
             "formula_authority_path": None,
+            "formula_approval_path": None,
+            "formula_approval_sha256": None,
             "memory_fit_evidence_path": None,
             "memory_fit_evidence_sha256": None,
             "cold_path_time_evidence_path": None,
@@ -186,6 +189,68 @@ def test_reference_source_revision_is_closed_and_immutable(tmp_path: Path) -> No
     path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
     with pytest.raises(ReferenceJobError, match="source_revision"):
         load_reference_job_config(path, root=tmp_path)
+
+
+def test_reference_preview_requires_independent_formula_approval_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = _config(tmp_path)
+    reports = tmp_path / "reports/local"
+    reports.mkdir(parents=True)
+    formula = reports / "formula.json"
+    formula.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "kind": "reference_formula_authority",
+                "authority_id": "reference-resource-accounting",
+                "authority_version": "1.0.0",
+                "memory_formula": MEMORY_FORMULA,
+                "time_formula": TIME_FORMULA,
+                "maximum_gpu_memory_bytes": A100_80GB_BYTES,
+                "maximum_context_tokens": 32768,
+                "timeout_seconds": 2700,
+                "approval_status": "approved",
+            }
+        ),
+        encoding="utf-8",
+    )
+    formula_sha = hashlib.sha256(formula.read_bytes()).hexdigest()
+    monkeypatch.setattr(reference_gates, "APPROVED_FORMULA_SHA256", formula_sha)
+    raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+    raw["inputs"]["formula_authority_sha256"] = formula_sha
+    raw["gates"]["formula_authority_path"] = "reports/local/formula.json"
+    path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+
+    config = load_reference_job_config(path, root=tmp_path)
+    assert "formula_approval_receipt_unverified" in plan_reference_preview(
+        config, root=tmp_path
+    )["blockers"]
+
+    receipt = reports / "formula-approval.json"
+    receipt.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "kind": "formula_approval_receipt",
+                "statement_sha256": reference_gates.FORMULA_APPROVAL_STATEMENT_SHA256,
+                "reviewed_formula_sha256": reference_gates.REVIEWED_FORMULA_SHA256,
+                "approved_formula_sha256": formula_sha,
+                "formula_authority_path": "reports/local/formula.json",
+                "human_origin": "attested",
+            }
+        ),
+        encoding="utf-8",
+    )
+    raw["gates"]["formula_approval_path"] = "reports/local/formula-approval.json"
+    raw["gates"]["formula_approval_sha256"] = hashlib.sha256(
+        receipt.read_bytes()
+    ).hexdigest()
+    path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    config = load_reference_job_config(path, root=tmp_path)
+    assert "formula_approval_receipt_unverified" not in plan_reference_preview(
+        config, root=tmp_path
+    )["blockers"]
 
 
 def test_reference_config_rejects_legacy_schema_version(tmp_path: Path) -> None:
@@ -261,6 +326,8 @@ def test_reference_preview_derives_gates_from_hashed_evidence(tmp_path: Path) ->
     raw["inputs"]["formula_authority_sha256"] = formula_sha256
     raw["gates"] = {
         "formula_authority_path": "reports/local/formula.json",
+        "formula_approval_path": None,
+        "formula_approval_sha256": None,
         "memory_fit_evidence_path": "reports/local/memory.json",
         "memory_fit_evidence_sha256": hashlib.sha256(memory.read_bytes()).hexdigest(),
         "cold_path_time_evidence_path": "reports/local/time.json",

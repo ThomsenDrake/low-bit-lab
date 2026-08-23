@@ -45,9 +45,21 @@ Paid execution needs a second boundary beyond authorization: atomically reserve 
 
 Treat digest-shaped values as claims, not verified lineage. Recompute approval challenges from the canonical config, verify every authority path against its declared hash, and cross-bind evidence to the inventory, runtime receipt, evaluation lock, reviewed commit, and resource envelope. Provider-safety flags must point to hashed evidence; a self-asserted boolean is not an independent gate.
 
+A digest proves that exact bytes were used; it does not prove who authored or approved them. Treat a human statement as attested input, freeze the accepted statement digest independently in code, and keep the accepted action classes closed. Regenerating a plan or readiness packet under that standing authority must never broaden the allowlist.
+
+Keep the total project ledger distinct from the cap for the next action. The ledger answers how much the lab may ever spend; the action cap answers whether this specific invocation may spend anything. A zero-spend controller must require the action cap to remain zero even when an ignored local ledger has a positive total ceiling.
+
+Readiness evidence is not paid authority. A handoff may report that only paid-boundary evidence remains, but it must leave the execution command, paid action cap, and approval wording unavailable until an exact provider action contract exists. Otherwise generated prose can become a self-authorizing execution surface.
+
+For immutable evidence, validate the exact bytes after persistence rather than trusting the object held in memory before the write. Hash the complete decision-bearing packet, including state, blockers, lineage, authority, budget, and safety fields. Canonical semantic equality and raw-byte digest equality are separate checks and both matter.
+
 Use compare-and-set state changes inside `BEGIN IMMEDIATE` transactions for reservation settlement and stale-run reconciliation. Reserve the exact worst-case cap, consume approval and reserve cost atomically, and move unknown submitted work to an audit-blocked state rather than releasing its reservation. Avoid SQLite `executescript` inside an explicit migration transaction because its implicit commit behavior can defeat the intended atomic boundary.
 
+Apply the same transaction rule to controller leases. Reconcile expired active cycles inside the acquisition transaction, then create the next generation under a uniqueness fence. Read-only status and verification commands must open SQLite in read-only mode so missing evidence cannot be created as a side effect.
+
 Evidence formulas must be versioned and hashed. Memory and cold-path timing evidence should name the method digest and bind the exact evaluation context; otherwise a valid-looking report can be replayed against a larger context or a different accounting method. Promotion-threshold compilation remains a separate authority step and should be mechanically unavailable until implemented and approved.
+
+Formula approval must be bound at every consumer, including direct preview, challenge derivation, persisted config gates, and execution-scope hashing. Enforcing it only in a higher-level controller leaves lower-level entrypoints able to construct a different decision surface.
 
 Cross-platform receipts must verify in the environment that owns the executable. Windows cannot
 reliably resolve a Linux virtual-environment symlink stored on a mounted filesystem. In that case,
@@ -93,6 +105,8 @@ These invariants make silent policy drift, config mutation, preflight failure lo
 - `src/lowbit_lab/db.py` binds experiment IDs to config digests and stores pre-validation attempts.
 - `src/lowbit_lab/db.py` atomically consumes approval challenges, reserves exact worst-case cost, and settles reservations with compare-and-set transitions.
 - `src/lowbit_lab/reference_contract.py` derives the immutable one-shot reference execution scope.
+- `src/lowbit_lab/controller.py` enforces the closed zero-spend action allowlist and immutable cycle fencing.
+- `src/lowbit_lab/handoff.py` emits a complete readiness packet without synthesizing paid authority.
 - `src/lowbit_lab/runtime.py` records dirty state plus a deterministic control-plane digest.
 - `src/lowbit_lab/activation.py` binds decision artifacts and reruns all bounded gates.
 - `src/lowbit_lab/publication.py` scans Git paths and contents before public publication.

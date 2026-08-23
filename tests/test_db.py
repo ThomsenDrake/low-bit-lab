@@ -367,7 +367,7 @@ def _reserve(
         "control_plane_sha256": "7" * 64,
     }
     raw = {
-        "schema_version": 3,
+        "schema_version": 4,
         "kind": "modal_reference_preview",
         "experiment_id": f"reference-{suffix}",
         "original_approved_plan_path": ORIGINAL_APPROVED_PLAN_PATH,
@@ -422,6 +422,8 @@ def _reserve(
         },
         "gates": {
             "formula_authority_path": None,
+            "formula_approval_path": "reports/local/formula-approval.json",
+            "formula_approval_sha256": "8" * 64,
             "memory_fit_evidence_path": None,
             "memory_fit_evidence_sha256": None,
             "cold_path_time_evidence_path": None,
@@ -588,6 +590,8 @@ def _downgrade_populated_database_to_v4(path: Path) -> None:
             CREATE UNIQUE INDEX budget_reservations_active_experiment
             ON budget_reservations(experiment_id)
             WHERE status IN ('reserved', 'submitted', 'settlement_pending', 'audit_blocked');
+            DROP TABLE controller_cycle_transitions;
+            DROP TABLE controller_cycles;
             DELETE FROM schema_info;
             INSERT INTO schema_info(version, applied_at) VALUES (4, '2026-08-22T00:00:00Z');
             """
@@ -602,7 +606,7 @@ def test_populated_v4_migration_preserves_legacy_rows_without_scope_authority(
     database = ResultsDatabase(path)
     database.initialize()
     with database.connect() as connection:
-        assert connection.execute("SELECT max(version) FROM schema_info").fetchone()[0] == 6
+        assert connection.execute("SELECT max(version) FROM schema_info").fetchone()[0] == 7
         assert connection.execute("SELECT count(*) FROM experiments").fetchone()[0] == 1
         assert connection.execute("SELECT count(*) FROM budget_reservations").fetchone()[0] == 1
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
@@ -649,6 +653,7 @@ def test_reference_execution_scope_is_canonical_and_source_bound() -> None:
         weight_inventory_sha256="1" * 64,
         evaluation_lock_sha256="4" * 64,
         formula_authority_sha256="5" * 64,
+        formula_approval_sha256="8" * 64,
     )
     assert len(scope) == 64
     assert scope == reference_execution_scope_sha256(
@@ -656,18 +661,21 @@ def test_reference_execution_scope_is_canonical_and_source_bound() -> None:
         weight_inventory_sha256="1" * 64,
         evaluation_lock_sha256="4" * 64,
         formula_authority_sha256="5" * 64,
+        formula_approval_sha256="8" * 64,
     )
     for changed in (
         {"source_revision": "e" * 40},
         {"weight_inventory_sha256": "2" * 64},
         {"evaluation_lock_sha256": "6" * 64},
         {"formula_authority_sha256": "7" * 64},
+        {"formula_approval_sha256": "9" * 64},
     ):
         inputs = {
             "source_revision": "d" * 40,
             "weight_inventory_sha256": "1" * 64,
             "evaluation_lock_sha256": "4" * 64,
             "formula_authority_sha256": "5" * 64,
+            "formula_approval_sha256": "8" * 64,
         }
         inputs.update(changed)
         assert reference_execution_scope_sha256(**inputs) != scope
@@ -676,6 +684,7 @@ def test_reference_execution_scope_is_canonical_and_source_bound() -> None:
         weight_inventory_sha256="1" * 64,
         evaluation_lock_sha256="4" * 64,
         formula_authority_sha256="5" * 64,
+        formula_approval_sha256="8" * 64,
     ) != scope
     with pytest.raises(ValueError, match="source revision"):
         reference_execution_scope_sha256(
@@ -683,6 +692,7 @@ def test_reference_execution_scope_is_canonical_and_source_bound() -> None:
             weight_inventory_sha256="1" * 64,
             evaluation_lock_sha256="4" * 64,
             formula_authority_sha256="5" * 64,
+            formula_approval_sha256="8" * 64,
         )
 
 
@@ -1143,3 +1153,276 @@ def test_legacy_submitted_or_later_reservation_retains_the_full_cap(tmp_path: Pa
                 "source_revision", "e" * 40
             ),
         )
+
+
+def _acquire_controller_cycle(
+    database: ResultsDatabase,
+    cycle_id: str,
+    *,
+    owner_id: str = "owner-one",
+    started_at: str = "2026-08-23T12:00:00+00:00",
+    lease_expires_at: str = "2026-08-23T12:05:00+00:00",
+) -> int:
+    return database.acquire_controller_cycle(
+        cycle_id=cycle_id,
+        workspace_id="workspace-one",
+        owner_id=owner_id,
+        context_sha256="a" * 64,
+        authority_sha256="b" * 64,
+        started_at=started_at,
+        lease_expires_at=lease_expires_at,
+    )
+
+
+def test_v6_to_v7_migration_adds_controller_cycles(tmp_path: Path) -> None:
+    path = tmp_path / "legacy-v6.sqlite"
+    import sqlite3
+
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "CREATE TABLE schema_info (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
+        )
+        connection.execute(
+            "INSERT INTO schema_info VALUES (6, '2026-08-23T00:00:00+00:00')"
+        )
+    database = ResultsDatabase(path)
+    database.initialize()
+    database.initialize()
+    assert _acquire_controller_cycle(database, "cycle-after-migration") == 1
+    with database.connect() as connection:
+        assert connection.execute("SELECT max(version) FROM schema_info").fetchone()[0] == 7
+
+
+def test_controller_cycle_lifecycle_commits_artifact_with_fencing(tmp_path: Path) -> None:
+    database = ResultsDatabase(tmp_path / "controller.sqlite")
+    database.initialize()
+    generation = _acquire_controller_cycle(database, "cycle-one")
+    database.transition_controller_cycle(
+        "cycle-one",
+        owner_id="owner-one",
+        generation=generation,
+        context_sha256="a" * 64,
+        authority_sha256="b" * 64,
+        from_state="created",
+        to_state="validated",
+        occurred_at="2026-08-23T12:01:00+00:00",
+    )
+    database.transition_controller_cycle(
+        "cycle-one",
+        owner_id="owner-one",
+        generation=generation,
+        context_sha256="a" * 64,
+        authority_sha256="b" * 64,
+        from_state="validated",
+        to_state="preparing",
+        occurred_at="2026-08-23T12:02:00+00:00",
+        lease_expires_at="2026-08-23T12:10:00+00:00",
+    )
+    database.finalize_controller_cycle(
+        "cycle-one",
+        owner_id="owner-one",
+        generation=generation,
+        context_sha256="a" * 64,
+        authority_sha256="b" * 64,
+        from_state="preparing",
+        to_state="paid_decision_required",
+        occurred_at="2026-08-23T12:03:00+00:00",
+        stop_reason="paid evidence remains explicitly unauthorized",
+        artifact_path="reports/local/controller-cycles/cycle-one.json",
+        artifact_sha256="c" * 64,
+    )
+    cycle = database.get_controller_cycle("cycle-one")
+    assert cycle["generation"] == 1
+    assert cycle["state"] == "paid_decision_required"
+    assert cycle["artifact_sha256"] == "c" * 64
+    assert [item["to_state"] for item in cycle["transitions"]] == [
+        "created",
+        "validated",
+        "preparing",
+        "paid_decision_required",
+    ]
+    assert database.get_latest_controller_cycle("workspace-one") == cycle
+
+
+def test_controller_cycle_workspace_lease_prevents_contention(tmp_path: Path) -> None:
+    database = ResultsDatabase(tmp_path / "controller.sqlite")
+    database.initialize()
+
+    def acquire(suffix: str) -> tuple[str, object]:
+        try:
+            return suffix, _acquire_controller_cycle(
+                database, f"cycle-{suffix}", owner_id=f"owner-{suffix}"
+            )
+        except DatabaseError as exc:
+            return suffix, exc
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(acquire, ("one", "two")))
+    assert sum(isinstance(result, int) for _, result in results) == 1
+    errors = [result for _, result in results if isinstance(result, DatabaseError)]
+    assert len(errors) == 1
+    assert "active cycle" in str(errors[0])
+    with database.connect() as connection:
+        assert connection.execute("SELECT count(*) FROM controller_cycles").fetchone()[0] == 1
+
+
+def test_controller_cycle_failure_is_terminal_without_fake_artifact(tmp_path: Path) -> None:
+    database = ResultsDatabase(tmp_path / "controller.sqlite")
+    database.initialize()
+    generation = _acquire_controller_cycle(database, "cycle-failed")
+    database.transition_controller_cycle(
+        "cycle-failed",
+        owner_id="owner-one",
+        generation=generation,
+        context_sha256="a" * 64,
+        authority_sha256="b" * 64,
+        from_state="created",
+        to_state="failed",
+        occurred_at="2026-08-23T12:01:00+00:00",
+        stop_reason="immutable artifact write failed",
+    )
+    cycle = database.get_controller_cycle("cycle-failed")
+    assert cycle["state"] == "failed"
+    assert cycle["stop_reason"] == "immutable artifact write failed"
+    assert cycle["artifact_path"] is None
+    assert cycle["ended_at"] == "2026-08-23T12:01:00+00:00"
+
+
+def test_controller_cycle_rejects_invalid_transition_drift_and_output(tmp_path: Path) -> None:
+    database = ResultsDatabase(tmp_path / "controller.sqlite")
+    database.initialize()
+    generation = _acquire_controller_cycle(database, "cycle-one")
+    common = {
+        "owner_id": "owner-one",
+        "generation": generation,
+        "context_sha256": "a" * 64,
+        "authority_sha256": "b" * 64,
+        "from_state": "created",
+        "occurred_at": "2026-08-23T12:01:00+00:00",
+    }
+    with pytest.raises(DatabaseError, match="invalid controller transition"):
+        database.transition_controller_cycle("cycle-one", to_state="preparing", **common)
+    with pytest.raises(DatabaseError, match="lost ownership"):
+        database.transition_controller_cycle(
+            "cycle-one", to_state="validated", **{**common, "context_sha256": "d" * 64}
+        )
+    database.transition_controller_cycle("cycle-one", to_state="validated", **common)
+    with pytest.raises(DatabaseError, match="cannot predate"):
+        database.transition_controller_cycle(
+            "cycle-one",
+            owner_id="owner-one",
+            generation=generation,
+            context_sha256="a" * 64,
+            authority_sha256="b" * 64,
+            from_state="validated",
+            to_state="preparing",
+            occurred_at="2026-08-23T12:00:30+00:00",
+        )
+    database.transition_controller_cycle(
+        "cycle-one",
+        owner_id="owner-one",
+        generation=generation,
+        context_sha256="a" * 64,
+        authority_sha256="b" * 64,
+        from_state="validated",
+        to_state="preparing",
+        occurred_at="2026-08-23T12:02:00+00:00",
+    )
+    finalize = {
+        "owner_id": "owner-one",
+        "generation": generation,
+        "context_sha256": "a" * 64,
+        "authority_sha256": "b" * 64,
+        "from_state": "preparing",
+        "to_state": "stopped",
+        "occurred_at": "2026-08-23T12:03:00+00:00",
+        "artifact_sha256": "c" * 64,
+    }
+    with pytest.raises(DatabaseError, match="at most 1024"):
+        database.finalize_controller_cycle(
+            "cycle-one",
+            stop_reason="x" * 1025,
+            artifact_path="reports/local/cycle.json",
+            **finalize,
+        )
+    with pytest.raises(DatabaseError, match="private machine path"):
+        database.finalize_controller_cycle(
+            "cycle-one",
+            stop_reason="credential gh" + "p_" + "abcdefghijklmnopqrstuvwxyz",
+            artifact_path="reports/local/cycle.json",
+            **finalize,
+        )
+    with pytest.raises(DatabaseError, match="portable local-artifact path"):
+        database.finalize_controller_cycle(
+            "cycle-one",
+            stop_reason="manual stop",
+            artifact_path="../private/cycle.json",
+            **finalize,
+        )
+    assert database.get_controller_cycle("cycle-one")["state"] == "preparing"
+
+
+def test_expired_controller_cycle_is_fenced_reconciled_and_replaced(tmp_path: Path) -> None:
+    database = ResultsDatabase(tmp_path / "controller.sqlite")
+    database.initialize()
+    generation = _acquire_controller_cycle(
+        database,
+        "cycle-stale",
+        lease_expires_at="2026-08-23T12:01:00+00:00",
+    )
+    with pytest.raises(DatabaseError, match="lease has expired"):
+        database.transition_controller_cycle(
+            "cycle-stale",
+            owner_id="owner-one",
+            generation=generation,
+            context_sha256="a" * 64,
+            authority_sha256="b" * 64,
+            from_state="created",
+            to_state="validated",
+            occurred_at="2026-08-23T12:02:00+00:00",
+        )
+    assert database.reconcile_stale_controller_cycles(
+        now="2026-08-23T12:02:00+00:00"
+    ) == ["cycle-stale"]
+    stale = database.get_controller_cycle("cycle-stale")
+    assert stale["state"] == "failed"
+    assert stale["artifact_path"] is None
+    with pytest.raises(DatabaseError, match="finalization lost ownership"):
+        database.finalize_controller_cycle(
+            "cycle-stale",
+            owner_id="owner-one",
+            generation=generation,
+            context_sha256="a" * 64,
+            authority_sha256="b" * 64,
+            from_state="created",
+            to_state="failed",
+            occurred_at="2026-08-23T12:02:30+00:00",
+            stop_reason="stale owner",
+            artifact_path="reports/local/stale.json",
+            artifact_sha256="c" * 64,
+        )
+    assert _acquire_controller_cycle(
+        database,
+        "cycle-new",
+        owner_id="owner-two",
+        started_at="2026-08-23T12:03:00+00:00",
+        lease_expires_at="2026-08-23T12:08:00+00:00",
+    ) == 2
+
+
+def test_controller_acquire_atomically_reconciles_expired_cycle(tmp_path: Path) -> None:
+    database = ResultsDatabase(tmp_path / "controller.sqlite")
+    database.initialize()
+    assert _acquire_controller_cycle(
+        database,
+        "cycle-one",
+        lease_expires_at="2026-08-23T12:01:00+00:00",
+    ) == 1
+    assert _acquire_controller_cycle(
+        database,
+        "cycle-two",
+        owner_id="owner-two",
+        started_at="2026-08-23T12:02:00+00:00",
+        lease_expires_at="2026-08-23T12:07:00+00:00",
+    ) == 2
+    assert database.get_controller_cycle("cycle-one")["state"] == "failed"

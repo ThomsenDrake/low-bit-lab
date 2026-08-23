@@ -26,7 +26,7 @@ from lowbit_lab.reference_contract import (
     reference_execution_scope_sha256,
 )
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 REFERENCE_RESERVATION_USD = Decimal("4.00")
 TERMINAL_STATES = {"completed", "failed"}
 TRANSITIONS = {
@@ -34,6 +34,16 @@ TRANSITIONS = {
     "validated": {"running", "failed"},
     "running": TERMINAL_STATES,
     "completed": set(),
+    "failed": set(),
+}
+
+CONTROLLER_TERMINAL_STATES = {"paid_decision_required", "stopped", "failed"}
+CONTROLLER_TRANSITIONS = {
+    "created": {"validated", "failed"},
+    "validated": {"preparing", "failed"},
+    "preparing": CONTROLLER_TERMINAL_STATES,
+    "paid_decision_required": set(),
+    "stopped": set(),
     "failed": set(),
 }
 
@@ -213,6 +223,46 @@ CREATE TABLE IF NOT EXISTS reference_approval_challenges (
           OR (approval_digest IS NOT NULL AND expires_at IS NOT NULL)),
     CHECK(consumed_at IS NULL OR run_id IS NOT NULL)
 );
+CREATE TABLE IF NOT EXISTS controller_cycles (
+    cycle_id TEXT PRIMARY KEY,
+    workspace_id TEXT NOT NULL,
+    generation INTEGER NOT NULL CHECK(generation > 0),
+    context_sha256 TEXT NOT NULL CHECK(length(context_sha256) = 64),
+    authority_sha256 TEXT NOT NULL CHECK(length(authority_sha256) = 64),
+    selected_action TEXT NOT NULL CHECK(selected_action = 'prepare'),
+    state TEXT NOT NULL CHECK(state IN (
+        'created', 'validated', 'preparing', 'paid_decision_required', 'stopped', 'failed'
+    )),
+    owner_id TEXT NOT NULL,
+    lease_expires_at TEXT NOT NULL,
+    heartbeat_at TEXT NOT NULL,
+    stop_reason TEXT,
+    artifact_path TEXT,
+    artifact_sha256 TEXT CHECK(artifact_sha256 IS NULL OR length(artifact_sha256) = 64),
+    started_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    ended_at TEXT,
+    UNIQUE(workspace_id, generation),
+    CHECK((state IN ('paid_decision_required', 'stopped', 'failed') AND ended_at IS NOT NULL)
+          OR (state NOT IN ('paid_decision_required', 'stopped', 'failed') AND ended_at IS NULL)),
+    CHECK((artifact_path IS NULL) = (artifact_sha256 IS NULL))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS controller_cycles_active_workspace
+ON controller_cycles(workspace_id)
+WHERE state IN ('created', 'validated', 'preparing');
+CREATE TABLE IF NOT EXISTS controller_cycle_transitions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    cycle_id TEXT NOT NULL REFERENCES controller_cycles(cycle_id) ON DELETE RESTRICT,
+    generation INTEGER NOT NULL CHECK(generation > 0),
+    from_state TEXT,
+    to_state TEXT NOT NULL CHECK(to_state IN (
+        'created', 'validated', 'preparing', 'paid_decision_required', 'stopped', 'failed'
+    )),
+    reason TEXT,
+    occurred_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS controller_cycle_transitions_cycle
+ON controller_cycle_transitions(cycle_id, id);
 """
 
 EVIDENCE_TABLES = (
@@ -458,6 +508,8 @@ def _reference_challenge(config_json: str, config_sha256: str) -> tuple[str, dic
     }
     gate_fields = {
         "formula_authority_path",
+        "formula_approval_path",
+        "formula_approval_sha256",
         "memory_fit_evidence_path",
         "memory_fit_evidence_sha256",
         "cold_path_time_evidence_path",
@@ -466,7 +518,7 @@ def _reference_challenge(config_json: str, config_sha256: str) -> tuple[str, dic
     if (
         not isinstance(raw, dict)
         or set(raw) != top_fields
-        or raw.get("schema_version") != 3
+        or raw.get("schema_version") != 4
         or raw.get("kind") != "modal_reference_preview"
         or not isinstance(raw.get("inputs"), dict)
         or set(raw["inputs"]) != input_fields
@@ -599,6 +651,38 @@ def _database_private_data_scan(value: object, *, path: str = "reference") -> No
         raise DatabaseError(f"private machine path is forbidden: {path}")
 
 
+def _controller_identifier(value: str, label: str) -> str:
+    if (
+        not isinstance(value, str)
+        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", value) is None
+    ):
+        raise DatabaseError(f"{label} must be a bounded portable identifier")
+    _database_private_data_scan(value, path=label)
+    return value
+
+
+def _controller_text(value: str, label: str, *, maximum: int) -> str:
+    if not isinstance(value, str) or not value.strip() or len(value) > maximum:
+        raise DatabaseError(f"{label} must be non-empty and at most {maximum} characters")
+    _database_private_data_scan(value, path=label)
+    return value
+
+
+def _controller_artifact_path(value: str) -> str:
+    value = _controller_text(value, "artifact_path", maximum=512)
+    path = Path(value)
+    portable = path.as_posix()
+    if (
+        path.is_absolute()
+        or "\\" in value
+        or ".." in path.parts
+        or portable != value
+        or not portable.startswith(("reports/local/", "artifacts/local/"))
+    ):
+        raise DatabaseError("artifact_path must be a portable local-artifact path")
+    return value
+
+
 def _validate_activation_run_config(config_json: str, requested_cost: str) -> None:
     try:
         config = json.loads(config_json)
@@ -671,6 +755,21 @@ class ResultsDatabase:
         finally:
             connection.close()
 
+    @contextmanager
+    def connect_readonly(self) -> Iterator[sqlite3.Connection]:
+        if not self.path.is_file():
+            raise DatabaseError("database does not exist")
+        try:
+            connection = sqlite3.connect(f"{self.path.resolve().as_uri()}?mode=ro", uri=True)
+        except sqlite3.Error as exc:
+            raise DatabaseError("cannot open database read-only") from exc
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys = ON")
+        try:
+            yield connection
+        finally:
+            connection.close()
+
     def initialize(self) -> None:
         with self.connect() as connection:
             has_schema = connection.execute(
@@ -700,8 +799,73 @@ class ResultsDatabase:
             if existing == 5:
                 self._migrate_v5_to_v6(connection)
                 existing = 6
+            if existing == 6:
+                self._migrate_v6_to_v7(connection)
+                existing = 7
             if existing != SCHEMA_VERSION:
                 raise DatabaseError(f"database schema {existing} != supported {SCHEMA_VERSION}")
+
+    def _migrate_v6_to_v7(self, connection: sqlite3.Connection) -> None:
+        statements = (
+            """CREATE TABLE controller_cycles (
+                cycle_id TEXT PRIMARY KEY,
+                workspace_id TEXT NOT NULL,
+                generation INTEGER NOT NULL CHECK(generation > 0),
+                context_sha256 TEXT NOT NULL CHECK(length(context_sha256) = 64),
+                authority_sha256 TEXT NOT NULL CHECK(length(authority_sha256) = 64),
+                selected_action TEXT NOT NULL CHECK(selected_action = 'prepare'),
+                state TEXT NOT NULL CHECK(state IN (
+                    'created', 'validated', 'preparing',
+                    'paid_decision_required', 'stopped', 'failed'
+                )),
+                owner_id TEXT NOT NULL,
+                lease_expires_at TEXT NOT NULL,
+                heartbeat_at TEXT NOT NULL,
+                stop_reason TEXT,
+                artifact_path TEXT,
+                artifact_sha256 TEXT
+                    CHECK(artifact_sha256 IS NULL OR length(artifact_sha256) = 64),
+                started_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                ended_at TEXT,
+                UNIQUE(workspace_id, generation),
+                CHECK((state IN ('paid_decision_required', 'stopped', 'failed')
+                       AND ended_at IS NOT NULL)
+                      OR (state NOT IN ('paid_decision_required', 'stopped', 'failed')
+                          AND ended_at IS NULL)),
+                CHECK((artifact_path IS NULL) = (artifact_sha256 IS NULL))
+            )""",
+            """CREATE UNIQUE INDEX controller_cycles_active_workspace
+            ON controller_cycles(workspace_id)
+            WHERE state IN ('created', 'validated', 'preparing')""",
+            """CREATE TABLE controller_cycle_transitions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                cycle_id TEXT NOT NULL
+                    REFERENCES controller_cycles(cycle_id) ON DELETE RESTRICT,
+                generation INTEGER NOT NULL CHECK(generation > 0),
+                from_state TEXT,
+                to_state TEXT NOT NULL CHECK(to_state IN (
+                    'created', 'validated', 'preparing',
+                    'paid_decision_required', 'stopped', 'failed'
+                )),
+                reason TEXT,
+                occurred_at TEXT NOT NULL
+            )""",
+            """CREATE INDEX controller_cycle_transitions_cycle
+            ON controller_cycle_transitions(cycle_id, id)""",
+        )
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            for statement in statements:
+                connection.execute(statement)
+            connection.execute(
+                """INSERT INTO schema_info(version, applied_at)
+                VALUES (7, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))"""
+            )
+            connection.commit()
+        except Exception as exc:
+            connection.rollback()
+            raise DatabaseError(f"database schema v7 migration failed: {exc}") from exc
 
     def _migrate_v5_to_v6(self, connection: sqlite3.Connection) -> None:
         try:
@@ -1138,6 +1302,463 @@ class ResultsDatabase:
         finally:
             connection.execute("PRAGMA foreign_keys = ON")
 
+    def acquire_controller_cycle(
+        self,
+        *,
+        cycle_id: str,
+        workspace_id: str,
+        owner_id: str,
+        context_sha256: str,
+        authority_sha256: str,
+        started_at: str,
+        lease_expires_at: str,
+        selected_action: str = "prepare",
+    ) -> int:
+        cycle_id = _controller_identifier(cycle_id, "cycle_id")
+        workspace_id = _controller_identifier(workspace_id, "workspace_id")
+        owner_id = _controller_identifier(owner_id, "owner_id")
+        context_sha256 = _database_sha256(context_sha256, "context_sha256")
+        authority_sha256 = _database_sha256(authority_sha256, "authority_sha256")
+        started = _database_timestamp(started_at, "started_at")
+        lease = _database_timestamp(lease_expires_at, "lease_expires_at")
+        if selected_action != "prepare":
+            raise DatabaseError("controller selected_action is not allowed")
+        if lease <= started:
+            raise DatabaseError("controller lease must expire after start")
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            expired = connection.execute(
+                """SELECT cycle_id, generation, state FROM controller_cycles
+                WHERE workspace_id = ? AND state IN ('created', 'validated', 'preparing')
+                  AND lease_expires_at <= ?""",
+                (workspace_id, started_at),
+            ).fetchall()
+            for row in expired:
+                reason = "controller cycle lease expired before terminal persistence"
+                connection.execute(
+                    """UPDATE controller_cycles SET state = 'failed', stop_reason = ?,
+                    heartbeat_at = ?, updated_at = ?, ended_at = ? WHERE cycle_id = ?""",
+                    (reason, started_at, started_at, started_at, row["cycle_id"]),
+                )
+                connection.execute(
+                    """INSERT INTO controller_cycle_transitions(
+                    cycle_id, generation, from_state, to_state, reason, occurred_at
+                    ) VALUES (?, ?, ?, 'failed', ?, ?)""",
+                    (row["cycle_id"], row["generation"], row["state"], reason, started_at),
+                )
+            active = connection.execute(
+                """SELECT cycle_id FROM controller_cycles
+                WHERE workspace_id = ? AND state IN ('created', 'validated', 'preparing')""",
+                (workspace_id,),
+            ).fetchone()
+            if active is not None:
+                raise DatabaseError(
+                    f"controller workspace already has an active cycle: {active['cycle_id']}"
+                )
+            generation = connection.execute(
+                "SELECT coalesce(max(generation), 0) + 1 FROM controller_cycles "
+                "WHERE workspace_id = ?",
+                (workspace_id,),
+            ).fetchone()[0]
+            connection.execute(
+                """INSERT INTO controller_cycles(
+                    cycle_id, workspace_id, generation, context_sha256, authority_sha256,
+                    selected_action, state, owner_id, lease_expires_at, heartbeat_at,
+                    started_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, 'created', ?, ?, ?, ?, ?)""",
+                (
+                    cycle_id,
+                    workspace_id,
+                    generation,
+                    context_sha256,
+                    authority_sha256,
+                    selected_action,
+                    owner_id,
+                    lease_expires_at,
+                    started_at,
+                    started_at,
+                    started_at,
+                ),
+            )
+            connection.execute(
+                """INSERT INTO controller_cycle_transitions(
+                    cycle_id, generation, from_state, to_state, occurred_at
+                ) VALUES (?, ?, NULL, 'created', ?)""",
+                (cycle_id, generation, started_at),
+            )
+            return generation
+
+    def transition_controller_cycle(
+        self,
+        cycle_id: str,
+        *,
+        owner_id: str,
+        generation: int,
+        context_sha256: str,
+        authority_sha256: str,
+        from_state: str,
+        to_state: str,
+        occurred_at: str,
+        lease_expires_at: str | None = None,
+        reason: str | None = None,
+        stop_reason: str | None = None,
+    ) -> None:
+        cycle_id = _controller_identifier(cycle_id, "cycle_id")
+        owner_id = _controller_identifier(owner_id, "owner_id")
+        context_sha256 = _database_sha256(context_sha256, "context_sha256")
+        authority_sha256 = _database_sha256(authority_sha256, "authority_sha256")
+        if not isinstance(generation, int) or isinstance(generation, bool) or generation <= 0:
+            raise DatabaseError("controller generation must be a positive integer")
+        if to_state not in CONTROLLER_TRANSITIONS.get(from_state, set()):
+            raise DatabaseError(f"invalid controller transition: {from_state} -> {to_state}")
+        if to_state in CONTROLLER_TERMINAL_STATES and to_state != "failed":
+            raise DatabaseError("terminal controller transitions require finalize")
+        occurred = _database_timestamp(occurred_at, "occurred_at")
+        if reason is not None:
+            reason = _controller_text(reason, "reason", maximum=1024)
+        if to_state == "failed":
+            if reason is not None or stop_reason is None:
+                raise DatabaseError("failed controller transition requires only stop_reason")
+            stop_reason = _controller_text(stop_reason, "stop_reason", maximum=1024)
+        elif stop_reason is not None:
+            raise DatabaseError("nonterminal controller transition cannot set stop_reason")
+        new_lease = None
+        if lease_expires_at is not None:
+            new_lease = _database_timestamp(lease_expires_at, "lease_expires_at")
+            if new_lease <= occurred:
+                raise DatabaseError("controller lease must expire after transition")
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """SELECT lease_expires_at, heartbeat_at FROM controller_cycles
+                WHERE cycle_id = ? AND owner_id = ? AND generation = ?
+                  AND context_sha256 = ? AND authority_sha256 = ? AND state = ?""",
+                (
+                    cycle_id,
+                    owner_id,
+                    generation,
+                    context_sha256,
+                    authority_sha256,
+                    from_state,
+                ),
+            ).fetchone()
+            if row is None:
+                raise DatabaseError(f"controller cycle transition lost ownership: {cycle_id}")
+            stored_lease = _database_timestamp(row["lease_expires_at"], "stored lease_expires_at")
+            if stored_lease <= occurred:
+                raise DatabaseError(f"controller cycle lease has expired: {cycle_id}")
+            stored_heartbeat = _database_timestamp(row["heartbeat_at"], "stored heartbeat_at")
+            if occurred < stored_heartbeat:
+                raise DatabaseError("controller transition cannot predate its heartbeat")
+            next_lease = (
+                lease_expires_at if lease_expires_at is not None else row["lease_expires_at"]
+            )
+            if to_state == "failed":
+                cursor = connection.execute(
+                    """UPDATE controller_cycles SET state = 'failed', stop_reason = ?,
+                        lease_expires_at = ?, heartbeat_at = ?, updated_at = ?, ended_at = ?
+                    WHERE cycle_id = ? AND owner_id = ? AND generation = ?
+                      AND context_sha256 = ? AND authority_sha256 = ? AND state = ?""",
+                    (
+                        stop_reason,
+                        next_lease,
+                        occurred_at,
+                        occurred_at,
+                        occurred_at,
+                        cycle_id,
+                        owner_id,
+                        generation,
+                        context_sha256,
+                        authority_sha256,
+                        from_state,
+                    ),
+                )
+            else:
+                cursor = connection.execute(
+                    """UPDATE controller_cycles SET state = ?, lease_expires_at = ?,
+                        heartbeat_at = ?, updated_at = ?
+                    WHERE cycle_id = ? AND owner_id = ? AND generation = ?
+                      AND context_sha256 = ? AND authority_sha256 = ? AND state = ?""",
+                    (
+                        to_state,
+                        next_lease,
+                        occurred_at,
+                        occurred_at,
+                        cycle_id,
+                        owner_id,
+                        generation,
+                        context_sha256,
+                        authority_sha256,
+                        from_state,
+                    ),
+                )
+            if cursor.rowcount != 1:
+                raise DatabaseError(f"controller cycle transition lost ownership: {cycle_id}")
+            connection.execute(
+                """INSERT INTO controller_cycle_transitions(
+                    cycle_id, generation, from_state, to_state, reason, occurred_at
+                ) VALUES (?, ?, ?, ?, ?, ?)""",
+                (
+                    cycle_id,
+                    generation,
+                    from_state,
+                    to_state,
+                    stop_reason if to_state == "failed" else reason,
+                    occurred_at,
+                ),
+            )
+
+    def finalize_controller_cycle(
+        self,
+        cycle_id: str,
+        *,
+        owner_id: str,
+        generation: int,
+        context_sha256: str,
+        authority_sha256: str,
+        from_state: str,
+        to_state: str,
+        occurred_at: str,
+        stop_reason: str,
+        artifact_path: str,
+        artifact_sha256: str,
+    ) -> None:
+        cycle_id = _controller_identifier(cycle_id, "cycle_id")
+        owner_id = _controller_identifier(owner_id, "owner_id")
+        context_sha256 = _database_sha256(context_sha256, "context_sha256")
+        authority_sha256 = _database_sha256(authority_sha256, "authority_sha256")
+        artifact_sha256 = _database_sha256(artifact_sha256, "artifact_sha256")
+        artifact_path = _controller_artifact_path(artifact_path)
+        stop_reason = _controller_text(stop_reason, "stop_reason", maximum=1024)
+        if not isinstance(generation, int) or isinstance(generation, bool) or generation <= 0:
+            raise DatabaseError("controller generation must be a positive integer")
+        if (
+            to_state not in CONTROLLER_TERMINAL_STATES
+            or to_state not in CONTROLLER_TRANSITIONS.get(from_state, set())
+        ):
+            raise DatabaseError(f"invalid controller finalization: {from_state} -> {to_state}")
+        occurred = _database_timestamp(occurred_at, "occurred_at")
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """SELECT lease_expires_at, heartbeat_at FROM controller_cycles
+                WHERE cycle_id = ? AND owner_id = ? AND generation = ?
+                  AND context_sha256 = ? AND authority_sha256 = ? AND state = ?""",
+                (
+                    cycle_id,
+                    owner_id,
+                    generation,
+                    context_sha256,
+                    authority_sha256,
+                    from_state,
+                ),
+            ).fetchone()
+            if row is None:
+                raise DatabaseError(f"controller cycle finalization lost ownership: {cycle_id}")
+            if _database_timestamp(row["lease_expires_at"], "stored lease_expires_at") <= occurred:
+                raise DatabaseError(f"controller cycle lease has expired: {cycle_id}")
+            if occurred < _database_timestamp(row["heartbeat_at"], "stored heartbeat_at"):
+                raise DatabaseError("controller finalization cannot predate its heartbeat")
+            cursor = connection.execute(
+                """UPDATE controller_cycles SET state = ?, stop_reason = ?, artifact_path = ?,
+                    artifact_sha256 = ?, heartbeat_at = ?, updated_at = ?, ended_at = ?
+                WHERE cycle_id = ? AND owner_id = ? AND generation = ?
+                  AND context_sha256 = ? AND authority_sha256 = ? AND state = ?""",
+                (
+                    to_state,
+                    stop_reason,
+                    artifact_path,
+                    artifact_sha256,
+                    occurred_at,
+                    occurred_at,
+                    occurred_at,
+                    cycle_id,
+                    owner_id,
+                    generation,
+                    context_sha256,
+                    authority_sha256,
+                    from_state,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise DatabaseError(f"controller cycle finalization lost ownership: {cycle_id}")
+            connection.execute(
+                """INSERT INTO controller_cycle_transitions(
+                    cycle_id, generation, from_state, to_state, reason, occurred_at
+                ) VALUES (?, ?, ?, ?, ?, ?)""",
+                (cycle_id, generation, from_state, to_state, stop_reason, occurred_at),
+            )
+
+    def fail_controller_cycle(
+        self,
+        cycle_id: str,
+        *,
+        owner_id: str,
+        generation: int,
+        context_sha256: str,
+        authority_sha256: str,
+        from_state: str,
+        occurred_at: str,
+        stop_reason: str,
+    ) -> None:
+        cycle_id = _controller_identifier(cycle_id, "cycle_id")
+        owner_id = _controller_identifier(owner_id, "owner_id")
+        context_sha256 = _database_sha256(context_sha256, "context_sha256")
+        authority_sha256 = _database_sha256(authority_sha256, "authority_sha256")
+        stop_reason = _controller_text(stop_reason, "stop_reason", maximum=1024)
+        if not isinstance(generation, int) or isinstance(generation, bool) or generation <= 0:
+            raise DatabaseError("controller generation must be a positive integer")
+        if "failed" not in CONTROLLER_TRANSITIONS.get(from_state, set()):
+            raise DatabaseError(f"invalid controller failure: {from_state} -> failed")
+        occurred = _database_timestamp(occurred_at, "occurred_at")
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """SELECT lease_expires_at FROM controller_cycles
+                WHERE cycle_id = ? AND owner_id = ? AND generation = ?
+                  AND context_sha256 = ? AND authority_sha256 = ? AND state = ?""",
+                (
+                    cycle_id,
+                    owner_id,
+                    generation,
+                    context_sha256,
+                    authority_sha256,
+                    from_state,
+                ),
+            ).fetchone()
+            if row is None or _database_timestamp(
+                row["lease_expires_at"], "stored lease_expires_at"
+            ) <= occurred:
+                raise DatabaseError(f"controller cycle failure lost ownership: {cycle_id}")
+            cursor = connection.execute(
+                """UPDATE controller_cycles SET state = 'failed', stop_reason = ?,
+                heartbeat_at = ?, updated_at = ?, ended_at = ?
+                WHERE cycle_id = ? AND owner_id = ? AND generation = ?
+                  AND context_sha256 = ? AND authority_sha256 = ? AND state = ?""",
+                (
+                    stop_reason,
+                    occurred_at,
+                    occurred_at,
+                    occurred_at,
+                    cycle_id,
+                    owner_id,
+                    generation,
+                    context_sha256,
+                    authority_sha256,
+                    from_state,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise DatabaseError(f"controller cycle failure lost ownership: {cycle_id}")
+            connection.execute(
+                """INSERT INTO controller_cycle_transitions(
+                cycle_id, generation, from_state, to_state, reason, occurred_at
+                ) VALUES (?, ?, ?, 'failed', ?, ?)""",
+                (cycle_id, generation, from_state, stop_reason, occurred_at),
+            )
+
+    def get_controller_cycle(self, cycle_id: str) -> dict[str, Any]:
+        cycle_id = _controller_identifier(cycle_id, "cycle_id")
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM controller_cycles WHERE cycle_id = ?", (cycle_id,)
+            ).fetchone()
+            if row is None:
+                raise DatabaseError(f"unknown controller cycle: {cycle_id}")
+            transitions = connection.execute(
+                """SELECT from_state, to_state, reason, occurred_at
+                FROM controller_cycle_transitions WHERE cycle_id = ? ORDER BY id""",
+                (cycle_id,),
+            ).fetchall()
+        result = dict(row)
+        result["transitions"] = [dict(item) for item in transitions]
+        return result
+
+    def get_latest_controller_cycle(self, workspace_id: str) -> dict[str, Any] | None:
+        workspace_id = _controller_identifier(workspace_id, "workspace_id")
+        with self.connect() as connection:
+            row = connection.execute(
+                """SELECT * FROM controller_cycles
+                WHERE workspace_id = ? ORDER BY generation DESC LIMIT 1""",
+                (workspace_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            transitions = connection.execute(
+                """SELECT from_state, to_state, reason, occurred_at
+                FROM controller_cycle_transitions WHERE cycle_id = ? ORDER BY id""",
+                (row["cycle_id"],),
+            ).fetchall()
+        result = dict(row)
+        result["transitions"] = [dict(item) for item in transitions]
+        return result
+
+    def get_latest_controller_cycle_readonly(
+        self, workspace_id: str
+    ) -> dict[str, Any] | None:
+        workspace_id = _controller_identifier(workspace_id, "workspace_id")
+        try:
+            with self.connect_readonly() as connection:
+                row = connection.execute(
+                    """SELECT * FROM controller_cycles
+                    WHERE workspace_id = ? ORDER BY generation DESC LIMIT 1""",
+                    (workspace_id,),
+                ).fetchone()
+                if row is None:
+                    return None
+                transitions = connection.execute(
+                    """SELECT from_state, to_state, reason, occurred_at
+                    FROM controller_cycle_transitions WHERE cycle_id = ? ORDER BY id""",
+                    (row["cycle_id"],),
+                ).fetchall()
+        except sqlite3.Error as exc:
+            raise DatabaseError("cannot read controller cycle") from exc
+        result = dict(row)
+        result["transitions"] = [dict(item) for item in transitions]
+        return result
+
+    def reconcile_stale_controller_cycles(self, *, now: str) -> list[str]:
+        now_time = _database_timestamp(now, "now")
+        reason = "controller cycle lease expired before terminal persistence"
+        reconciled: list[str] = []
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            rows = connection.execute(
+                """SELECT cycle_id, generation, state, lease_expires_at
+                FROM controller_cycles
+                WHERE state IN ('created', 'validated', 'preparing') ORDER BY cycle_id"""
+            ).fetchall()
+            for row in rows:
+                stored_lease = _database_timestamp(
+                    row["lease_expires_at"], "stored lease_expires_at"
+                )
+                if stored_lease > now_time:
+                    continue
+                cursor = connection.execute(
+                    """UPDATE controller_cycles SET state = 'failed', stop_reason = ?,
+                        heartbeat_at = ?, updated_at = ?, ended_at = ?
+                    WHERE cycle_id = ? AND generation = ? AND state = ?""",
+                    (
+                        reason,
+                        now,
+                        now,
+                        now,
+                        row["cycle_id"],
+                        row["generation"],
+                        row["state"],
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    continue
+                connection.execute(
+                    """INSERT INTO controller_cycle_transitions(
+                        cycle_id, generation, from_state, to_state, reason, occurred_at
+                    ) VALUES (?, ?, ?, 'failed', ?, ?)""",
+                    (row["cycle_id"], row["generation"], row["state"], reason, now),
+                )
+                reconciled.append(row["cycle_id"])
+        return reconciled
+
     def create_run(
         self,
         *,
@@ -1320,6 +1941,9 @@ class ResultsDatabase:
                 weight_inventory_sha256=str(inputs["weight_inventory_sha256"]),
                 evaluation_lock_sha256=str(inputs["evaluation_lock_sha256"]),
                 formula_authority_sha256=str(inputs["formula_authority_sha256"]),
+                formula_approval_sha256=str(
+                    parsed_config["gates"]["formula_approval_sha256"]
+                ),
                 trust_override_sha256=str(parsed_config["provider"]["trust_override_sha256"]),
             )
         except ValueError as exc:

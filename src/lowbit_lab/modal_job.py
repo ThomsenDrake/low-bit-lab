@@ -42,6 +42,7 @@ from lowbit_lab.reference_contract import (
 from lowbit_lab.reference_gates import (
     ReferenceGateError,
     verify_cold_path_time_evidence,
+    verify_formula_approval_receipt,
     verify_formula_authority,
     verify_memory_fit_evidence,
     verify_provider_billing_authority,
@@ -104,13 +105,15 @@ class ReferenceJobConfig:
     @property
     def reference_execution_scope_sha256(self) -> str | None:
         formula_authority_sha256 = self.inputs["formula_authority_sha256"]
-        if formula_authority_sha256 is None:
+        formula_approval_sha256 = self.gates["formula_approval_sha256"]
+        if formula_authority_sha256 is None or formula_approval_sha256 is None:
             return None
         return reference_execution_scope_sha256(
             source_revision=str(self.inputs["source_revision"]),
             weight_inventory_sha256=str(self.inputs["weight_inventory_sha256"]),
             evaluation_lock_sha256=str(self.inputs["evaluation_lock_sha256"]),
             formula_authority_sha256=str(formula_authority_sha256),
+            formula_approval_sha256=str(formula_approval_sha256),
             trust_override_sha256=self.provider["trust_override_sha256"],
         )
 
@@ -181,7 +184,7 @@ def load_reference_job_config(path: Path, *, root: Path) -> ReferenceJobConfig:
         raise ReferenceJobError(f"cannot read reference config: {exc}") from exc
     _reject_credential_fields(raw)
     top = _closed(raw, REFERENCE_FIELDS, "reference config")
-    if top["schema_version"] != 3 or top["kind"] != "modal_reference_preview":
+    if top["schema_version"] != 4 or top["kind"] != "modal_reference_preview":
         raise ReferenceJobError("unsupported reference config")
     if not isinstance(top["experiment_id"], str) or not top["experiment_id"]:
         raise ReferenceJobError("reference experiment_id is required")
@@ -361,6 +364,8 @@ def load_reference_job_config(path: Path, *, root: Path) -> ReferenceJobConfig:
         top["gates"],
         {
             "formula_authority_path",
+            "formula_approval_path",
+            "formula_approval_sha256",
             "memory_fit_evidence_path",
             "memory_fit_evidence_sha256",
             "cold_path_time_evidence_path",
@@ -393,6 +398,23 @@ def load_reference_job_config(path: Path, *, root: Path) -> ReferenceJobConfig:
             "formula_authority_path",
             "reports/local/",
         )
+    formula_approval_path = gates["formula_approval_path"]
+    formula_approval_sha = gates["formula_approval_sha256"]
+    if (formula_approval_path is None) != (formula_approval_sha is None):
+        raise ReferenceJobError(
+            "formula approval path and SHA-256 must be supplied together"
+        )
+    if formula_approval_path is not None:
+        gates["formula_approval_path"] = _repo_path(
+            root,
+            formula_approval_path,
+            "formula_approval_path",
+            "reports/local/",
+        )
+        if not isinstance(formula_approval_sha, str) or SHA256_RE.fullmatch(
+            formula_approval_sha
+        ) is None:
+            raise ReferenceJobError("formula_approval_sha256 must be lowercase SHA-256")
     approval_path = top["approval_artifact_path"]
     if approval_path is not None:
         approval_path = _repo_path(
@@ -448,6 +470,7 @@ def plan_reference_preview(config: ReferenceJobConfig, *, root: Path) -> dict[st
         blockers.append("control_plane_hash_mismatch")
     formula_verified = False
     formula_human_approved = False
+    formula_approval_verified = False
     formula_sha = config.inputs["formula_authority_sha256"]
     formula_path = config.gates["formula_authority_path"]
     if isinstance(formula_sha, str) and isinstance(formula_path, str):
@@ -462,6 +485,17 @@ def plan_reference_preview(config: ReferenceJobConfig, *, root: Path) -> dict[st
             )
             formula_verified = bool(formula_result["verified"])
             formula_human_approved = bool(formula_result["human_approved"])
+            approval_path = config.gates["formula_approval_path"]
+            approval_sha = config.gates["formula_approval_sha256"]
+            if isinstance(approval_path, str) and isinstance(approval_sha, str):
+                formula_approval_verified = bool(
+                    verify_formula_approval_receipt(
+                        root / approval_path,
+                        expected_sha256=approval_sha,
+                        expected_formula_path=formula_path,
+                        expected_formula_sha256=formula_sha,
+                    )["verified"]
+                )
         except ReferenceGateError:
             formula_verified = False
     if formula_sha is None:
@@ -470,6 +504,8 @@ def plan_reference_preview(config: ReferenceJobConfig, *, root: Path) -> dict[st
         blockers.append("formula_authority_unverified")
     elif not formula_human_approved:
         blockers.append("formula_authority_review_pending")
+    elif not formula_approval_verified:
+        blockers.append("formula_approval_receipt_unverified")
     provider_concurrency_proven = False
     provider_constraint_authority = "unproven"
     trust_override_accepted = False

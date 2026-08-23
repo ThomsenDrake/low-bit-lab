@@ -25,6 +25,15 @@ TIME_FORMULA = (
     "+safety_margin_seconds<=timeout_seconds"
 )
 A100_80GB_BYTES = 80 * 1024**3
+FORMULA_APPROVAL_STATEMENT_SHA256 = (
+    "87b42e40c2a290e01d87b721bf381c3c5e259d1eb0a4660e41fdbf8bc73f7ddd"
+)
+REVIEWED_FORMULA_SHA256 = (
+    "b7d1b7495f2f5396059c693dcde62525a278854b4b8953ce300cd6054f31c163"
+)
+APPROVED_FORMULA_SHA256 = (
+    "a2ee227c0cba04ac2b9af3ff1ca293fe0aabe4b2abe71f7f949a8d54f1f93e68"
+)
 
 
 @dataclass(frozen=True)
@@ -140,6 +149,41 @@ def verify_formula_authority(
         "human_approved": authority["approval_status"] == "approved",
         "evidence_sha256": digest,
     }
+
+
+def verify_formula_approval_receipt(
+    path: Path,
+    *,
+    expected_sha256: str,
+    expected_formula_path: str,
+    expected_formula_sha256: str,
+) -> dict[str, object]:
+    raw, digest = _load(path, expected_sha256)
+    receipt = _closed(
+        raw,
+        {
+            "schema_version",
+            "kind",
+            "statement_sha256",
+            "reviewed_formula_sha256",
+            "approved_formula_sha256",
+            "formula_authority_path",
+            "human_origin",
+        },
+        "formula approval receipt",
+    )
+    if receipt["schema_version"] != 1 or receipt["kind"] != "formula_approval_receipt":
+        raise ReferenceGateError("unsupported formula approval receipt")
+    if (
+        receipt["statement_sha256"] != FORMULA_APPROVAL_STATEMENT_SHA256
+        or receipt["reviewed_formula_sha256"] != REVIEWED_FORMULA_SHA256
+        or receipt["approved_formula_sha256"] != APPROVED_FORMULA_SHA256
+        or receipt["approved_formula_sha256"] != expected_formula_sha256
+        or receipt["formula_authority_path"] != expected_formula_path
+        or receipt["human_origin"] != "attested"
+    ):
+        raise ReferenceGateError("formula approval receipt lineage mismatch")
+    return {"verified": True, "evidence_sha256": digest}
 
 
 def verify_memory_fit_evidence(
