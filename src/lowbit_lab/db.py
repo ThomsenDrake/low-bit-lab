@@ -7,7 +7,7 @@ import re
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
@@ -162,6 +162,11 @@ CREATE TABLE IF NOT EXISTS budget_reservations (
     provider_actual_cost_usd TEXT,
     provider_job_id TEXT UNIQUE,
     app_identity TEXT,
+    billing_authority_sha256 TEXT,
+    authoritative_report_identity_sha256 TEXT,
+    billing_completeness_delay_seconds INTEGER,
+    submitted_at TEXT,
+    settlement_pending_at TEXT,
     idempotency_key TEXT NOT NULL UNIQUE,
     settlement_identity TEXT UNIQUE,
     owner_id TEXT NOT NULL,
@@ -174,7 +179,17 @@ CREATE TABLE IF NOT EXISTS budget_reservations (
            AND settlement_identity IS NOT NULL) OR status != 'settled'),
     CHECK((status IN ('submitted', 'settlement_pending', 'settled', 'audit_blocked')
            AND provider_job_id IS NOT NULL AND app_identity IS NOT NULL)
-          OR status NOT IN ('submitted', 'settlement_pending', 'settled', 'audit_blocked'))
+          OR status NOT IN ('submitted', 'settlement_pending', 'settled', 'audit_blocked')),
+    CHECK(reference_execution_scope_sha256 IS NULL OR
+          (billing_authority_sha256 IS NOT NULL
+           AND authoritative_report_identity_sha256 IS NOT NULL
+           AND billing_completeness_delay_seconds > 0)),
+    CHECK(reference_execution_scope_sha256 IS NULL
+          OR status NOT IN ('submitted', 'settlement_pending', 'settled', 'audit_blocked')
+          OR submitted_at IS NOT NULL),
+    CHECK(reference_execution_scope_sha256 IS NULL
+          OR status NOT IN ('settlement_pending', 'settled')
+          OR settlement_pending_at IS NOT NULL)
 );
 CREATE UNIQUE INDEX IF NOT EXISTS budget_reservations_active_experiment
 ON budget_reservations(experiment_id)
@@ -326,6 +341,46 @@ def _database_timestamp(value: str, label: str) -> datetime:
     return timestamp
 
 
+def _reference_billing_report(
+    report_json: str, report_sha256: str
+) -> tuple[dict[str, object], Decimal]:
+    _database_sha256(report_sha256, "billing_report_sha256")
+    try:
+        report = json.loads(report_json)
+    except json.JSONDecodeError as exc:
+        raise DatabaseError("billing report receipt must be canonical JSON") from exc
+    fields = {
+        "schema_version",
+        "kind",
+        "provider_job_id",
+        "billing_authority_sha256",
+        "authoritative_report_identity_sha256",
+        "covered_through",
+        "actual_cost_usd",
+    }
+    canonical = json.dumps(report, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    if (
+        not isinstance(report, dict)
+        or set(report) != fields
+        or canonical != report_json
+        or hashlib.sha256(canonical.encode()).hexdigest() != report_sha256
+        or report.get("schema_version") != 1
+        or report.get("kind") != "provider_billing_report_receipt"
+        or not isinstance(report.get("provider_job_id"), str)
+        or not report["provider_job_id"]
+    ):
+        raise DatabaseError("billing report receipt identity is invalid")
+    for field in ("billing_authority_sha256", "authoritative_report_identity_sha256"):
+        if not isinstance(report[field], str) or SHA256_RE.fullmatch(report[field]) is None:
+            raise DatabaseError("billing report receipt authority is invalid")
+    if not isinstance(report.get("covered_through"), str):
+        raise DatabaseError("billing report receipt coverage is invalid")
+    _database_timestamp(report["covered_through"], "covered_through")
+    if not isinstance(report.get("actual_cost_usd"), str):
+        raise DatabaseError("billing report receipt cost is invalid")
+    return report, _database_money(report["actual_cost_usd"], "actual_cost_usd")
+
+
 def _reference_challenge(config_json: str, config_sha256: str) -> tuple[str, dict[str, Any]]:
     try:
         raw = json.loads(config_json)
@@ -387,6 +442,8 @@ def _reference_challenge(config_json: str, config_sha256: str) -> tuple[str, dic
         "observation_receipt_sha256",
         "billing_authority_path",
         "billing_authority_sha256",
+        "authoritative_report_identity_sha256",
+        "billing_completeness_delay_seconds",
     }
     gate_fields = {
         "formula_authority_path",
@@ -398,7 +455,7 @@ def _reference_challenge(config_json: str, config_sha256: str) -> tuple[str, dic
     if (
         not isinstance(raw, dict)
         or set(raw) != top_fields
-        or raw.get("schema_version") != 1
+        or raw.get("schema_version") != 2
         or raw.get("kind") != "modal_reference_preview"
         or not isinstance(raw.get("inputs"), dict)
         or set(raw["inputs"]) != input_fields
@@ -435,17 +492,34 @@ def _reference_challenge(config_json: str, config_sha256: str) -> tuple[str, dic
     ):
         raise DatabaseError("reference authority paths or hashes are invalid")
     for digest_name in ("workspace_scope_sha256", "environment_scope_sha256"):
-        if SHA256_RE.fullmatch(str(provider[digest_name])) is None:
+        if (
+            not isinstance(provider[digest_name], str)
+            or SHA256_RE.fullmatch(provider[digest_name]) is None
+        ):
             raise DatabaseError("reference provider authority is invalid")
+    if (
+        not isinstance(provider["authoritative_report_identity_sha256"], str)
+        or SHA256_RE.fullmatch(provider["authoritative_report_identity_sha256"]) is None
+        or not isinstance(provider["billing_completeness_delay_seconds"], int)
+        or isinstance(provider["billing_completeness_delay_seconds"], bool)
+        or provider["billing_completeness_delay_seconds"] <= 0
+    ):
+        raise DatabaseError("reference provider billing authority is invalid")
     inputs = raw["inputs"]
-    if IMMUTABLE_REVISION_RE.fullmatch(str(inputs["source_revision"])) is None:
+    if (
+        not isinstance(inputs["source_revision"], str)
+        or IMMUTABLE_REVISION_RE.fullmatch(inputs["source_revision"]) is None
+    ):
         raise DatabaseError("reference source_revision is not an immutable revision")
     for digest_name in (
         "weight_inventory_sha256",
         "evaluation_lock_sha256",
         "formula_authority_sha256",
     ):
-        if SHA256_RE.fullmatch(str(inputs[digest_name])) is None:
+        if (
+            not isinstance(inputs[digest_name], str)
+            or SHA256_RE.fullmatch(inputs[digest_name]) is None
+        ):
             raise DatabaseError("reference execution scope authority is incomplete")
     for path_name, digest_name in (
         ("constraint_contract_path", "constraint_contract_sha256"),
@@ -458,7 +532,8 @@ def _reference_challenge(config_json: str, config_sha256: str) -> tuple[str, dic
             or Path(authority_path).is_absolute()
             or ".." in Path(authority_path).parts
             or not Path(authority_path).as_posix().startswith("reports/local/")
-            or SHA256_RE.fullmatch(str(provider[digest_name])) is None
+            or not isinstance(provider[digest_name], str)
+            or SHA256_RE.fullmatch(provider[digest_name]) is None
         ):
             raise DatabaseError("reference provider authority is invalid")
     challenge_material = {
@@ -782,6 +857,11 @@ class ResultsDatabase:
                     provider_actual_cost_usd TEXT,
                     provider_job_id TEXT UNIQUE,
                     app_identity TEXT,
+                    billing_authority_sha256 TEXT,
+                    authoritative_report_identity_sha256 TEXT,
+                    billing_completeness_delay_seconds INTEGER,
+                    submitted_at TEXT,
+                    settlement_pending_at TEXT,
                     idempotency_key TEXT NOT NULL UNIQUE,
                     settlement_identity TEXT UNIQUE,
                     owner_id TEXT NOT NULL,
@@ -911,6 +991,11 @@ class ResultsDatabase:
                     provider_actual_cost_usd TEXT,
                     provider_job_id TEXT UNIQUE,
                     app_identity TEXT,
+                    billing_authority_sha256 TEXT,
+                    authoritative_report_identity_sha256 TEXT,
+                    billing_completeness_delay_seconds INTEGER,
+                    submitted_at TEXT,
+                    settlement_pending_at TEXT,
                     idempotency_key TEXT NOT NULL UNIQUE,
                     settlement_identity TEXT UNIQUE,
                     owner_id TEXT NOT NULL,
@@ -926,7 +1011,17 @@ class ResultsDatabase:
                            ) AND provider_job_id IS NOT NULL AND app_identity IS NOT NULL)
                           OR status NOT IN (
                               'submitted', 'settlement_pending', 'settled', 'audit_blocked'
-                          ))
+                          )),
+                    CHECK(reference_execution_scope_sha256 IS NULL OR
+                          (billing_authority_sha256 IS NOT NULL
+                           AND authoritative_report_identity_sha256 IS NOT NULL
+                           AND billing_completeness_delay_seconds > 0)),
+                    CHECK(reference_execution_scope_sha256 IS NULL OR status NOT IN (
+                              'submitted', 'settlement_pending', 'settled', 'audit_blocked'
+                          ) OR submitted_at IS NOT NULL),
+                    CHECK(reference_execution_scope_sha256 IS NULL
+                          OR status NOT IN ('settlement_pending', 'settled')
+                          OR settlement_pending_at IS NOT NULL)
                 )"""
             )
             reservation_columns = (
@@ -1190,6 +1285,9 @@ class ResultsDatabase:
                 raise DatabaseError(f"reference {label} exceeds the audit record limit")
             _database_private_data_scan(value, path=label)
         start_time = _database_timestamp(started_at, "started_at")
+        initial_lease_expiry = _database_timestamp(lease_expires_at, "lease_expires_at")
+        if initial_lease_expiry <= start_time:
+            raise DatabaseError("reference reservation lease must expire after it starts")
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             approval = connection.execute(
@@ -1203,6 +1301,8 @@ class ResultsDatabase:
                 or approval["consumed_at"] is not None
                 or approval["expires_at"] is None
                 or _database_timestamp(approval["expires_at"], "expires_at") <= start_time
+                or initial_lease_expiry
+                > _database_timestamp(approval["expires_at"], "expires_at")
             ):
                 raise DatabaseError(
                     "reference approval is missing, expired, mismatched, or consumed"
@@ -1243,13 +1343,15 @@ class ResultsDatabase:
                         )
             committed = Decimal("0")
             for row in connection.execute(
-                """SELECT status, requested_cost_usd, provider_actual_cost_usd
+                """SELECT status, requested_cost_usd, provider_actual_cost_usd,
+                    reference_execution_scope_sha256
                 FROM budget_reservations
                 WHERE status != 'released'"""
             ):
                 value = (
                     row["provider_actual_cost_usd"]
-                    if row["status"] in {"settled", "failed"}
+                    if row["reference_execution_scope_sha256"] is not None
+                    and row["status"] in {"settled", "failed"}
                     and row["provider_actual_cost_usd"] is not None
                     else row["requested_cost_usd"]
                 )
@@ -1315,16 +1417,21 @@ class ResultsDatabase:
             connection.execute(
                 """INSERT INTO budget_reservations(
                     reservation_id, run_id, experiment_id, reference_execution_scope_sha256,
-                    phase, status, requested_cost_usd,
+                    phase, status, requested_cost_usd, billing_authority_sha256,
+                    authoritative_report_identity_sha256,
+                    billing_completeness_delay_seconds,
                     idempotency_key, owner_id, lease_expires_at, heartbeat_at,
                     created_at, updated_at
-                ) VALUES (?, ?, ?, ?, 1, 'reserved', ?, ?, ?, ?, ?, ?, ?)""",
+                ) VALUES (?, ?, ?, ?, 1, 'reserved', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     reservation_id,
                     run_id,
                     experiment_id,
                     execution_scope_sha256,
                     requested_cost_usd,
+                    parsed_config["provider"]["billing_authority_sha256"],
+                    parsed_config["provider"]["authoritative_report_identity_sha256"],
+                    parsed_config["provider"]["billing_completeness_delay_seconds"],
                     idempotency_key,
                     owner_id,
                     lease_expires_at,
@@ -1374,59 +1481,209 @@ class ResultsDatabase:
         self,
         reservation_id: str,
         *,
+        owner_id: str,
         provider_job_id: str,
         app_identity: str,
         occurred_at: str,
+        lease_expires_at: str,
     ) -> None:
-        if not provider_job_id or not app_identity:
+        occurred = _database_timestamp(occurred_at, "occurred_at")
+        lease_expiry = _database_timestamp(lease_expires_at, "lease_expires_at")
+        if not owner_id or not provider_job_id or not app_identity:
             raise DatabaseError("submitted reservation requires provider identity")
+        if lease_expiry <= occurred:
+            raise DatabaseError("submitted reservation lease must expire in the future")
         with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """SELECT lease_expires_at, heartbeat_at FROM budget_reservations
+                WHERE reservation_id = ?""",
+                (reservation_id,),
+            ).fetchone()
+            if row is not None and occurred > _database_timestamp(
+                row["lease_expires_at"], "stored lease_expires_at"
+            ):
+                raise DatabaseError("submitted reservation lease has expired")
+            if (
+                row is None
+                or occurred < _database_timestamp(row["heartbeat_at"], "stored heartbeat_at")
+                or lease_expiry
+                <= _database_timestamp(row["lease_expires_at"], "stored lease_expires_at")
+            ):
+                raise DatabaseError("submitted reservation lease must advance")
             cursor = connection.execute(
                 """UPDATE budget_reservations
                 SET status = 'submitted', provider_job_id = ?, app_identity = ?,
-                    heartbeat_at = ?, updated_at = ?
-                WHERE reservation_id = ? AND status = 'reserved'""",
-                (provider_job_id, app_identity, occurred_at, occurred_at, reservation_id),
+                    submitted_at = ?, heartbeat_at = ?, lease_expires_at = ?, updated_at = ?
+                WHERE reservation_id = ? AND status = 'reserved' AND owner_id = ?""",
+                (
+                    provider_job_id,
+                    app_identity,
+                    occurred_at,
+                    occurred_at,
+                    lease_expires_at,
+                    occurred_at,
+                    reservation_id,
+                    owner_id,
+                ),
             )
             if cursor.rowcount != 1:
                 raise DatabaseError(f"reservation cannot be submitted: {reservation_id}")
 
-    def mark_settlement_pending(self, reservation_id: str, *, occurred_at: str) -> None:
+    def mark_settlement_pending(
+        self,
+        reservation_id: str,
+        *,
+        owner_id: str,
+        occurred_at: str,
+        provider_terminal_at: str,
+        lease_expires_at: str,
+    ) -> None:
+        occurred = _database_timestamp(occurred_at, "occurred_at")
+        terminal = _database_timestamp(provider_terminal_at, "provider_terminal_at")
+        lease_expiry = _database_timestamp(lease_expires_at, "lease_expires_at")
+        if lease_expiry <= occurred:
+            raise DatabaseError("settlement lease must expire after the transition")
         with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """SELECT lease_expires_at, heartbeat_at, submitted_at
+                FROM budget_reservations WHERE reservation_id = ?""",
+                (reservation_id,),
+            ).fetchone()
+            if row is not None and row["submitted_at"] is not None:
+                submitted = _database_timestamp(row["submitted_at"], "submitted_at")
+                if terminal < submitted or terminal > occurred:
+                    raise DatabaseError("provider terminal time is outside the transition window")
+            if (
+                row is None
+                or row["submitted_at"] is None
+                or occurred < _database_timestamp(row["heartbeat_at"], "stored heartbeat_at")
+                or occurred
+                > _database_timestamp(row["lease_expires_at"], "stored lease_expires_at")
+                or lease_expiry
+                <= _database_timestamp(row["lease_expires_at"], "stored lease_expires_at")
+            ):
+                raise DatabaseError("settlement lease must advance")
             cursor = connection.execute(
                 """UPDATE budget_reservations
-                SET status = 'settlement_pending', heartbeat_at = ?, updated_at = ?
-                WHERE reservation_id = ? AND status = 'submitted'""",
-                (occurred_at, occurred_at, reservation_id),
+                SET status = 'settlement_pending', settlement_pending_at = ?,
+                    heartbeat_at = ?, lease_expires_at = ?, updated_at = ?
+                WHERE reservation_id = ? AND status = 'submitted' AND owner_id = ?""",
+                (
+                    provider_terminal_at,
+                    occurred_at,
+                    lease_expires_at,
+                    occurred_at,
+                    reservation_id,
+                    owner_id,
+                ),
             )
             if cursor.rowcount != 1:
                 raise DatabaseError(f"reservation cannot await settlement: {reservation_id}")
+
+    def renew_reservation_lease(
+        self,
+        reservation_id: str,
+        *,
+        owner_id: str,
+        occurred_at: str,
+        lease_expires_at: str,
+    ) -> None:
+        occurred = _database_timestamp(occurred_at, "occurred_at")
+        lease_expiry = _database_timestamp(lease_expires_at, "lease_expires_at")
+        if lease_expiry <= occurred:
+            raise DatabaseError("renewed reservation lease must expire in the future")
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """SELECT lease_expires_at, heartbeat_at FROM budget_reservations
+                WHERE reservation_id = ? AND owner_id = ?
+                  AND status IN ('reserved', 'submitted', 'settlement_pending')""",
+                (reservation_id, owner_id),
+            ).fetchone()
+            if row is not None and occurred > _database_timestamp(
+                row["lease_expires_at"], "stored lease_expires_at"
+            ):
+                raise DatabaseError(f"reservation lease has expired: {reservation_id}")
+            if (
+                row is None
+                or occurred < _database_timestamp(row["heartbeat_at"], "stored heartbeat_at")
+                or lease_expiry
+                <= _database_timestamp(row["lease_expires_at"], "stored lease_expires_at")
+            ):
+                raise DatabaseError(f"reservation lease cannot renew: {reservation_id}")
+            connection.execute(
+                """UPDATE budget_reservations SET heartbeat_at = ?, lease_expires_at = ?,
+                    updated_at = ? WHERE reservation_id = ? AND owner_id = ?
+                    AND status IN ('reserved', 'submitted', 'settlement_pending')""",
+                (occurred_at, lease_expires_at, occurred_at, reservation_id, owner_id),
+            )
 
     def settle_reservation(
         self,
         reservation_id: str,
         *,
         actual_cost_usd: str,
-        settlement_identity: str,
+        billing_authority_sha256: str,
+        authoritative_report_identity_sha256: str,
+        billing_report_json: str,
+        billing_report_sha256: str,
         occurred_at: str,
     ) -> None:
         actual = _database_money(actual_cost_usd, "actual_cost_usd")
-        if not settlement_identity:
-            raise DatabaseError("settlement requires provider attribution")
+        _database_sha256(billing_authority_sha256, "billing_authority_sha256")
+        _database_sha256(
+            authoritative_report_identity_sha256,
+            "authoritative_report_identity_sha256",
+        )
+        report, report_actual = _reference_billing_report(
+            billing_report_json, billing_report_sha256
+        )
+        if report_actual != actual:
+            raise DatabaseError("billing report receipt cost mismatch")
+        occurred = _database_timestamp(occurred_at, "occurred_at")
         budget_failure = False
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
-                """SELECT run_id, requested_cost_usd, status FROM budget_reservations
+                """SELECT run_id, requested_cost_usd, status, billing_authority_sha256,
+                    authoritative_report_identity_sha256,
+                    billing_completeness_delay_seconds, settlement_pending_at,
+                    provider_job_id
+                FROM budget_reservations
                 WHERE reservation_id = ?""",
                 (reservation_id,),
             ).fetchone()
-            if row is None or row["status"] not in {
-                "submitted",
-                "settlement_pending",
-                "audit_blocked",
-            }:
+            if (
+                row is None
+                or row["status"] not in {"settlement_pending", "audit_blocked"}
+                or row["settlement_pending_at"] is None
+            ):
                 raise DatabaseError(f"reservation cannot settle: {reservation_id}")
+            if (
+                row["billing_authority_sha256"] != billing_authority_sha256
+                or row["authoritative_report_identity_sha256"]
+                != authoritative_report_identity_sha256
+                or report["billing_authority_sha256"] != billing_authority_sha256
+                or report["authoritative_report_identity_sha256"]
+                != authoritative_report_identity_sha256
+                or report["provider_job_id"] != row["provider_job_id"]
+            ):
+                raise DatabaseError("settlement billing authority or report identity mismatch")
+            terminal_at = _database_timestamp(
+                row["settlement_pending_at"], "settlement_pending_at"
+            )
+            complete_at = terminal_at + timedelta(
+                seconds=row["billing_completeness_delay_seconds"]
+            )
+            if (
+                occurred < complete_at
+                or _database_timestamp(report["covered_through"], "covered_through")
+                < terminal_at
+            ):
+                raise DatabaseError("authoritative provider billing report is not yet complete")
+            settlement_identity = billing_report_sha256
             if actual > _database_money(row["requested_cost_usd"], "requested_cost_usd"):
                 reason = (
                     "authoritative provider actual cost exceeds the USD 4.00 local reservation; "
@@ -1504,15 +1761,19 @@ class ResultsDatabase:
 
     def reconcile_stale_reservations(self, *, now: str) -> dict[str, list[str]]:
         result: dict[str, list[str]] = {"released": [], "audit_blocked": []}
+        now_time = _database_timestamp(now, "now")
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             rows = connection.execute(
-                """SELECT reservation_id, status FROM budget_reservations
+                """SELECT reservation_id, status, lease_expires_at FROM budget_reservations
                 WHERE status IN ('reserved', 'submitted', 'settlement_pending')
-                  AND lease_expires_at < ? ORDER BY reservation_id""",
-                (now,),
+                ORDER BY reservation_id""",
             ).fetchall()
             for row in rows:
+                if _database_timestamp(
+                    row["lease_expires_at"], "stored lease_expires_at"
+                ) >= now_time:
+                    continue
                 next_state = "released" if row["status"] == "reserved" else "audit_blocked"
                 reason = (
                     "stale reservation released before submission"

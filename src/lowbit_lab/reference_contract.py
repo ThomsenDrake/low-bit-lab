@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
-import re
+
+from lowbit_lab.config import IMMUTABLE_REVISION_RE, SHA256_RE
 
 ORIGINAL_APPROVED_PLAN_SHA256 = (
     "a45e791c83466f545f6ac204857722478a080a1ea4a007c47510fbc4aa2b86c4"
@@ -38,14 +39,14 @@ def reference_execution_scope_sha256(
     formula_authority_sha256: str,
 ) -> str:
     """Bind the immutable inputs that define the one-attempt reference scope."""
-    if re.fullmatch(r"[0-9a-f]{40}", source_revision) is None:
-        raise ValueError("source revision must be a lowercase immutable 40-character revision")
+    if IMMUTABLE_REVISION_RE.fullmatch(source_revision) is None:
+        raise ValueError("source revision must be a lowercase immutable revision")
     for label, value in (
         ("weight inventory", weight_inventory_sha256),
         ("evaluation lock", evaluation_lock_sha256),
         ("formula authority", formula_authority_sha256),
     ):
-        if re.fullmatch(r"[0-9a-f]{64}", value) is None:
+        if SHA256_RE.fullmatch(value) is None:
             raise ValueError(f"{label} must be lowercase SHA-256")
     material = {
         "approved_amendment_sha256": APPROVED_PROVIDER_AMENDMENT_SHA256,

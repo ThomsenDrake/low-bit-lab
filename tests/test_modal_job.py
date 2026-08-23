@@ -1,3 +1,4 @@
+import ast
 import hashlib
 import json
 import sqlite3
@@ -61,7 +62,7 @@ def _config(tmp_path: Path, **changes: object) -> Path:
         (plans / name).write_bytes((repository_plans / name).read_bytes())
     _budget(configs / "reference-budget.json", ORIGINAL_APPROVED_PLAN_SHA256)
     raw = {
-        "schema_version": 1,
+        "schema_version": 2,
         "kind": "modal_reference_preview",
         "experiment_id": "reference-preview-v1",
         "original_approved_plan_path": ORIGINAL_PLAN_PATH,
@@ -116,6 +117,8 @@ def _config(tmp_path: Path, **changes: object) -> Path:
             "observation_receipt_sha256": None,
             "billing_authority_path": None,
             "billing_authority_sha256": None,
+            "authoritative_report_identity_sha256": "1" * 64,
+            "billing_completeness_delay_seconds": 3600,
         },
         "gates": {
             "formula_authority_path": None,
@@ -135,6 +138,7 @@ def _config(tmp_path: Path, **changes: object) -> Path:
 def test_reference_preview_is_exact_non_submitting_and_zero_actual(tmp_path: Path) -> None:
     config = load_reference_job_config(_config(tmp_path), root=tmp_path)
     preview = plan_reference_preview(config, root=tmp_path)
+    assert preview["schema_version"] == 2
     assert preview["submit"] is False
     assert preview["actual_cost_usd"] == "0"
     assert preview["local_reservation_limit_usd"] == "4.00"
@@ -166,6 +170,15 @@ def test_reference_source_revision_is_closed_and_immutable(tmp_path: Path) -> No
     path = tmp_path / "configs" / "local" / "bad-revision.yaml"
     path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
     with pytest.raises(ReferenceJobError, match="source_revision"):
+        load_reference_job_config(path, root=tmp_path)
+
+
+def test_reference_config_rejects_legacy_schema_version(tmp_path: Path) -> None:
+    path = _config(tmp_path)
+    raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+    raw["schema_version"] = 1
+    path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    with pytest.raises(ReferenceJobError, match="unsupported"):
         load_reference_job_config(path, root=tmp_path)
 
 
@@ -369,6 +382,8 @@ def _write_provider_evidence(tmp_path: Path, *, observed_at: datetime) -> dict[s
         "observation_receipt_sha256": hashlib.sha256(receipt_path.read_bytes()).hexdigest(),
         "billing_authority_path": "reports/local/billing.json",
         "billing_authority_sha256": hashlib.sha256(billing_path.read_bytes()).hexdigest(),
+        "authoritative_report_identity_sha256": "d" * 64,
+        "billing_completeness_delay_seconds": 3600,
     }
 
 
@@ -446,6 +461,12 @@ def test_reference_preview_clears_each_provider_blocker_with_bound_approval(
                 "billing_authority_sha256": raw["provider"]["billing_authority_sha256"],
                 "workspace_scope_sha256": raw["provider"]["workspace_scope_sha256"],
                 "environment_scope_sha256": raw["provider"]["environment_scope_sha256"],
+                "authoritative_report_identity_sha256": raw["provider"][
+                    "authoritative_report_identity_sha256"
+                ],
+                "billing_completeness_delay_seconds": raw["provider"][
+                    "billing_completeness_delay_seconds"
+                ],
                 "provider_residual_cost_risk_accepted": True,
                 "local_reservation_limit_usd": "4.00",
                 "expires_at": "2026-08-22T12:30:00+00:00",
@@ -532,6 +553,8 @@ def test_reference_approval_is_separate_bound_and_expiring(tmp_path: Path) -> No
                 "billing_authority_sha256": "e" * 64,
                 "workspace_scope_sha256": "8" * 64,
                 "environment_scope_sha256": "9" * 64,
+                "authoritative_report_identity_sha256": "1" * 64,
+                "billing_completeness_delay_seconds": 3600,
                 "provider_residual_cost_risk_accepted": True,
                 "local_reservation_limit_usd": "4.00",
                 "expires_at": "2026-08-22T01:00:00+00:00",
@@ -550,6 +573,8 @@ def test_reference_approval_is_separate_bound_and_expiring(tmp_path: Path) -> No
             "billing_authority_sha256": "e" * 64,
             "workspace_scope_sha256": "8" * 64,
             "environment_scope_sha256": "9" * 64,
+            "authoritative_report_identity_sha256": "1" * 64,
+            "billing_completeness_delay_seconds": 3600,
         },
         now=datetime(2026, 8, 22, 0, 0, tzinfo=UTC),
     )
@@ -566,6 +591,8 @@ def test_reference_approval_is_separate_bound_and_expiring(tmp_path: Path) -> No
                 "billing_authority_sha256": "e" * 64,
                 "workspace_scope_sha256": "8" * 64,
                 "environment_scope_sha256": "9" * 64,
+                "authoritative_report_identity_sha256": "1" * 64,
+                "billing_completeness_delay_seconds": 3600,
             },
             now=datetime(2026, 8, 22, 2, 0, tzinfo=UTC),
         )
@@ -581,6 +608,8 @@ def test_reference_approval_is_separate_bound_and_expiring(tmp_path: Path) -> No
                 "billing_authority_sha256": "e" * 64,
                 "workspace_scope_sha256": "8" * 64,
                 "environment_scope_sha256": "9" * 64,
+                "authoritative_report_identity_sha256": "1" * 64,
+                "billing_completeness_delay_seconds": 3600,
             },
             now=datetime(2026, 8, 22, 0, 0, tzinfo=UTC),
         )
@@ -601,6 +630,8 @@ def test_reference_approval_is_separate_bound_and_expiring(tmp_path: Path) -> No
                 "billing_authority_sha256": "e" * 64,
                 "workspace_scope_sha256": "8" * 64,
                 "environment_scope_sha256": "9" * 64,
+                "authoritative_report_identity_sha256": "1" * 64,
+                "billing_completeness_delay_seconds": 3600,
             },
             now=datetime(2026, 8, 22, 0, 0, tzinfo=UTC),
         )
@@ -621,13 +652,75 @@ def test_reference_dry_run_records_complete_zero_spend_row(tmp_path: Path) -> No
     assert result["run"]["metrics"]["weights_transferred"]["value"] is False
 
 
+def _submission_violations(source: str) -> list[str]:
+    tree = ast.parse(source)
+    forbidden_members = {"App", "remote", "spawn", "deploy", "submit"}
+    violations: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            violations.extend(
+                alias.name for alias in node.names if alias.name.split(".", 1)[0] == "modal"
+            )
+        elif isinstance(node, ast.ImportFrom) and (node.module or "").split(".", 1)[0] == "modal":
+            violations.append(node.module or "modal")
+        elif isinstance(node, ast.Call):
+            if isinstance(node.func, ast.Name) and node.func.id in forbidden_members:
+                violations.append(node.func.id)
+            elif isinstance(node.func, ast.Attribute) and node.func.attr in forbidden_members:
+                violations.append(node.func.attr)
+            elif (
+                (
+                    isinstance(node.func, ast.Name)
+                    and node.func.id == "__import__"
+                    or isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "import_module"
+                )
+                and node.args
+                and isinstance(node.args[0], ast.Constant)
+                and isinstance(node.args[0].value, str)
+                and node.args[0].value.split(".", 1)[0] == "modal"
+            ):
+                violations.append("dynamic modal import")
+            elif (
+                isinstance(node.func, ast.Name)
+                and node.func.id == "getattr"
+                and len(node.args) >= 2
+                and isinstance(node.args[1], ast.Constant)
+                and node.args[1].value in forbidden_members
+            ):
+                violations.append(str(node.args[1].value))
+        elif isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+            for decorator in node.decorator_list:
+                name = decorator.id if isinstance(decorator, ast.Name) else None
+                member = decorator.attr if isinstance(decorator, ast.Attribute) else None
+                if name in forbidden_members or member in forbidden_members:
+                    violations.append(str(name or member))
+    return violations
+
+
 def test_u8_submission_primitives_are_absent() -> None:
-    production = "\n".join(
-        path.read_text(encoding="utf-8")
-        for path in (Path("src/lowbit_lab/modal_job.py"), Path("modal/reference_job.py"))
+    production_paths = sorted(Path("src/lowbit_lab").rglob("*.py")) + sorted(
+        Path("modal").rglob("*.py")
     )
-    for forbidden in ("modal.App", ".remote(", ".spawn(", ".deploy(", ".submit("):
-        assert forbidden not in production
+    for path in production_paths:
+        assert _submission_violations(path.read_text(encoding="utf-8")) == [], path
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "import modal.runner",
+        "from modal.app import App as CloudApp",
+        "App('forbidden')",
+        "client.submit()",
+        "@client.remote\ndef task():\n    pass",
+        "__import__('modal.runner')",
+        "importlib.import_module('modal.runner')",
+        "getattr(client, 'spawn')()",
+    ],
+)
+def test_no_submit_scanner_rejects_equivalent_primitives(source: str) -> None:
+    assert _submission_violations(source)
 
 
 def test_cli_records_malformed_reference_yaml_attempt(

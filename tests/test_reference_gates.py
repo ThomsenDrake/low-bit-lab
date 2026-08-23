@@ -510,3 +510,63 @@ def test_provider_billing_authority_binds_scope_and_required_semantics(tmp_path:
             expected_sha256=digest,
             expected_environment_scope_sha256="9" * 64,
         )
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("unknown", "not allowed", "closed"),
+        ("schema_version", 1, "unsupported"),
+        ("kind", "provider_billing_receipt", "unsupported"),
+        ("provider", "other", "provider identity"),
+    ],
+)
+def test_provider_billing_authority_rejects_schema_and_provider_drift(
+    tmp_path: Path, field: str, value: object, message: str
+) -> None:
+    authority = _provider_billing_authority()
+    authority[field] = value
+    path = tmp_path / "billing.json"
+    digest = _write(path, authority)
+    with pytest.raises(ReferenceGateError, match=message):
+        verify_provider_billing_authority(
+            path,
+            expected_sha256=digest,
+            expected_environment_scope_sha256="b" * 64,
+        )
+
+
+def test_provider_observation_receipt_rejects_future_and_naive_validation_time(
+    tmp_path: Path,
+) -> None:
+    validated_at = datetime(2026, 8, 22, 12, 0, tzinfo=UTC)
+    receipt = _provider_observation_receipt(
+        "2" * 64, observed_at=validated_at + timedelta(seconds=1)
+    )
+    path = tmp_path / "receipt.json"
+    digest = _write(path, receipt)
+    with pytest.raises(ReferenceGateError, match="future"):
+        verify_provider_observation_receipt(
+            path,
+            expected_sha256=digest,
+            expected_contract_sha256="2" * 64,
+            expected_workspace_scope_sha256="a" * 64,
+            expected_environment_scope_sha256="b" * 64,
+            expected_amendment_sha256="d" * 64,
+            validated_at=validated_at,
+            maximum_age_seconds=900,
+        )
+
+    receipt["observed_at"] = validated_at.isoformat()
+    digest = _write(path, receipt)
+    with pytest.raises(ReferenceGateError, match="validation time"):
+        verify_provider_observation_receipt(
+            path,
+            expected_sha256=digest,
+            expected_contract_sha256="2" * 64,
+            expected_workspace_scope_sha256="a" * 64,
+            expected_environment_scope_sha256="b" * 64,
+            expected_amendment_sha256="d" * 64,
+            validated_at=datetime(2026, 8, 22, 12, 0),
+            maximum_age_seconds=900,
+        )

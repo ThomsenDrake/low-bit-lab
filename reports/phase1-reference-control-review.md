@@ -1,6 +1,6 @@
 # Phase 1 U1–U7 report-only review
 
-Date: 2026-08-22
+Date: 2026-08-23
 
 Scope: the target-neutral public control plane for U1–U7. U8 submission remains absent and unauthorized.
 
@@ -14,8 +14,14 @@ Scope: the target-neutral public control plane for U1–U7. U8 submission remain
 
 - The remote wrapper is declarative and contains no provider app, submit, or remote-call primitive.
 - The only reference envelope is fixed at one A100 80 GB GPU, 8 CPU cores, 96 GiB memory, 90 GiB ephemeral disk, 2,700 seconds, no startup override, and zero retries.
-- Worst-case reservation is exactly USD 4.00. Challenge consumption and reservation creation are atomic. Settlement uses compare-and-set state transitions; unknown submitted work remains audit-blocked rather than releasing budget.
-- Provider safety, formula, memory-fit, cold-path-time, evaluation authority, and human approval are independent fail-closed gates.
+- The local reservation and failure threshold is exactly USD 4.00; it is not described as a
+  provider-enforced cap. Challenge consumption and reservation creation are atomic. Unknown submitted
+  work remains audit-blocked, and authoritative cost above the reservation is durably recorded as a
+  terminal budget failure.
+- Provider concurrency, residual-risk acceptance, billing scope, formula, memory fit, cold-path time,
+  evaluation authority, and human approval are independent fail-closed gates.
+- One-container and one-GPU environment limits reduce overlap but do not bound provider-managed crash
+  rescheduling or cumulative dollar spend. A submitted execution scope can never be retried.
 
 ## Local RTX 5080 compatibility
 
@@ -33,7 +39,8 @@ Scope: the target-neutral public control plane for U1–U7. U8 submission remain
 
 - U1–U3 establish immutable source and runtime lineage without transferring weights.
 - U4 defines the six-family deterministic reference interface and distinguishes configured context from proven usefulness.
-- U5–U7 provide a dry-run-only reference contract, approval challenge, exact reservation ledger, evidence gates, and a manual runbook.
+- U5–U7 provide a dry-run-only reference contract, approval challenge, exact local reservation ledger,
+  provider observation/billing contracts, evidence gates, and a manual runbook.
 - Candidate promotion and threshold compilation are mechanically blocked; U8 is required before any paid reference execution can exist.
 
 ## Findings fixed during review
@@ -46,14 +53,26 @@ Scope: the target-neutral public control plane for U1–U7. U8 submission remain
 - Bound memory and timing evidence to the evaluation lock, context, and formula method.
 - Rejected malformed YAML through an auditable failed attempt and expanded privacy redaction.
 - Kept numeric threshold authority unavailable rather than accepting self-authored thresholds.
+- Replaced the unavailable provider-dollar-cap prerequisite with an explicitly weaker, versioned
+  concurrency contract bound to the approved amendment.
+- Added transactional schema migration, immutable execution-scope consumption, nullable pending
+  provider cost, and durable delayed/over-cap settlement behavior.
+- Versioned the amended config and preview contract explicitly, made no-submit scanning recursive and
+  syntax-aware, and rejected non-string digest claims at the database boundary.
+- Bound settlement to the approved billing authority, authoritative report identity, completeness
+  delay, and owner-checked renewable leases.
 
 ## Remaining blockers by design
 
 - Source, evaluation, inventory, and installed-runtime authority can be cross-verified without
   transferring weight shards.
 - The resource-accounting formula remains pending human review.
-- No authenticated provider-cap/billing evidence, conservative memory-fit evidence,
-  cold-path-time evidence, or U8 approval exists.
+- The stored provider screenshot is historical and cannot satisfy the 15-minute approval freshness
+  gate. A fresh local observation receipt and regenerated packet are required.
+- Billing authority can describe attribution and completeness, but no pre-submission value can prove
+  actual provider cost. Unknown post-submission billing remains audit-blocked.
+- No conservative memory-fit evidence, cold-path-time evidence, residual-risk approval, or U8
+  approval exists.
 - No model weights have been downloaded or transferred, and no remote job has been submitted.
 
 ## Evidence-remediation addendum
@@ -62,6 +81,6 @@ Scope: the target-neutral public control plane for U1–U7. U8 submission remain
 - Windows delegates executable hashing to the isolated WSL inventory probe only when Windows cannot
   resolve the Linux symlink; the probe must first attest that the resolved executable remains under
   the expected repository root.
-- Provider documentation states that container crashes may be rescheduled independently of
-  configured function retries. Therefore `retries: 0` is not evidence of one billable attempt; a
-  separately observed hard workspace cap is still required.
+- Provider-managed crash rescheduling is not bounded by `retries: 0`. The approved amendment accepts
+  that residual risk only through a later exact-packet approval; concurrency limits are never treated
+  as proof of one billable attempt.

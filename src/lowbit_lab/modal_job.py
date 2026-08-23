@@ -91,7 +91,18 @@ class ReferenceJobConfig:
     canonical_json: str
     sha256: str
     challenge_sha256: str
-    reference_execution_scope_sha256: str | None
+
+    @property
+    def reference_execution_scope_sha256(self) -> str | None:
+        formula_authority_sha256 = self.inputs["formula_authority_sha256"]
+        if formula_authority_sha256 is None:
+            return None
+        return reference_execution_scope_sha256(
+            source_revision=str(self.inputs["source_revision"]),
+            weight_inventory_sha256=str(self.inputs["weight_inventory_sha256"]),
+            evaluation_lock_sha256=str(self.inputs["evaluation_lock_sha256"]),
+            formula_authority_sha256=str(formula_authority_sha256),
+        )
 
 
 def _closed(value: Any, fields: set[str], label: str) -> dict[str, Any]:
@@ -160,7 +171,7 @@ def load_reference_job_config(path: Path, *, root: Path) -> ReferenceJobConfig:
         raise ReferenceJobError(f"cannot read reference config: {exc}") from exc
     _reject_credential_fields(raw)
     top = _closed(raw, REFERENCE_FIELDS, "reference config")
-    if top["schema_version"] != 1 or top["kind"] != "modal_reference_preview":
+    if top["schema_version"] != 2 or top["kind"] != "modal_reference_preview":
         raise ReferenceJobError("unsupported reference config")
     if not isinstance(top["experiment_id"], str) or not top["experiment_id"]:
         raise ReferenceJobError("reference experiment_id is required")
@@ -254,6 +265,8 @@ def load_reference_job_config(path: Path, *, root: Path) -> ReferenceJobConfig:
         "observation_receipt_sha256",
         "billing_authority_path",
         "billing_authority_sha256",
+        "authoritative_report_identity_sha256",
+        "billing_completeness_delay_seconds",
     }
     provider = _closed(top["provider"], provider_fields, "reference provider")
     if provider["submit"] is not False:
@@ -271,6 +284,17 @@ def load_reference_job_config(path: Path, *, root: Path) -> ReferenceJobConfig:
         digest = provider[digest_name]
         if not isinstance(digest, str) or SHA256_RE.fullmatch(digest) is None:
             raise ReferenceJobError(f"{digest_name} must be lowercase SHA-256")
+    if (
+        not isinstance(provider["authoritative_report_identity_sha256"], str)
+        or SHA256_RE.fullmatch(provider["authoritative_report_identity_sha256"]) is None
+    ):
+        raise ReferenceJobError("authoritative_report_identity_sha256 must be lowercase SHA-256")
+    if (
+        not isinstance(provider["billing_completeness_delay_seconds"], int)
+        or isinstance(provider["billing_completeness_delay_seconds"], bool)
+        or provider["billing_completeness_delay_seconds"] <= 0
+    ):
+        raise ReferenceJobError("billing_completeness_delay_seconds must be positive")
     for path_name, digest_name in (
         ("constraint_contract_path", "constraint_contract_sha256"),
         ("observation_receipt_path", "observation_receipt_sha256"),
@@ -336,14 +360,6 @@ def load_reference_job_config(path: Path, *, root: Path) -> ReferenceJobConfig:
     challenge_json = json.dumps(
         challenge_material, sort_keys=True, separators=(",", ":"), ensure_ascii=True
     )
-    execution_scope = None
-    if inputs["formula_authority_sha256"] is not None:
-        execution_scope = reference_execution_scope_sha256(
-            source_revision=str(inputs["source_revision"]),
-            weight_inventory_sha256=str(inputs["weight_inventory_sha256"]),
-            evaluation_lock_sha256=str(inputs["evaluation_lock_sha256"]),
-            formula_authority_sha256=str(inputs["formula_authority_sha256"]),
-        )
     return ReferenceJobConfig(
         experiment_id=top["experiment_id"],
         original_approved_plan_path=original_plan_path,
@@ -360,7 +376,6 @@ def load_reference_job_config(path: Path, *, root: Path) -> ReferenceJobConfig:
         canonical_json=canonical,
         sha256=hashlib.sha256(canonical.encode()).hexdigest(),
         challenge_sha256=hashlib.sha256(challenge_json.encode()).hexdigest(),
-        reference_execution_scope_sha256=execution_scope,
     )
 
 
@@ -453,14 +468,19 @@ def plan_reference_preview(config: ReferenceJobConfig, *, root: Path) -> dict[st
             provider_concurrency_proven = False
     if isinstance(billing_path, str) and isinstance(billing_sha, str):
         try:
-            provider_billing_scope_proven = bool(
-                verify_provider_billing_authority(
+            billing_authority = verify_provider_billing_authority(
                     root / billing_path,
                     expected_sha256=billing_sha,
                     expected_environment_scope_sha256=str(
                         config.provider["environment_scope_sha256"]
                     ),
-                )["proven"]
+                )
+            provider_billing_scope_proven = bool(
+                billing_authority["proven"]
+                and billing_authority["authoritative_report_identity_sha256"]
+                == config.provider["authoritative_report_identity_sha256"]
+                and billing_authority["billing_completeness_delay_seconds"]
+                == config.provider["billing_completeness_delay_seconds"]
             )
         except ReferenceGateError:
             provider_billing_scope_proven = False
@@ -527,13 +547,15 @@ def plan_reference_preview(config: ReferenceJobConfig, *, root: Path) -> dict[st
                 expected_original_plan_sha256=config.original_approved_plan_sha256,
                 expected_amendment_sha256=config.approved_amendment_sha256,
                 expected_provider={
-                    name: str(config.provider[name])
+                    name: config.provider[name]
                     for name in (
                         "constraint_contract_sha256",
                         "observation_receipt_sha256",
                         "billing_authority_sha256",
                         "workspace_scope_sha256",
                         "environment_scope_sha256",
+                        "authoritative_report_identity_sha256",
+                        "billing_completeness_delay_seconds",
                     )
                 },
                 now=_now_datetime(),
@@ -549,7 +571,7 @@ def plan_reference_preview(config: ReferenceJobConfig, *, root: Path) -> dict[st
     if not approval_valid:
         blockers.append("execution_approval_missing")
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "kind": "modal_reference_preview",
         "submit": False,
         "scheduling_enabled": False,
@@ -659,7 +681,7 @@ def validate_reference_approval(
     expected_challenge_sha256: str,
     expected_original_plan_sha256: str,
     expected_amendment_sha256: str,
-    expected_provider: dict[str, str],
+    expected_provider: dict[str, object],
     now: datetime,
 ) -> dict[str, str]:
     if expected_original_plan_sha256 != ORIGINAL_APPROVED_PLAN_SHA256:
@@ -682,6 +704,8 @@ def validate_reference_approval(
         "billing_authority_sha256",
         "workspace_scope_sha256",
         "environment_scope_sha256",
+        "authoritative_report_identity_sha256",
+        "billing_completeness_delay_seconds",
         "provider_residual_cost_risk_accepted",
         "local_reservation_limit_usd",
         "expires_at",
@@ -701,16 +725,23 @@ def validate_reference_approval(
         "billing_authority_sha256",
         "workspace_scope_sha256",
         "environment_scope_sha256",
+        "authoritative_report_identity_sha256",
     ):
         if approval[field] != expected_provider.get(field):
             raise ReferenceJobError(f"reference approval {field} mismatch")
         if not isinstance(approval[field], str) or SHA256_RE.fullmatch(approval[field]) is None:
             raise ReferenceJobError(f"reference approval {field} is invalid")
+    if approval["billing_completeness_delay_seconds"] != expected_provider.get(
+        "billing_completeness_delay_seconds"
+    ):
+        raise ReferenceJobError("reference approval billing completeness delay mismatch")
     if approval["provider_residual_cost_risk_accepted"] is not True:
         raise ReferenceJobError("provider residual cost risk is not accepted")
     if IMMUTABLE_REVISION_RE.fullmatch(str(approval["reviewed_commit_sha256"])) is None:
         raise ReferenceJobError("reference approval commit is invalid")
-    if approval["local_reservation_limit_usd"] != "4.00":
+    if approval["local_reservation_limit_usd"] != format(
+        ReferenceBudgetGuard.LOCAL_RESERVATION_LIMIT, "f"
+    ):
         raise ReferenceJobError("reference approval local reservation limit is invalid")
     try:
         expires_at = datetime.fromisoformat(approval["expires_at"])

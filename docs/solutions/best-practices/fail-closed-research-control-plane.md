@@ -1,7 +1,7 @@
 ---
 title: Fail-closed boundaries for a research control plane
 date: 2026-08-21
-last_updated: 2026-08-22
+last_updated: 2026-08-23
 category: best-practices
 module: experiment-control-plane
 problem_type: best_practice
@@ -57,9 +57,17 @@ by that probe. Do not weaken the check to a path-string comparison or silently s
 lineage.
 
 Provider retry configuration and provider crash recovery are separate controls. A declared retry
-count of zero does not bound provider-managed container rescheduling. Cost containment must instead
-be backed by independently observed provider evidence, such as a hard workspace cap, and unknown
-billing remains audit-blocked.
+count of zero does not bound provider-managed container rescheduling. Prefer a provider-enforced
+dollar cap when one exists. When it does not, treat observed one-container/one-GPU concurrency as a
+strictly weaker control: bind it to a fresh receipt and a separately approved residual-risk
+amendment, never describe it as a cumulative cost cap, and keep unknown billing audit-blocked.
+
+Make the reference execution scope a canonical digest over source revision, weight inventory,
+evaluation lock, formula authority, resource envelope, and every controlling plan. A released
+never-submitted reservation may retry only with a fresh observation, packet, challenge, and
+approval. Any submitted-or-later state consumes the scope permanently. Settlement must match the
+challenge-bound billing authority and report identity, wait for the declared completeness delay,
+and preserve authoritative over-limit cost as a durable terminal failure.
 
 ## Why This Matters
 
@@ -76,6 +84,7 @@ These invariants make silent policy drift, config mutation, preflight failure lo
 - `src/lowbit_lab/constants.py` freezes zero-spend defaults independently of editable policy files.
 - `src/lowbit_lab/db.py` binds experiment IDs to config digests and stores pre-validation attempts.
 - `src/lowbit_lab/db.py` atomically consumes approval challenges, reserves exact worst-case cost, and settles reservations with compare-and-set transitions.
+- `src/lowbit_lab/reference_contract.py` derives the immutable one-shot reference execution scope.
 - `src/lowbit_lab/runtime.py` records dirty state plus a deterministic control-plane digest.
 - `src/lowbit_lab/activation.py` binds decision artifacts and reruns all bounded gates.
 - `src/lowbit_lab/publication.py` scans Git paths and contents before public publication.

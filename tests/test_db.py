@@ -348,6 +348,8 @@ def _reserve(
     hardware: dict[str, object] | None = None,
     mutate_config: Callable[[dict[str, object]], None] | None = None,
     observation_receipt_sha256: str = "b" * 64,
+    lease_expires_at: str = "2026-08-22T00:05:00+00:00",
+    started_at: str = "2026-08-22T00:00:00+00:00",
 ) -> None:
     inputs = {
         "source_revision": "d" * 40,
@@ -362,7 +364,7 @@ def _reserve(
         "control_plane_sha256": "7" * 64,
     }
     raw = {
-        "schema_version": 1,
+        "schema_version": 2,
         "kind": "modal_reference_preview",
         "experiment_id": f"reference-{suffix}",
         "original_approved_plan_path": ORIGINAL_APPROVED_PLAN_PATH,
@@ -406,6 +408,8 @@ def _reserve(
             "observation_receipt_sha256": observation_receipt_sha256,
             "billing_authority_path": "reports/local/billing.json",
             "billing_authority_sha256": "c" * 64,
+            "authoritative_report_identity_sha256": "1" * 64,
+            "billing_completeness_delay_seconds": 3600,
         },
         "gates": {
             "formula_authority_path": None,
@@ -470,11 +474,54 @@ def _reserve(
         single_job_cap_usd="4.00",
         idempotency_key=f"idempotency-{suffix}",
         owner_id="owner",
-        lease_expires_at="2026-08-22T00:05:00+00:00",
-        started_at="2026-08-22T00:00:00+00:00",
+        lease_expires_at=lease_expires_at,
+        started_at=started_at,
         challenge_sha256=challenge,
         approval_digest=approval,
     )
+
+
+def _submit(database: ResultsDatabase, reservation_id: str, *, lease: str) -> None:
+    database.mark_reservation_submitted(
+        reservation_id,
+        owner_id="owner",
+        provider_job_id=f"job-{reservation_id}",
+        app_identity=f"app-{reservation_id}",
+        occurred_at="2026-08-22T00:01:00+00:00",
+        lease_expires_at=lease,
+    )
+
+
+def _await_settlement(database: ResultsDatabase, reservation_id: str, *, lease: str) -> None:
+    database.mark_settlement_pending(
+        reservation_id,
+        owner_id="owner",
+        occurred_at="2026-08-22T00:02:00+00:00",
+        provider_terminal_at="2026-08-22T00:02:00+00:00",
+        lease_expires_at=lease,
+    )
+
+
+def _billing_report(
+    reservation_id: str, actual_cost_usd: str, *, covered_through: str = "2026-08-22T01:02:00+00:00"
+) -> dict[str, str]:
+    report = {
+        "schema_version": 1,
+        "kind": "provider_billing_report_receipt",
+        "provider_job_id": f"job-{reservation_id}",
+        "billing_authority_sha256": "c" * 64,
+        "authoritative_report_identity_sha256": "1" * 64,
+        "covered_through": covered_through,
+        "actual_cost_usd": actual_cost_usd,
+    }
+    report_json = json.dumps(report, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return {
+        "actual_cost_usd": actual_cost_usd,
+        "billing_authority_sha256": "c" * 64,
+        "authoritative_report_identity_sha256": "1" * 64,
+        "billing_report_json": report_json,
+        "billing_report_sha256": hashlib.sha256(report_json.encode()).hexdigest(),
+    }
 
 
 def _downgrade_populated_database_to_v4(path: Path) -> None:
@@ -551,12 +598,15 @@ def test_populated_v4_migration_preserves_legacy_rows_without_scope_authority(
         assert connection.execute("SELECT count(*) FROM budget_reservations").fetchone()[0] == 1
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
         legacy = connection.execute(
-            "SELECT reference_execution_scope_sha256 FROM budget_reservations"
-        ).fetchone()[0]
+            """SELECT reference_execution_scope_sha256, billing_authority_sha256,
+                authoritative_report_identity_sha256,
+                billing_completeness_delay_seconds, submitted_at, settlement_pending_at
+            FROM budget_reservations"""
+        ).fetchone()
         actual = connection.execute(
             "SELECT modal_cost_actual_usd FROM experiments"
         ).fetchone()[0]
-    assert legacy is None
+    assert tuple(legacy) == (None, None, None, None, None, None)
     assert actual == "0"
 
 
@@ -566,7 +616,7 @@ def test_v4_to_v5_migration_rolls_back_on_unknown_schema_state(tmp_path: Path) -
     import sqlite3
 
     with sqlite3.connect(path) as connection:
-        connection.execute("CREATE TABLE experiments_v5(blocker INTEGER)")
+        connection.execute("CREATE TABLE budget_reservations_v5(blocker INTEGER)")
     with pytest.raises(DatabaseError, match="v5 migration failed"):
         ResultsDatabase(path).initialize()
     with sqlite3.connect(path) as connection:
@@ -577,6 +627,9 @@ def test_v4_to_v5_migration_rolls_back_on_unknown_schema_state(tmp_path: Path) -
         columns = {
             row[1] for row in connection.execute("PRAGMA table_info(budget_reservations)")
         }
+        assert connection.execute(
+            "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'experiments_v5'"
+        ).fetchone()[0] == 0
     assert "reference_execution_scope_sha256" not in columns
 
 
@@ -594,6 +647,26 @@ def test_reference_execution_scope_is_canonical_and_source_bound() -> None:
         evaluation_lock_sha256="4" * 64,
         formula_authority_sha256="5" * 64,
     )
+    for changed in (
+        {"source_revision": "e" * 40},
+        {"weight_inventory_sha256": "2" * 64},
+        {"evaluation_lock_sha256": "6" * 64},
+        {"formula_authority_sha256": "7" * 64},
+    ):
+        inputs = {
+            "source_revision": "d" * 40,
+            "weight_inventory_sha256": "1" * 64,
+            "evaluation_lock_sha256": "4" * 64,
+            "formula_authority_sha256": "5" * 64,
+        }
+        inputs.update(changed)
+        assert reference_execution_scope_sha256(**inputs) != scope
+    assert reference_execution_scope_sha256(
+        source_revision="e" * 64,
+        weight_inventory_sha256="1" * 64,
+        evaluation_lock_sha256="4" * 64,
+        formula_authority_sha256="5" * 64,
+    ) != scope
     with pytest.raises(ValueError, match="source revision"):
         reference_execution_scope_sha256(
             source_revision="D" * 40,
@@ -690,6 +763,22 @@ def _set_provider_field(raw: dict[str, object], field: str, value: object) -> No
         ),
         (lambda raw: _remove_provider_field(raw, "workspace_scope_sha256"), "schema"),
         (
+            lambda raw: _set_provider_field(raw, "workspace_scope_sha256", 1),
+            "provider authority",
+        ),
+        (
+            lambda raw: _set_provider_field(raw, "constraint_contract_sha256", 1),
+            "provider authority",
+        ),
+        (
+            lambda raw: raw["inputs"].__setitem__("source_revision", 1),
+            "source_revision",
+        ),
+        (
+            lambda raw: raw["inputs"].__setitem__("weight_inventory_sha256", 1),
+            "scope authority",
+        ),
+        (
             lambda raw: _set_provider_field(raw, "billing_authority_path", "C:/private"),
             "authority",
         ),
@@ -716,20 +805,12 @@ def test_reference_settlement_is_exactly_once_and_provider_attributed(tmp_path: 
     database = ResultsDatabase(tmp_path / "results.sqlite")
     database.initialize()
     _reserve(database, suffix="settle")
-    database.mark_reservation_submitted(
-        "reservation-settle",
-        provider_job_id="job-1",
-        app_identity="isolated-app-1",
-        occurred_at="2026-08-22T00:01:00+00:00",
-    )
-    database.mark_settlement_pending(
-        "reservation-settle", occurred_at="2026-08-22T00:02:00+00:00"
-    )
+    _submit(database, "reservation-settle", lease="2026-08-22T00:10:00+00:00")
+    _await_settlement(database, "reservation-settle", lease="2026-08-22T02:10:00+00:00")
     database.settle_reservation(
         "reservation-settle",
-        actual_cost_usd="2.50",
-        settlement_identity="billing-export-row-1",
-        occurred_at="2026-08-22T01:00:00+00:00",
+        occurred_at="2026-08-22T01:02:00+00:00",
+        **_billing_report("reservation-settle", "2.50"),
     )
     reservation = database.get_reservation("reservation-settle")
     assert reservation["status"] == "settled"
@@ -738,9 +819,114 @@ def test_reference_settlement_is_exactly_once_and_provider_attributed(tmp_path: 
     with pytest.raises(DatabaseError, match="cannot settle"):
         database.settle_reservation(
             "reservation-settle",
-            actual_cost_usd="2.50",
-            settlement_identity="billing-export-row-1",
-            occurred_at="2026-08-22T01:00:01+00:00",
+            occurred_at="2026-08-22T01:02:01+00:00",
+            **_billing_report("reservation-settle", "2.50"),
+        )
+
+
+def test_reference_settlement_requires_bound_complete_billing(tmp_path: Path) -> None:
+    database = ResultsDatabase(tmp_path / "results.sqlite")
+    database.initialize()
+    _reserve(database, suffix="billing")
+    reservation = database.get_reservation("reservation-billing")
+    assert reservation["billing_authority_sha256"] == "c" * 64
+    assert reservation["authoritative_report_identity_sha256"] == "1" * 64
+    assert reservation["billing_completeness_delay_seconds"] == 3600
+    _submit(database, "reservation-billing", lease="2026-08-22T00:10:00+00:00")
+    with pytest.raises(DatabaseError, match="cannot settle"):
+        database.settle_reservation(
+            "reservation-billing",
+            occurred_at="2026-08-22T01:02:00+00:00",
+            **_billing_report("reservation-billing", "1.00"),
+        )
+    _await_settlement(database, "reservation-billing", lease="2026-08-22T02:10:00+00:00")
+    for changed, occurred_at, message in (
+        (
+            {"authoritative_report_identity_sha256": "2" * 64},
+            "2026-08-22T01:02:00+00:00",
+            "identity",
+        ),
+        ({"billing_authority_sha256": "d" * 64}, "2026-08-22T01:02:00+00:00", "authority"),
+        ({}, "2026-08-22T01:01:59+00:00", "not yet complete"),
+    ):
+        billing = _billing_report("reservation-billing", "1.00")
+        billing.update(changed)
+        with pytest.raises(DatabaseError, match=message):
+            database.settle_reservation(
+                "reservation-billing",
+                occurred_at=occurred_at,
+                **billing,
+            )
+        unchanged = database.get_reservation("reservation-billing")
+        assert unchanged["status"] == "settlement_pending"
+        assert unchanged["provider_actual_cost_usd"] is None
+
+
+def test_reference_lease_renewal_is_owner_checked_and_prevents_reconciliation(
+    tmp_path: Path,
+) -> None:
+    database = ResultsDatabase(tmp_path / "results.sqlite")
+    database.initialize()
+    _reserve(database, suffix="renew")
+    with pytest.raises(DatabaseError, match="cannot renew"):
+        database.renew_reservation_lease(
+            "reservation-renew",
+            owner_id="other",
+            occurred_at="2026-08-22T00:04:00+00:00",
+            lease_expires_at="2026-08-22T00:20:00+00:00",
+        )
+    database.renew_reservation_lease(
+        "reservation-renew",
+        owner_id="owner",
+        occurred_at="2026-08-22T00:04:00+00:00",
+        lease_expires_at="2026-08-21T20:20:00-04:00",
+    )
+    assert database.reconcile_stale_reservations(
+        now="2026-08-22T00:10:00+00:00"
+    ) == {"released": [], "audit_blocked": []}
+
+
+def test_reference_lease_boundaries_fail_closed(tmp_path: Path) -> None:
+    database = ResultsDatabase(tmp_path / "results.sqlite")
+    database.initialize()
+    with pytest.raises(DatabaseError, match="lease must expire after"):
+        _reserve(
+            database,
+            suffix="initial-expired",
+            lease_expires_at="2026-08-22T00:00:00+00:00",
+        )
+
+    _reserve(database, suffix="expired")
+    with pytest.raises(DatabaseError, match="lease has expired"):
+        database.renew_reservation_lease(
+            "reservation-expired",
+            owner_id="owner",
+            occurred_at="2026-08-22T00:05:01+00:00",
+            lease_expires_at="2026-08-22T00:20:00+00:00",
+        )
+    with pytest.raises(DatabaseError, match="lease has expired"):
+        database.mark_reservation_submitted(
+            "reservation-expired",
+            owner_id="owner",
+            provider_job_id="job-expired",
+            app_identity="app-expired",
+            occurred_at="2026-08-22T00:05:01+00:00",
+            lease_expires_at="2026-08-22T00:20:00+00:00",
+        )
+
+
+def test_settlement_pending_rejects_backdated_provider_terminal_time(tmp_path: Path) -> None:
+    database = ResultsDatabase(tmp_path / "results.sqlite")
+    database.initialize()
+    _reserve(database, suffix="backdated")
+    _submit(database, "reservation-backdated", lease="2026-08-22T00:10:00+00:00")
+    with pytest.raises(DatabaseError, match="provider terminal time"):
+        database.mark_settlement_pending(
+            "reservation-backdated",
+            owner_id="owner",
+            occurred_at="2026-08-22T00:03:00+00:00",
+            provider_terminal_at="2026-08-22T00:00:59+00:00",
+            lease_expires_at="2026-08-22T02:10:00+00:00",
         )
 
 
@@ -753,15 +939,23 @@ def test_stale_reference_reservations_release_only_before_submission(tmp_path: P
     assert database.get_run("run-pre")["status"] == "failed"
 
     _reserve(database, suffix="post", observation_receipt_sha256="e" * 64)
-    database.mark_reservation_submitted(
-        "reservation-post",
-        provider_job_id="job-post",
-        app_identity="isolated-app-post",
-        occurred_at="2026-08-22T00:01:00+00:00",
-    )
+    _submit(database, "reservation-post", lease="2026-08-22T00:06:00+00:00")
     blocked = database.reconcile_stale_reservations(now="2026-08-22T00:10:00+00:00")
     assert blocked == {"released": [], "audit_blocked": ["reservation-post"]}
     assert database.get_run("run-post")["modal_cost_actual_usd"] is None
+    reservation = database.get_reservation("reservation-post")
+    assert reservation["status"] == "audit_blocked"
+    assert reservation["requested_cost_usd"] == "4.00"
+    assert reservation["provider_actual_cost_usd"] is None
+    with pytest.raises(DatabaseError, match="cap"):
+        _reserve(
+            database,
+            suffix="blocked-overlap",
+            observation_receipt_sha256="f" * 64,
+            mutate_config=lambda raw: raw["inputs"].__setitem__(
+                "source_revision", "e" * 40
+            ),
+        )
 
 
 def test_released_scope_requires_new_observation_challenge_and_approval(tmp_path: Path) -> None:
@@ -796,32 +990,25 @@ def test_submitted_or_later_scope_is_permanently_consumed(
     database.initialize()
     _reserve(database, suffix=f"used-{terminal}")
     reservation_id = f"reservation-used-{terminal}"
-    database.mark_reservation_submitted(
-        reservation_id,
-        provider_job_id=f"job-{terminal}",
-        app_identity=f"app-{terminal}",
-        occurred_at="2026-08-22T00:01:00+00:00",
-    )
+    _submit(database, reservation_id, lease="2026-08-22T00:06:00+00:00")
     if terminal == "settlement_pending":
-        database.mark_settlement_pending(
-            reservation_id, occurred_at="2026-08-22T00:02:00+00:00"
-        )
+        _await_settlement(database, reservation_id, lease="2026-08-22T02:10:00+00:00")
     elif terminal == "settled":
+        _await_settlement(database, reservation_id, lease="2026-08-22T02:10:00+00:00")
         database.settle_reservation(
             reservation_id,
-            actual_cost_usd="4.00",
-            settlement_identity=f"bill-{terminal}",
-            occurred_at="2026-08-22T00:03:00+00:00",
+            occurred_at="2026-08-22T01:02:00+00:00",
+            **_billing_report(reservation_id, "4.00"),
         )
     elif terminal == "audit_blocked":
         database.reconcile_stale_reservations(now="2026-08-22T00:10:00+00:00")
     elif terminal == "failed":
+        _await_settlement(database, reservation_id, lease="2026-08-22T02:10:00+00:00")
         with pytest.raises(DatabaseError, match="budget failure"):
             database.settle_reservation(
                 reservation_id,
-                actual_cost_usd="4.01",
-                settlement_identity=f"bill-{terminal}",
-                occurred_at="2026-08-22T00:03:00+00:00",
+                occurred_at="2026-08-22T01:02:00+00:00",
+                **_billing_report(reservation_id, "4.01"),
             )
 
     with pytest.raises(DatabaseError, match="scope"):
@@ -862,23 +1049,20 @@ def test_over_cap_settlement_is_durable_and_unambiguously_fails(tmp_path: Path) 
     database = ResultsDatabase(tmp_path / "results.sqlite")
     database.initialize()
     _reserve(database, suffix="over")
-    database.mark_reservation_submitted(
-        "reservation-over",
-        provider_job_id="job-over",
-        app_identity="app-over",
-        occurred_at="2026-08-22T00:01:00+00:00",
-    )
+    _submit(database, "reservation-over", lease="2026-08-22T00:10:00+00:00")
+    _await_settlement(database, "reservation-over", lease="2026-08-22T02:10:00+00:00")
     with pytest.raises(DatabaseError, match="budget failure"):
         database.settle_reservation(
             "reservation-over",
-            actual_cost_usd="4.01",
-            settlement_identity="billing-over",
-            occurred_at="2026-08-22T00:03:00+00:00",
+            occurred_at="2026-08-22T01:02:00+00:00",
+            **_billing_report("reservation-over", "4.01"),
         )
     reservation = database.get_reservation("reservation-over")
     assert reservation["status"] == "failed"
     assert reservation["provider_actual_cost_usd"] == "4.01"
-    assert reservation["settlement_identity"] == "billing-over"
+    assert reservation["settlement_identity"] == _billing_report(
+        "reservation-over", "4.01"
+    )["billing_report_sha256"]
     run = database.get_run("run-over")
     assert run["status"] == "failed"
     assert run["modal_cost_actual_usd"] == "4.01"
@@ -899,19 +1083,38 @@ def test_delayed_authoritative_billing_can_settle_an_audit_blocked_run(
     database = ResultsDatabase(tmp_path / "results.sqlite")
     database.initialize()
     _reserve(database, suffix="delayed")
-    database.mark_reservation_submitted(
-        "reservation-delayed",
-        provider_job_id="job-delayed",
-        app_identity="app-delayed",
-        occurred_at="2026-08-22T00:01:00+00:00",
-    )
+    _submit(database, "reservation-delayed", lease="2026-08-22T00:06:00+00:00")
+    _await_settlement(database, "reservation-delayed", lease="2026-08-22T00:07:00+00:00")
     database.reconcile_stale_reservations(now="2026-08-22T00:10:00+00:00")
     assert database.get_run("run-delayed")["modal_cost_actual_usd"] is None
     database.settle_reservation(
         "reservation-delayed",
-        actual_cost_usd="4.00",
-        settlement_identity="billing-delayed",
-        occurred_at="2026-08-22T01:00:00+00:00",
+        occurred_at="2026-08-22T01:02:00+00:00",
+        **_billing_report("reservation-delayed", "4.00"),
     )
     assert database.get_reservation("reservation-delayed")["status"] == "settled"
     assert database.get_run("run-delayed")["modal_cost_actual_usd"] == "4.00"
+
+
+def test_legacy_submitted_or_later_reservation_retains_the_full_cap(tmp_path: Path) -> None:
+    path = tmp_path / "legacy.sqlite"
+    _downgrade_populated_database_to_v4(path)
+    import sqlite3
+
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            """UPDATE budget_reservations SET status = 'settled',
+                provider_actual_cost_usd = '0', provider_job_id = 'legacy-job',
+                app_identity = 'legacy-app', settlement_identity = 'legacy-bill'"""
+        )
+    database = ResultsDatabase(path)
+    database.initialize()
+    with pytest.raises(DatabaseError, match="cap"):
+        _reserve(
+            database,
+            suffix="after-legacy",
+            observation_receipt_sha256="e" * 64,
+            mutate_config=lambda raw: raw["inputs"].__setitem__(
+                "source_revision", "e" * 40
+            ),
+        )
