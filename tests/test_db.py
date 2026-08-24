@@ -606,7 +606,7 @@ def test_populated_v4_migration_preserves_legacy_rows_without_scope_authority(
     database = ResultsDatabase(path)
     database.initialize()
     with database.connect() as connection:
-        assert connection.execute("SELECT max(version) FROM schema_info").fetchone()[0] == 7
+        assert connection.execute("SELECT max(version) FROM schema_info").fetchone()[0] == 8
         assert connection.execute("SELECT count(*) FROM experiments").fetchone()[0] == 1
         assert connection.execute("SELECT count(*) FROM budget_reservations").fetchone()[0] == 1
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
@@ -1190,7 +1190,7 @@ def test_v6_to_v7_migration_adds_controller_cycles(tmp_path: Path) -> None:
     database.initialize()
     assert _acquire_controller_cycle(database, "cycle-after-migration") == 1
     with database.connect() as connection:
-        assert connection.execute("SELECT max(version) FROM schema_info").fetchone()[0] == 7
+        assert connection.execute("SELECT max(version) FROM schema_info").fetchone()[0] == 8
 
 
 def test_controller_cycle_lifecycle_commits_artifact_with_fencing(tmp_path: Path) -> None:

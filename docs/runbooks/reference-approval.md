@@ -49,20 +49,67 @@ every unresolved blocker. Previewing never creates or consumes an execution appr
   reviewed commit, all three plan authorities, every provider evidence identity including any trust
   override, the exact cap from the ignored local ledger, explicit residual-risk acceptance, and expiry.
 
+## No-weight provider-smoke handoff
+
+After the reviewed tree is clean, generate the short-lived contract from the ignored local lineage
+and save only the nested `contract` object. Contract generation does not contact Modal:
+
+```powershell
+$issued = (Get-Date).ToUniversalTime()
+$expires = $issued.AddMinutes(30)
+$packet = uv run lowbit-paid-smoke contract --root . `
+  --config configs/local/reference.yaml `
+  --ledger configs/local/reference-budget.json `
+  --issued-at $issued.ToString("o") --expires-at $expires.ToString("o") |
+  ConvertFrom-Json
+$contractJson = $packet.contract | ConvertTo-Json -Depth 20 -Compress
+[System.IO.File]::WriteAllText(
+  "$PWD\configs\local\provider-smoke-contract.json",
+  $contractJson,
+  (New-Object System.Text.UTF8Encoding($false))
+)
+```
+
+The approved adapter implementation can then be inspected without contacting Modal:
+
+```powershell
+uv run lowbit-paid-smoke plan --contract configs/local/provider-smoke-contract.json
+uv run lowbit-paid-smoke verify --contract configs/local/provider-smoke-contract.json `
+  --approval configs/local/provider-smoke-approval.json
+```
+
+Both commands are read-only. The generated handoff reports the exact later `execute` command,
+execution-scope hash, USD 4.00 maximum, expiry, and approval wording while keeping
+`paid_action_ready:false`. Do not run `execute` during zero-spend preparation. The local reservation
+is not a Modal-enforced dollar cap, so the exact approval wording acknowledges residual provider
+execution risk.
+
+After any future paid action, the reservation stays in `settlement_pending` until a canonical,
+authoritative billing receipt covers the contract's complete billing-delay window. Place that
+ignored receipt at `reports/local/provider-smoke-billing.json`, then settle locally without provider
+contact:
+
+```powershell
+uv run lowbit-paid-smoke settle --root . `
+  --db results/local/reference.sqlite `
+  --report reports/local/provider-smoke-billing.json `
+  --reservation-id <exact-reservation-id>
+```
+
 ## Hard stop
 
-U8 remains unauthorized. This repository contains no `modal.App`, remote function, deploy, spawn,
-or submit entrypoint. Do not add one, transfer weights, reserve money, or register an approval until
-a human separately approves the exact U7 packet and reviewed commit. Provider authentication may be
+U8 remains unauthorized. The sole audited `modal.App`/spawn boundary is the no-weight provider-smoke
+adapter. Do not invoke it, transfer weights, reserve money, or register an approval until a human
+separately approves the exact smoke packet and reviewed commit. Provider authentication may be
 configured locally, but it is not execution authority and credentials must never enter the repository.
 Unknown billing after any future submission must become `audit_blocked`; it must never release
 reusable budget. Every submitted or later state permanently consumes its execution scope.
 
-The controller handoff reads `total_ledger_ceiling_usd` from the validated ignored local ledger and separates it from
-`current_action_authorized_cap_usd:"0.00"`. The total ledger is not authority to spend it, and
-`proposed_action_cap_usd:null` means no paid evidence action has been allocated. Until a later
-approved plan supplies that allocation and a reviewed provider adapter, `command_available` remains
-false and there is no executable paid command to approve.
+The controller handoff reads `total_ledger_ceiling_usd` from the validated ignored local ledger and
+separates it from `current_action_authorized_cap_usd:"0.00"`. The total ledger is not authority to
+spend it. The reviewed provider-smoke adapter now supplies a separate exact command and action
+contract, but its local ledger remains unauthorized and `paid_action_ready` remains false until a
+human separately approves that exact short-lived packet.
 
 No approval text is generated while the command and exact paid-action contract are absent. A future
 approval must bind the complete paid-action packet, exact command, challenge, cap, and reviewed

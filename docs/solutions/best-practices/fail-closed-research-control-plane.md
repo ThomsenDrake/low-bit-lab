@@ -89,6 +89,19 @@ approval. Any submitted-or-later state consumes the scope permanently. Settlemen
 challenge-bound billing authority and report identity, wait for the declared completeness delay,
 and preserve authoritative over-limit cost as a durable terminal failure.
 
+A provider-only smoke probe should not reuse a model/reference reservation schema whose scope
+requires weight inventory and evaluation lineage. Give the probe a separate target-neutral action
+contract and reservation state, but calculate committed cost across both ledgers in the same
+transaction. Bind the exact resource envelope, environment, reviewed commit, control-plane hash,
+local ledger bytes, approval expiry, and fixed human wording. The adapter should accept one
+capability object and no model, path, URL, token, repository, or user payload.
+
+Persist an explicit `submission_pending` state before importing the provider SDK. Immediately after
+`spawn`, store the real provider call identity before waiting for results. A failure before that
+identity is known and a failure after it is known are both audit-blocking; neither may release or
+replay the scope. This separates provider contact from provider completion without inventing a job
+identity during an ambiguous start.
+
 ## Why This Matters
 
 These invariants make silent policy drift, config mutation, preflight failure loss, and concurrent overspend observable or impossible. They also let later agents resume from durable state without inheriting hidden judgment from an earlier session.
@@ -111,6 +124,10 @@ These invariants make silent policy drift, config mutation, preflight failure lo
 - `src/lowbit_lab/activation.py` binds decision artifacts and reruns all bounded gates.
 - `src/lowbit_lab/publication.py` scans Git paths and contents before public publication.
 - `src/lowbit_lab/reference_gates.py` verifies method-bound memory and timing evidence without enabling submission.
+- `src/lowbit_lab/provider_smoke.py` binds one ignored approval and exact local cap before the
+  audited adapter can be imported.
+- `src/lowbit_lab/modal_adapter.py` persists provider-call identity immediately after spawn and
+  accepts no model input or remote payload.
 
 ## Related
 

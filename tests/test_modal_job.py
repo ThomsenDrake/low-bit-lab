@@ -28,12 +28,8 @@ from lowbit_lab.reference_contract import (
 from lowbit_lab.reference_gates import A100_80GB_BYTES, MEMORY_FORMULA, TIME_FORMULA
 
 ORIGINAL_PLAN_PATH = "docs/plans/local/2026-08-21-2358-feat-full-weight-baseline-plan.md"
-AMENDMENT_PATH = (
-    "docs/plans/local/2026-08-22-1126-feat-provider-constraint-amendment-plan.md"
-)
-TRUST_OVERRIDE_PLAN_PATH = (
-    "docs/plans/local/2026-08-23-provider-observation-trust-override-plan.md"
-)
+AMENDMENT_PATH = "docs/plans/local/2026-08-22-1126-feat-provider-constraint-amendment-plan.md"
+TRUST_OVERRIDE_PLAN_PATH = "docs/plans/local/2026-08-23-provider-observation-trust-override-plan.md"
 
 
 def _budget(path: Path, plan_sha256: str) -> None:
@@ -223,9 +219,10 @@ def test_reference_preview_requires_independent_formula_approval_receipt(
     path.write_text(yaml.safe_dump(raw), encoding="utf-8")
 
     config = load_reference_job_config(path, root=tmp_path)
-    assert "formula_approval_receipt_unverified" in plan_reference_preview(
-        config, root=tmp_path
-    )["blockers"]
+    assert (
+        "formula_approval_receipt_unverified"
+        in plan_reference_preview(config, root=tmp_path)["blockers"]
+    )
 
     receipt = reports / "formula-approval.json"
     receipt.write_text(
@@ -243,14 +240,13 @@ def test_reference_preview_requires_independent_formula_approval_receipt(
         encoding="utf-8",
     )
     raw["gates"]["formula_approval_path"] = "reports/local/formula-approval.json"
-    raw["gates"]["formula_approval_sha256"] = hashlib.sha256(
-        receipt.read_bytes()
-    ).hexdigest()
+    raw["gates"]["formula_approval_sha256"] = hashlib.sha256(receipt.read_bytes()).hexdigest()
     path.write_text(yaml.safe_dump(raw), encoding="utf-8")
     config = load_reference_job_config(path, root=tmp_path)
-    assert "formula_approval_receipt_unverified" not in plan_reference_preview(
-        config, root=tmp_path
-    )["blockers"]
+    assert (
+        "formula_approval_receipt_unverified"
+        not in plan_reference_preview(config, root=tmp_path)["blockers"]
+    )
 
 
 def test_reference_config_rejects_legacy_schema_version(tmp_path: Path) -> None:
@@ -357,9 +353,7 @@ def test_reference_preview_derives_gates_from_hashed_evidence(tmp_path: Path) ->
         ("retries", 1),
     ],
 )
-def test_reference_resource_drift_fails_closed(
-    tmp_path: Path, field: str, value: object
-) -> None:
+def test_reference_resource_drift_fails_closed(tmp_path: Path, field: str, value: object) -> None:
     path = _config(tmp_path)
     raw = yaml.safe_load(path.read_text(encoding="utf-8"))
     raw["resources"][field] = value
@@ -562,9 +556,7 @@ def test_reference_preview_accepts_bound_human_trust_override_for_stale_observat
     constraint_path = tmp_path / "reports" / "local" / "constraint.json"
     constraint_bytes = constraint_path.read_bytes()
     constraint_path.write_text("{}", encoding="utf-8")
-    blocked = plan_reference_preview(
-        load_reference_job_config(path, root=tmp_path), root=tmp_path
-    )
+    blocked = plan_reference_preview(load_reference_job_config(path, root=tmp_path), root=tmp_path)
     assert blocked["provider_constraint_authority"] == "unproven"
     assert "provider_concurrency_unproven" in blocked["blockers"]
     constraint_path.write_bytes(constraint_bytes)
@@ -575,9 +567,7 @@ def test_reference_preview_accepts_bound_human_trust_override_for_stale_observat
         override_path.read_bytes()
     ).hexdigest()
     path.write_text(yaml.safe_dump(raw), encoding="utf-8")
-    blocked = plan_reference_preview(
-        load_reference_job_config(path, root=tmp_path), root=tmp_path
-    )
+    blocked = plan_reference_preview(load_reference_job_config(path, root=tmp_path), root=tmp_path)
     assert blocked["provider_constraint_authority"] == "unproven"
     assert "provider_concurrency_unproven" in blocked["blockers"]
 
@@ -604,12 +594,8 @@ def test_reference_preview_clears_each_provider_blocker_with_bound_approval(
                 "original_approved_plan_sha256": ORIGINAL_APPROVED_PLAN_SHA256,
                 "approved_amendment_sha256": APPROVED_PROVIDER_AMENDMENT_SHA256,
                 "approved_trust_override_plan_sha256": APPROVED_TRUST_OVERRIDE_PLAN_SHA256,
-                "constraint_contract_sha256": raw["provider"][
-                    "constraint_contract_sha256"
-                ],
-                "observation_receipt_sha256": raw["provider"][
-                    "observation_receipt_sha256"
-                ],
+                "constraint_contract_sha256": raw["provider"]["constraint_contract_sha256"],
+                "observation_receipt_sha256": raw["provider"]["observation_receipt_sha256"],
                 "billing_authority_sha256": raw["provider"]["billing_authority_sha256"],
                 "workspace_scope_sha256": raw["provider"]["workspace_scope_sha256"],
                 "environment_scope_sha256": raw["provider"]["environment_scope_sha256"],
@@ -673,13 +659,19 @@ def test_reference_preview_clears_each_provider_blocker_with_bound_approval(
     assert "provider_concurrency_unproven" not in blockers
     assert "provider_billing_scope_unproven" not in blockers
 
+
 def test_provider_output_is_bounded_and_redacted() -> None:
     output = redact_provider_output(
-        "modal_token_id=" + "identifier "
-        + "modal_token_secret:" + "supersecret "
-        + "api_key=" + "anothersecret "
-        + '{"password":"' + 'json-secret"} '
-        + "Authorization: Bearer " + "bearer-secret "
+        "modal_token_id="
+        + "identifier "
+        + "modal_token_secret:"
+        + "supersecret "
+        + "api_key="
+        + "anothersecret "
+        + '{"password":"'
+        + 'json-secret"} '
+        + "Authorization: Bearer "
+        + "bearer-secret "
         + "x" * 5000
     )
     assert "identifier" not in output
@@ -866,7 +858,37 @@ def test_u8_submission_primitives_are_absent() -> None:
         Path("modal").rglob("*.py")
     )
     for path in production_paths:
-        assert _submission_violations(path.read_text(encoding="utf-8")) == [], path
+        violations = _submission_violations(path.read_text(encoding="utf-8"))
+        if path.as_posix() == "src/lowbit_lab/modal_adapter.py":
+            assert sorted(violations) == ["App", "modal", "spawn"], path
+            source = path.read_text(encoding="utf-8")
+            assert source.count("modal.App(") == 1
+            assert source.count("@app.function(") == 1
+            assert source.count("app.run(") == 1
+            assert source.count("observe.spawn(") == 1
+            assert source.count("call.get(") == 1
+            assert "include_source=False" in source
+            assert "environment_name=capability.provider_environment" in source
+            assert 'serialized=SMOKE_RESOURCE_SPEC["serialized_function"]' in source
+            tree = ast.parse(source)
+            allowed_attributes = {
+                "modal": {"App"},
+                "app": {"function", "run"},
+                "observe": {"spawn"},
+                "call": {"get", "object_id"},
+            }
+            for node in ast.walk(tree):
+                if (
+                    isinstance(node, ast.Attribute)
+                    and isinstance(node.value, ast.Name)
+                    and node.value.id in allowed_attributes
+                ):
+                    assert node.attr in allowed_attributes[node.value.id], (
+                        node.value.id,
+                        node.attr,
+                    )
+        else:
+            assert violations == [], path
 
 
 @pytest.mark.parametrize(
