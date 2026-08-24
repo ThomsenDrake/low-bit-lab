@@ -15,7 +15,7 @@ context:
   useful_proven: false
 sources:
   - path: PLAN.md
-    sha256: ce8d47b3381282e75ad49f01f827175cf86b31e06bacb14653cbcaf0ffccb327
+    sha256: 191a1a8ecb878544283fb3ae4f54e962175b2c3bb7ac6d4bdfa4ce9489849a77
 runtime:
   name: scaffold-control-plane
   revision: 0.1.0

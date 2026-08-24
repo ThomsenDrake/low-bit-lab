@@ -116,6 +116,16 @@ audit-blocked until delayed billing evidence resolves the attempt. A stopped app
 zero containers is strong execution evidence, but it is not a substitute for the declared billing
 authority when settling reserved cost.
 
+Standing paid authority should be a campaign capability, not an invitation to skip per-action
+lineage. Freeze the exact human grant digest and a closed campaign envelope in code, then bind that
+authority into short-lived action contracts. Account active or ambiguous attempts at requested
+cost, settled or failed attempts at authoritative actual cost, and permit reuse only when the full
+next safe reservation fits confirmed remaining lifetime balance. Validate the approved campaign
+plan's exact bytes during both contract generation and execution; a constant that merely repeats a
+historical digest does not prove the plan is still present. For prelaunch provider rejection, bind a
+stopped app identity and zero task/container evidence separately; do not relabel an app ID as a
+function-call ID merely to satisfy settlement plumbing.
+
 ## Why This Matters
 
 These invariants make silent policy drift, config mutation, preflight failure loss, and concurrent overspend observable or impossible. They also let later agents resume from durable state without inheriting hidden judgment from an earlier session.
@@ -138,8 +148,8 @@ These invariants make silent policy drift, config mutation, preflight failure lo
 - `src/lowbit_lab/activation.py` binds decision artifacts and reruns all bounded gates.
 - `src/lowbit_lab/publication.py` scans Git paths and contents before public publication.
 - `src/lowbit_lab/reference_gates.py` verifies method-bound memory and timing evidence without enabling submission.
-- `src/lowbit_lab/provider_smoke.py` binds one ignored approval and exact local cap before the
-  audited adapter can be imported.
+- `src/lowbit_lab/provider_smoke.py` binds one ignored campaign authority, the approved plan bytes,
+  and the exact local cap before the audited adapter can be imported.
 - `src/lowbit_lab/modal_adapter.py` persists provider-call identity immediately after spawn and
   accepts no model input or remote payload.
 

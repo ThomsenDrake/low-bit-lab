@@ -712,6 +712,33 @@ def test_reference_reservation_is_atomic_and_prevents_cap_overlap(tmp_path: Path
         ).fetchone()[0] == 0
 
 
+def test_zero_cost_settled_smoke_restores_reference_reservation_balance(
+    tmp_path: Path,
+) -> None:
+    database = ResultsDatabase(tmp_path / "results.sqlite")
+    database.initialize()
+    with database.connect() as connection:
+        connection.execute(
+            """INSERT INTO provider_smoke_reservations(
+                reservation_id, action_contract_sha256, execution_scope_sha256,
+                challenge_sha256, approval_digest, contract_json, status,
+                requested_cost_usd, provider_actual_cost_usd, owner_id, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, '{}', 'settled', '4.00', '0.00', ?, ?, ?)""",
+            (
+                "settled-smoke",
+                "1" * 64,
+                "2" * 64,
+                "3" * 64,
+                "4" * 64,
+                "smoke-owner",
+                "2026-08-21T23:00:00+00:00",
+                "2026-08-21T23:30:00+00:00",
+            ),
+        )
+    _reserve(database, suffix="after-zero-smoke")
+    assert database.get_reservation("reservation-after-zero-smoke")["status"] == "reserved"
+
+
 def test_reference_reservation_requires_unconsumed_unexpired_approval(tmp_path: Path) -> None:
     database = ResultsDatabase(tmp_path / "results.sqlite")
     database.initialize()

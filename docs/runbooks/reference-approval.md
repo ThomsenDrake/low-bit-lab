@@ -51,8 +51,9 @@ every unresolved blocker. Previewing never creates or consumes an execution appr
 
 ## No-weight provider-smoke handoff
 
-After the reviewed tree is clean, generate the short-lived contract from the ignored local lineage
-and save only the nested `contract` object. Contract generation does not contact Modal:
+After the reviewed tree is clean, validate the ignored standing campaign authority and generate a
+short-lived action contract from local lineage. Save only the nested `contract` object. Contract
+generation does not contact Modal:
 
 ```powershell
 $issued = (Get-Date).ToUniversalTime()
@@ -60,6 +61,7 @@ $expires = $issued.AddMinutes(30)
 $packet = uv run lowbit-paid-smoke contract --root . `
   --config configs/local/reference.yaml `
   --ledger configs/local/reference-budget.json `
+  --authority configs/local/provider-smoke-campaign-authority.json `
   --issued-at $issued.ToString("o") --expires-at $expires.ToString("o") |
   ConvertFrom-Json
 $contractJson = $packet.contract | ConvertTo-Json -Depth 20 -Compress
@@ -75,14 +77,13 @@ The approved adapter implementation can then be inspected without contacting Mod
 ```powershell
 uv run lowbit-paid-smoke plan --contract configs/local/provider-smoke-contract.json
 uv run lowbit-paid-smoke verify --contract configs/local/provider-smoke-contract.json `
-  --approval configs/local/provider-smoke-approval.json
+  --authority configs/local/provider-smoke-campaign-authority.json
 ```
 
-Both commands are read-only. The generated handoff reports the exact later `execute` command,
-execution-scope hash, USD 4.00 maximum, expiry, and approval wording while keeping
-`paid_action_ready:false`. Do not run `execute` during zero-spend preparation. The local reservation
-is not a Modal-enforced dollar cap, so the exact approval wording acknowledges residual provider
-execution risk.
+Both commands are read-only. The handoff reports the exact later `execute` command, action scope,
+campaign-authority digest, maximum reservation, and expiry. Execution needs no regenerated human
+approval, but remains blocked unless authoritative settled cost leaves enough campaign balance and
+no active or audit-blocked reservation exists. The local ceiling is not provider-enforced.
 
 After any future paid action, the reservation stays in `settlement_pending` until a canonical,
 authoritative billing receipt covers the contract's complete billing-delay window. Place that
@@ -96,21 +97,31 @@ uv run lowbit-paid-smoke settle --root . `
   --reservation-id <exact-reservation-id>
 ```
 
+If Modal creates a stopped app but launches zero tasks and zero containers before a call identity
+exists, first record the closed evidence at
+`reports/local/provider-smoke-prelaunch-audit.json`. The JSON object must contain exactly:
+`schema_version` 1, `kind` `provider_smoke_prelaunch_audit`, the reservation, action-contract, and
+execution-scope identities, `provider_app_id`, `provider_environment`, stopped app state, zero task
+and container counts, provider-created and provider-stopped timestamps, and the SHA-256 of the
+read-only provider report. Then run:
+
+```powershell
+uv run lowbit-paid-smoke audit-prelaunch --root . `
+  --db results/local/reference.sqlite `
+  --evidence reports/local/provider-smoke-prelaunch-audit.json `
+  --reservation-id <exact-reservation-id>
+```
+
+This transition never contacts Modal and does not invent a function-call identity; billing
+settlement binds the app ID.
+
 ## Hard stop
 
 U8 remains unauthorized. The sole audited `modal.App`/spawn boundary is the no-weight provider-smoke
-adapter. Do not invoke it, transfer weights, reserve money, or register an approval until a human
-separately approves the exact smoke packet and reviewed commit. Provider authentication may be
-configured locally, but it is not execution authority and credentials must never enter the repository.
+adapter. The standing campaign grant authorizes only that adapter within confirmed unspent lifetime
+balance. Provider authentication is not broader authority and credentials must never enter the repo.
 Unknown billing after any future submission must become `audit_blocked`; it must never release
 reusable budget. Every submitted or later state permanently consumes its execution scope.
 
-The controller handoff reads `total_ledger_ceiling_usd` from the validated ignored local ledger and
-separates it from `current_action_authorized_cap_usd:"0.00"`. The total ledger is not authority to
-spend it. The reviewed provider-smoke adapter now supplies a separate exact command and action
-contract, but its local ledger remains unauthorized and `paid_action_ready` remains false until a
-human separately approves that exact short-lived packet.
-
-No approval text is generated while the command and exact paid-action contract are absent. A future
-approval must bind the complete paid-action packet, exact command, challenge, cap, and reviewed
-lineage. The current readiness-packet SHA-256 is evidence for planning, not execution authority.
+The controller handoff still keeps ordinary target-bearing action authority at zero. The standing
+campaign authority is a separate, closed no-weight capability; it cannot activate a target or U8.

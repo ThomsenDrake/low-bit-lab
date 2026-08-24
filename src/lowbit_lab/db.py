@@ -422,6 +422,35 @@ def _database_timestamp(value: str, label: str) -> datetime:
     return timestamp
 
 
+def _committed_provider_cost(connection: sqlite3.Connection) -> Decimal:
+    committed = Decimal("0")
+    for row in connection.execute(
+        """SELECT status, requested_cost_usd, provider_actual_cost_usd,
+            reference_execution_scope_sha256
+        FROM budget_reservations WHERE status != 'released'"""
+    ):
+        value = (
+            row["provider_actual_cost_usd"]
+            if row["reference_execution_scope_sha256"] is not None
+            and row["status"] in {"settled", "failed"}
+            and row["provider_actual_cost_usd"] is not None
+            else row["requested_cost_usd"]
+        )
+        committed += _database_money(value, "stored reference reservation cost")
+    for row in connection.execute(
+        """SELECT status, requested_cost_usd, provider_actual_cost_usd
+        FROM provider_smoke_reservations"""
+    ):
+        value = (
+            row["provider_actual_cost_usd"]
+            if row["status"] in {"settled", "failed"}
+            and row["provider_actual_cost_usd"] is not None
+            else row["requested_cost_usd"]
+        )
+        committed += _database_money(value, "stored provider smoke cost")
+    return committed
+
+
 def _reference_billing_report(
     report_json: str, report_sha256: str
 ) -> tuple[dict[str, object], Decimal]:
@@ -883,7 +912,7 @@ class ResultsDatabase:
         action_contract_sha256: str,
         execution_scope_sha256: str,
         challenge_sha256: str,
-        approval_json: str,
+        authority_json: str,
         contract_json: str,
         owner_id: str,
         occurred_at: str,
@@ -899,22 +928,25 @@ class ResultsDatabase:
             raise DatabaseError("provider smoke reservation requires identities")
         try:
             parsed = json.loads(contract_json)
-            approval = json.loads(approval_json)
+            authority = json.loads(authority_json)
         except json.JSONDecodeError as exc:
-            raise DatabaseError("provider smoke contract or approval is not JSON") from exc
+            raise DatabaseError("provider smoke contract or authority is not JSON") from exc
         canonical = json.dumps(parsed, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
         if canonical != contract_json:
             raise DatabaseError("provider smoke contract must be canonical JSON")
         if (
-            json.dumps(approval, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
-            != approval_json
+            json.dumps(authority, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+            != authority_json
         ):
-            raise DatabaseError("provider smoke approval must be canonical JSON")
+            raise DatabaseError("provider smoke authority must be canonical JSON")
         try:
-            from lowbit_lab.provider_smoke import validate_approval, validate_contract
+            from lowbit_lab.provider_smoke import (
+                validate_contract,
+                validate_execution_authority,
+            )
 
             contract = validate_contract(parsed)
-            approval_digest = validate_approval(approval, contract, now=datetime.now(UTC))
+            approval_digest = validate_execution_authority(authority, contract)
         except ValueError as exc:
             raise DatabaseError(f"provider smoke authority is invalid: {exc}") from exc
         if (
@@ -943,22 +975,7 @@ class ResultsDatabase:
                 AND json_extract(contract_json, '$.approval_expires_at') <= ?""",
                 (reconciliation_time, reconciliation_time),
             )
-            committed = Decimal("0")
-            for row in connection.execute(
-                """SELECT status, requested_cost_usd, provider_actual_cost_usd
-                FROM budget_reservations WHERE status != 'released'"""
-            ):
-                value = (
-                    row["provider_actual_cost_usd"]
-                    if row["status"] in {"settled", "failed"}
-                    and row["provider_actual_cost_usd"] is not None
-                    else row["requested_cost_usd"]
-                )
-                committed += _database_money(value, "stored reservation cost")
-            for row in connection.execute(
-                "SELECT requested_cost_usd FROM provider_smoke_reservations"
-            ):
-                committed += _database_money(row[0], "stored smoke cost")
+            committed = _committed_provider_cost(connection)
             if committed + REFERENCE_RESERVATION_USD > REFERENCE_RESERVATION_USD:
                 raise DatabaseError("provider smoke reservation exceeds the local ledger")
             try:
@@ -1087,6 +1104,85 @@ class ResultsDatabase:
             failure_reason=reason[:2000],
         )
 
+    def mark_provider_smoke_prelaunch_audited(
+        self,
+        reservation_id: str,
+        *,
+        evidence_json: str,
+        evidence_sha256: str,
+        occurred_at: str,
+    ) -> None:
+        _database_sha256(evidence_sha256, "evidence_sha256")
+        _database_timestamp(occurred_at, "occurred_at")
+        try:
+            evidence = json.loads(evidence_json)
+        except json.JSONDecodeError as exc:
+            raise DatabaseError("provider smoke prelaunch evidence must be JSON") from exc
+        canonical = json.dumps(
+            evidence, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+        )
+        fields = {
+            "schema_version",
+            "kind",
+            "reservation_id",
+            "action_contract_sha256",
+            "execution_scope_sha256",
+            "provider_app_id",
+            "provider_environment",
+            "provider_app_state",
+            "provider_task_count",
+            "provider_container_count",
+            "provider_created_at",
+            "provider_stopped_at",
+            "provider_report_sha256",
+        }
+        if (
+            set(evidence) != fields
+            or evidence.get("schema_version") != 1
+            or evidence.get("kind") != "provider_smoke_prelaunch_audit"
+            or evidence.get("reservation_id") != reservation_id
+            or evidence.get("provider_environment") != "low-bit-lab"
+            or evidence.get("provider_app_state") != "stopped"
+            or evidence.get("provider_task_count") != 0
+            or evidence.get("provider_container_count") != 0
+            or not isinstance(evidence.get("provider_app_id"), str)
+            or not evidence["provider_app_id"].startswith("ap-")
+            or canonical != evidence_json
+            or hashlib.sha256(canonical.encode()).hexdigest() != evidence_sha256
+        ):
+            raise DatabaseError("provider smoke prelaunch evidence is invalid")
+        for field in (
+            "action_contract_sha256",
+            "execution_scope_sha256",
+            "provider_report_sha256",
+        ):
+            _database_sha256(evidence.get(field), field)
+        created = _database_timestamp(evidence.get("provider_created_at"), "provider_created_at")
+        stopped = _database_timestamp(evidence.get("provider_stopped_at"), "provider_stopped_at")
+        if stopped < created:
+            raise DatabaseError("provider smoke prelaunch timestamps are invalid")
+        _database_private_data_scan(evidence, path="provider_smoke_prelaunch_audit")
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """UPDATE provider_smoke_reservations
+                SET status = 'settlement_pending', observation_sha256 = ?,
+                    observation_json = ?, settlement_pending_at = ?, updated_at = ?
+                WHERE reservation_id = ? AND status = 'audit_blocked'
+                AND provider_call_id IS NULL AND action_contract_sha256 = ?
+                AND execution_scope_sha256 = ?""",
+                (
+                    evidence_sha256,
+                    evidence_json,
+                    evidence["provider_stopped_at"],
+                    occurred_at,
+                    reservation_id,
+                    evidence["action_contract_sha256"],
+                    evidence["execution_scope_sha256"],
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise DatabaseError("provider smoke prelaunch audit transition failed")
+
     def mark_provider_smoke_observed(
         self,
         reservation_id: str,
@@ -1144,19 +1240,22 @@ class ResultsDatabase:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
                 """SELECT status, requested_cost_usd, provider_call_id, contract_json,
-                    settlement_pending_at FROM provider_smoke_reservations
+                    observation_json, settlement_pending_at FROM provider_smoke_reservations
                 WHERE reservation_id = ?""",
                 (reservation_id,),
             ).fetchone()
             if row is None or row["status"] != "settlement_pending":
                 raise DatabaseError("provider smoke reservation cannot settle")
             contract = json.loads(row["contract_json"])
+            provider_identity = row["provider_call_id"]
+            if provider_identity is None and row["observation_json"] is not None:
+                provider_identity = json.loads(row["observation_json"]).get("provider_app_id")
             pending_at = _database_timestamp(row["settlement_pending_at"], "settlement_pending_at")
             complete_at = pending_at + timedelta(
                 seconds=contract["billing_completeness_delay_seconds"]
             )
             if (
-                report["provider_job_id"] != row["provider_call_id"]
+                report["provider_job_id"] != provider_identity
                 or report["billing_authority_sha256"] != contract["billing_authority_sha256"]
                 or report["authoritative_report_identity_sha256"]
                 != contract["authoritative_report_identity_sha256"]
@@ -2417,25 +2516,7 @@ class ResultsDatabase:
                         raise DatabaseError(
                             "released reference scope requires a new challenge and approval"
                         )
-            committed = Decimal("0")
-            for row in connection.execute(
-                """SELECT status, requested_cost_usd, provider_actual_cost_usd,
-                    reference_execution_scope_sha256
-                FROM budget_reservations
-                WHERE status != 'released'"""
-            ):
-                value = (
-                    row["provider_actual_cost_usd"]
-                    if row["reference_execution_scope_sha256"] is not None
-                    and row["status"] in {"settled", "failed"}
-                    and row["provider_actual_cost_usd"] is not None
-                    else row["requested_cost_usd"]
-                )
-                committed += _database_money(value, "stored reservation cost")
-            for row in connection.execute(
-                "SELECT requested_cost_usd FROM provider_smoke_reservations"
-            ):
-                committed += _database_money(row[0], "stored smoke cost")
+            committed = _committed_provider_cost(connection)
             if committed + requested > phase_cap or committed + requested > total_cap:
                 raise DatabaseError("reference reservation exceeds phase or total cap")
             registered = connection.execute(

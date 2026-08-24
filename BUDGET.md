@@ -7,7 +7,8 @@ The public scaffold authorizes USD 0 of cloud spend.
 A future positive budget requires explicit human approval, a target-specific controlling plan, matching changes to both policy representations, focused guard tests, and a report-only safety review. Credentials and billing details must not be committed.
 
 The public no-weight provider-smoke adapter does not change these zero defaults. Any future smoke
-execution requires a validated ignored ledger, a separate exact action approval, and an atomic local
-USD 4.00 reservation. That reservation is a local stop control, not a provider-enforced dollar cap;
-the approval must explicitly accept residual provider-managed execution risk. Code presence and a
-total ledger ceiling are not spend authority.
+execution requires a validated ignored ledger and campaign authority plus an atomic local
+reservation no larger than confirmed unspent campaign balance. The campaign has one cumulative
+lifetime USD 4.00 ceiling. Active and audit-blocked attempts retain requested cost; settled or
+failed attempts consume authoritative actual cost. These are local stop controls, not a
+provider-enforced dollar cap. Code presence and a total ledger ceiling are not spend authority.

@@ -163,7 +163,23 @@ class ReferenceBudgetGuard:
     }
 
     def __init__(self, policy_path: Path, *, expected_plan_sha256: str) -> None:
-        raw = json.loads(policy_path.read_text(encoding="utf-8"))
+        self._initialize(
+            json.loads(policy_path.read_text(encoding="utf-8")),
+            expected_plan_sha256=expected_plan_sha256,
+        )
+
+    @classmethod
+    def from_bytes(
+        cls, policy_bytes: bytes, *, expected_plan_sha256: str
+    ) -> ReferenceBudgetGuard:
+        guard = cls.__new__(cls)
+        guard._initialize(
+            json.loads(policy_bytes.decode("utf-8")),
+            expected_plan_sha256=expected_plan_sha256,
+        )
+        return guard
+
+    def _initialize(self, raw: object, *, expected_plan_sha256: str) -> None:
         if not isinstance(raw, dict) or set(raw) != self._FIELDS:
             raise BudgetError("reference budget policy schema is closed")
         if raw["schema_version"] != 1 or raw["kind"] != "reference_budget_authority":

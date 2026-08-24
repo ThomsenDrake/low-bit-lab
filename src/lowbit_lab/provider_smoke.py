@@ -21,8 +21,13 @@ from lowbit_lab.jsonio import emit
 
 ACTION_KIND = "modal_provider_smoke"
 ACTION_CAP_USD = "4.00"
-APPROVAL_KIND = "modal_provider_smoke_approval"
-IMPLEMENTATION_PLAN_SHA256 = "dd08a09dbdbd6e88f53a50de932fc15f933ee71d41a21f0f16ad28b68b402d61"
+CAMPAIGN_AUTHORITY_KIND = "modal_provider_smoke_campaign_authority"
+CAMPAIGN_STATEMENT_SHA256 = "d1d49e39a244b9308d77ae19e538c88cfa468bb271eb7d13d7b043362e77361a"
+CAMPAIGN_AUTHORITY_SHA256 = "dd3030287422a40b2dac30d6732cb848be39bae33ddebbd5f519281a5e1ade01"
+IMPLEMENTATION_PLAN_SHA256 = "64ad51dec6257987e15077564055cd40a4fbd09c96650c9d9acd0b2350a55807"
+IMPLEMENTATION_PLAN_PATH = Path(
+    "docs/plans/2026-08-24-2026-feat-autonomous-provider-smoke-campaign-plan.md"
+)
 SMOKE_RESOURCE_SPEC = {
     "gpu": "A100-80GB:1",
     "cpu_cores": 8,
@@ -57,6 +62,7 @@ class ProviderSmokeContract:
     schema_version: int
     kind: str
     implementation_plan_sha256: str
+    campaign_authority_sha256: str
     config_sha256: str
     challenge_sha256: str
     execution_scope_sha256: str
@@ -100,6 +106,7 @@ def build_contract(**values: Any) -> ProviderSmokeContract:
         "schema_version": 1,
         "kind": ACTION_KIND,
         "implementation_plan_sha256": IMPLEMENTATION_PLAN_SHA256,
+        "campaign_authority_sha256": CAMPAIGN_AUTHORITY_SHA256,
         **values,
         "maximum_cost_usd": ACTION_CAP_USD,
         "timeout_seconds": 2700,
@@ -122,6 +129,7 @@ def validate_contract(value: object) -> ProviderSmokeContract:
         raise ProviderSmokeError("unsupported provider smoke contract")
     for field in (
         "implementation_plan_sha256",
+        "campaign_authority_sha256",
         "config_sha256",
         "challenge_sha256",
         "execution_scope_sha256",
@@ -143,6 +151,7 @@ def validate_contract(value: object) -> ProviderSmokeContract:
         raise ProviderSmokeError("contract approval expiry is invalid") from exc
     if (
         value.get("implementation_plan_sha256") != IMPLEMENTATION_PLAN_SHA256
+        or value.get("campaign_authority_sha256") != CAMPAIGN_AUTHORITY_SHA256
         or value.get("maximum_cost_usd") != ACTION_CAP_USD
         or value.get("timeout_seconds") != 2700
         or value.get("resource_envelope_sha256") != SMOKE_RESOURCE_SHA256
@@ -167,6 +176,14 @@ def _validate_live_lineage(
     from lowbit_lab.modal_job import load_reference_job_config
     from lowbit_lab.runtime import runtime_metadata
 
+    try:
+        implementation_plan_sha256 = hashlib.sha256(
+            (root / IMPLEMENTATION_PLAN_PATH).read_bytes()
+        ).hexdigest()
+    except OSError as exc:
+        raise ProviderSmokeError(f"cannot read provider smoke implementation plan: {exc}") from exc
+    if implementation_plan_sha256 != IMPLEMENTATION_PLAN_SHA256:
+        raise ProviderSmokeError("provider smoke implementation plan has drifted")
     if config_path != Path("configs/local/reference.yaml"):
         raise ProviderSmokeError("provider smoke config path is fixed")
     config = load_reference_job_config(root / config_path, root=root)
@@ -239,74 +256,6 @@ def build_live_contract(
     return contract
 
 
-def approval_wording(contract: ProviderSmokeContract) -> str:
-    return (
-        "I approve one no-weight Modal provider smoke action for action contract SHA-256 "
-        f"{contract.action_contract_sha256}, execution scope {contract.execution_scope_sha256}, "
-        f"challenge {contract.challenge_sha256}, reviewed commit "
-        f"{contract.reviewed_commit_sha256}, environment scope "
-        f"{contract.environment_scope_sha256}, maximum authorized cost USD {ACTION_CAP_USD}, "
-        f"timeout {SMOKE_RESOURCE_SPEC['timeout_seconds']} seconds, one A100-80GB GPU, "
-        "no retries, no weights, no user payloads, no data or source mounts, "
-        "no secrets, no volumes, no scheduling, and U8 remains unauthorized. "
-        "Modal may receive only the audited function definition required for execution. "
-        "I understand that the local reservation is not a provider-enforced hard dollar cap "
-        "and accept residual provider-managed execution risk."
-    )
-
-
-def validate_approval(
-    value: object, contract: ProviderSmokeContract, *, now: datetime | None = None
-) -> str:
-    fields = {
-        "schema_version",
-        "kind",
-        "action_contract_sha256",
-        "statement_sha256",
-        "challenge_sha256",
-        "execution_scope_sha256",
-        "provider_environment",
-        "reviewed_commit_sha256",
-        "environment_scope_sha256",
-        "maximum_cost_usd",
-        "expires_at",
-        "weights_authorized",
-        "u8_authorized",
-    }
-    if not isinstance(value, dict) or set(value) != fields:
-        raise ProviderSmokeError("provider smoke approval schema is closed")
-    expected = {
-        "schema_version": 1,
-        "kind": APPROVAL_KIND,
-        "action_contract_sha256": contract.action_contract_sha256,
-        "statement_sha256": hashlib.sha256(approval_wording(contract).encode()).hexdigest(),
-        "challenge_sha256": contract.challenge_sha256,
-        "execution_scope_sha256": contract.execution_scope_sha256,
-        "provider_environment": contract.provider_environment,
-        "reviewed_commit_sha256": contract.reviewed_commit_sha256,
-        "environment_scope_sha256": contract.environment_scope_sha256,
-        "maximum_cost_usd": ACTION_CAP_USD,
-        "weights_authorized": False,
-        "u8_authorized": False,
-    }
-    if any(value.get(key) != item for key, item in expected.items()):
-        raise ProviderSmokeError("provider smoke approval does not match the action contract")
-    try:
-        expiry = datetime.fromisoformat(str(value["expires_at"]))
-        contract_expiry = datetime.fromisoformat(contract.approval_expires_at)
-    except ValueError as exc:
-        raise ProviderSmokeError("provider smoke approval expiry is invalid") from exc
-    current = now or datetime.now(UTC)
-    issued = datetime.fromisoformat(contract.approval_issued_at)
-    if issued > current:
-        raise ProviderSmokeError("provider smoke approval is not yet valid")
-    if expiry.tzinfo is None or expiry <= current:
-        raise ProviderSmokeError("provider smoke approval is expired")
-    if expiry != contract_expiry:
-        raise ProviderSmokeError("provider smoke approval expiry does not match the contract")
-    return sha256_json(value)
-
-
 def load_contract(path: Path) -> ProviderSmokeContract:
     try:
         return validate_contract(json.loads(path.read_text(encoding="utf-8")))
@@ -314,38 +263,78 @@ def load_contract(path: Path) -> ProviderSmokeContract:
         raise ProviderSmokeError(f"cannot read provider smoke contract: {exc}") from exc
 
 
-def _load_approval(path: Path) -> object:
+def _load_campaign_authority(path: Path) -> object:
     try:
         return json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
-        raise ProviderSmokeError(f"cannot read provider smoke approval: {exc}") from exc
+        raise ProviderSmokeError(f"cannot read provider smoke campaign authority: {exc}") from exc
+
+
+def validate_campaign_authority(value: object) -> str:
+    expected = {
+        "schema_version": 1,
+        "kind": CAMPAIGN_AUTHORITY_KIND,
+        "statement_sha256": CAMPAIGN_STATEMENT_SHA256,
+        "cumulative_lifetime_cap_usd": ACTION_CAP_USD,
+        "provider_environment": "low-bit-lab",
+        "gpu": SMOKE_RESOURCE_SPEC["gpu"],
+        "max_concurrent_containers": SMOKE_RESOURCE_SPEC["max_containers"],
+        "timeout_seconds": SMOKE_RESOURCE_SPEC["timeout_seconds"],
+        "provider_retries": SMOKE_RESOURCE_SPEC["retries"],
+        "application_retries": 0,
+        "weights_authorized": False,
+        "user_payloads_authorized": False,
+        "secrets_authorized": False,
+        "mounts_authorized": False,
+        "volumes_authorized": False,
+        "scheduling_authorized": False,
+        "destructive_cleanup_authorized": False,
+        "target_activation_authorized": False,
+        "u8_authorized": False,
+    }
+    if value != expected or sha256_json(value) != CAMPAIGN_AUTHORITY_SHA256:
+        raise ProviderSmokeError("provider smoke campaign authority is invalid")
+    return CAMPAIGN_AUTHORITY_SHA256
+
+
+def validate_execution_authority(value: object, contract: ProviderSmokeContract) -> str:
+    campaign_sha256 = validate_campaign_authority(value)
+    if contract.campaign_authority_sha256 != campaign_sha256:
+        raise ProviderSmokeError("provider smoke contract campaign authority mismatch")
+    return sha256_json(
+        {
+            "action_contract_sha256": contract.action_contract_sha256,
+            "campaign_authority_sha256": campaign_sha256,
+        }
+    )
 
 
 def execute(
     contract: ProviderSmokeContract,
-    approval_path: Path,
+    authority_path: Path,
     db_path: Path,
     ledger_path: Path,
     root: Path,
     config_path: Path,
 ) -> dict[str, Any]:
-    """Atomically consume approval and reserve the cap before importing the adapter."""
+    """Bind standing campaign authority and reserve the cap before importing the adapter."""
     if db_path != Path("results/local/reference.sqlite"):
         raise ProviderSmokeError("provider smoke database path is fixed")
     if ledger_path != Path("configs/local/reference-budget.json"):
         raise ProviderSmokeError("provider smoke ledger path is fixed")
-    if approval_path != Path("configs/local/provider-smoke-approval.json"):
-        raise ProviderSmokeError("provider smoke approval path is fixed")
+    if authority_path != Path("configs/local/provider-smoke-campaign-authority.json"):
+        raise ProviderSmokeError("provider smoke campaign authority path is fixed")
     root = root.resolve()
     _validate_live_lineage(contract, root=root, config_path=config_path)
     resolved_db_path = confine_results_db(root, db_path)
     resolved_ledger_path = root / ledger_path
-    approval = _load_approval(root / approval_path)
-    approval_digest = validate_approval(approval, contract)
+    authority = _load_campaign_authority(root / authority_path)
+    authority_digest = validate_execution_authority(authority, contract)
     try:
-        ledger_sha256 = hashlib.sha256(resolved_ledger_path.read_bytes()).hexdigest()
-        guard = ReferenceBudgetGuard(
-            resolved_ledger_path,
+        ledger_bytes = resolved_ledger_path.read_bytes()
+        ledger_sha256 = hashlib.sha256(ledger_bytes).hexdigest()
+        guard = ReferenceBudgetGuard.from_bytes(
+            ledger_bytes,
             expected_plan_sha256=contract.budget_authority_plan_sha256,
         )
         guard.preview(
@@ -368,7 +357,7 @@ def execute(
         action_contract_sha256=contract.action_contract_sha256,
         execution_scope_sha256=contract.execution_scope_sha256,
         challenge_sha256=contract.challenge_sha256,
-        approval_json=canonical_json(approval),
+        authority_json=canonical_json(authority),
         contract_json=canonical_json(asdict(contract)),
         owner_id=owner_id,
         occurred_at=occurred_at,
@@ -398,7 +387,7 @@ def execute(
                 occurred_at=datetime.now(UTC).isoformat(),
             )
         raise
-    return {"approval_digest": approval_digest, "result": result}
+    return {"campaign_execution_authority_digest": authority_digest, "result": result}
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -408,6 +397,7 @@ def _parser() -> argparse.ArgumentParser:
     contract_parser.add_argument("--root", type=Path, required=True)
     contract_parser.add_argument("--config", type=Path, required=True)
     contract_parser.add_argument("--ledger", type=Path, required=True)
+    contract_parser.add_argument("--authority", type=Path, required=True)
     contract_parser.add_argument("--issued-at", required=True)
     contract_parser.add_argument("--expires-at", required=True)
     settle_parser = sub.add_parser("settle")
@@ -415,14 +405,19 @@ def _parser() -> argparse.ArgumentParser:
     settle_parser.add_argument("--db", type=Path, required=True)
     settle_parser.add_argument("--report", type=Path, required=True)
     settle_parser.add_argument("--reservation-id", required=True)
+    audit_parser = sub.add_parser("audit-prelaunch")
+    audit_parser.add_argument("--root", type=Path, required=True)
+    audit_parser.add_argument("--db", type=Path, required=True)
+    audit_parser.add_argument("--evidence", type=Path, required=True)
+    audit_parser.add_argument("--reservation-id", required=True)
     plan = sub.add_parser("plan")
     plan.add_argument("--contract", type=Path, required=True)
     verify = sub.add_parser("verify")
     verify.add_argument("--contract", type=Path, required=True)
-    verify.add_argument("--approval", type=Path, required=True)
+    verify.add_argument("--authority", type=Path, required=True)
     execute_parser = sub.add_parser("execute")
     execute_parser.add_argument("--contract", type=Path, required=True)
-    execute_parser.add_argument("--approval", type=Path, required=True)
+    execute_parser.add_argument("--authority", type=Path, required=True)
     execute_parser.add_argument("--db", type=Path, required=True)
     execute_parser.add_argument("--ledger", type=Path, required=True)
     execute_parser.add_argument("--confirm-scope", required=True)
@@ -436,6 +431,31 @@ def main(argv: list[str] | None = None) -> int:
     try:
         args = _parser().parse_args(argv)
         command = args.command
+        if args.command == "audit-prelaunch":
+            if args.db != Path("results/local/reference.sqlite") or args.evidence != Path(
+                "reports/local/provider-smoke-prelaunch-audit.json"
+            ):
+                raise ProviderSmokeError("provider smoke prelaunch audit paths are fixed")
+            root = args.root.resolve()
+            db_path = confine_results_db(root, args.db)
+            evidence = json.loads((root / args.evidence).read_text(encoding="utf-8"))
+            evidence_json = canonical_json(evidence)
+            database = ResultsDatabase(db_path)
+            database.mark_provider_smoke_prelaunch_audited(
+                args.reservation_id,
+                evidence_json=evidence_json,
+                evidence_sha256=sha256_json(evidence),
+                occurred_at=datetime.now(UTC).isoformat(),
+            )
+            emit(
+                {
+                    "ok": True,
+                    "command": "audit-prelaunch",
+                    "provider_contacted": False,
+                    "status": "settlement_pending",
+                }
+            )
+            return 0
         if args.command == "settle":
             if args.db != Path("results/local/reference.sqlite") or args.report != Path(
                 "reports/local/provider-smoke-billing.json"
@@ -443,13 +463,13 @@ def main(argv: list[str] | None = None) -> int:
                 raise ProviderSmokeError("provider smoke settlement paths are fixed")
             root = args.root.resolve()
             db_path = confine_results_db(root, args.db)
-            report_bytes = (root / args.report).read_bytes()
-            report_json = report_bytes.decode("utf-8")
+            report = json.loads((root / args.report).read_text(encoding="utf-8"))
+            report_json = canonical_json(report)
             database = ResultsDatabase(db_path)
             settlement = database.settle_provider_smoke(
                 args.reservation_id,
                 billing_report_json=report_json,
-                billing_report_sha256=hashlib.sha256(report_bytes).hexdigest(),
+                billing_report_sha256=sha256_json(report),
                 occurred_at=datetime.now(UTC).isoformat(),
             )
             emit(
@@ -462,6 +482,11 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 0
         if args.command == "contract":
+            if args.authority != Path("configs/local/provider-smoke-campaign-authority.json"):
+                raise ProviderSmokeError("provider smoke campaign authority path is fixed")
+            validate_campaign_authority(
+                _load_campaign_authority(args.root.resolve() / args.authority)
+            )
             contract = build_live_contract(
                 root=args.root,
                 config_path=args.config,
@@ -477,13 +502,13 @@ def main(argv: list[str] | None = None) -> int:
             "command": args.command,
             "action_contract_sha256": contract.action_contract_sha256,
             "maximum_cost_usd": ACTION_CAP_USD,
-            "approval_wording": approval_wording(contract),
+            "campaign_authority_sha256": contract.campaign_authority_sha256,
             "approval_expires_at": contract.approval_expires_at,
             "execution_scope_sha256": contract.execution_scope_sha256,
             "exact_execute_command": (
                 "uv run --extra remote lowbit-paid-smoke execute "
                 "--contract configs/local/provider-smoke-contract.json "
-                "--approval configs/local/provider-smoke-approval.json "
+                "--authority configs/local/provider-smoke-campaign-authority.json "
                 "--db results/local/reference.sqlite "
                 "--ledger configs/local/reference-budget.json "
                 "--root . --config configs/local/reference.yaml "
@@ -493,14 +518,16 @@ def main(argv: list[str] | None = None) -> int:
             "provider_contacted": False,
         }
         if args.command == "verify":
-            result["approval_digest"] = validate_approval(_load_approval(args.approval), contract)
+            result["campaign_execution_authority_digest"] = validate_execution_authority(
+                _load_campaign_authority(args.authority), contract
+            )
         if args.command == "execute":
             if args.confirm_scope != contract.execution_scope_sha256:
                 raise ProviderSmokeError("--confirm-scope must match the exact execution scope")
             result.update(
                 execute(
                     contract,
-                    args.approval,
+                    args.authority,
                     args.db,
                     args.ledger,
                     args.root,

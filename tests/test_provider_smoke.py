@@ -12,17 +12,19 @@ import pytest
 from lowbit_lab.db import DatabaseError, ResultsDatabase
 from lowbit_lab.modal_adapter import submit_provider_smoke
 from lowbit_lab.provider_smoke import (
-    ACTION_CAP_USD,
+    CAMPAIGN_AUTHORITY_KIND,
+    CAMPAIGN_AUTHORITY_SHA256,
+    CAMPAIGN_STATEMENT_SHA256,
+    IMPLEMENTATION_PLAN_PATH,
     SMOKE_RESOURCE_SHA256,
     SMOKE_RESOURCE_SPEC,
     ProviderSmokeCapability,
     ProviderSmokeError,
     _validate_live_lineage,
-    approval_wording,
     build_contract,
     execute,
     main,
-    validate_approval,
+    validate_campaign_authority,
     validate_contract,
 )
 
@@ -36,12 +38,13 @@ def test_smoke_requests_modal_minimum_ephemeral_disk() -> None:
 def _contract(
     *,
     ledger_sha256: str = "a" * 64,
+    challenge_sha256: str = "2" * 64,
     issued_at: datetime | None = None,
     expires_at: datetime | None = None,
 ):
     return build_contract(
         config_sha256="1" * 64,
-        challenge_sha256="2" * 64,
+        challenge_sha256=challenge_sha256,
         reviewed_commit_sha256="4" * 40,
         control_plane_sha256="5" * 64,
         environment_scope_sha256="6" * 64,
@@ -58,22 +61,26 @@ def _contract(
     )
 
 
-def _approval(contract):
-    import hashlib
-
+def _campaign_authority():
     return {
         "schema_version": 1,
-        "kind": "modal_provider_smoke_approval",
-        "action_contract_sha256": contract.action_contract_sha256,
-        "statement_sha256": hashlib.sha256(approval_wording(contract).encode()).hexdigest(),
-        "challenge_sha256": contract.challenge_sha256,
-        "execution_scope_sha256": contract.execution_scope_sha256,
-        "provider_environment": contract.provider_environment,
-        "reviewed_commit_sha256": contract.reviewed_commit_sha256,
-        "environment_scope_sha256": contract.environment_scope_sha256,
-        "maximum_cost_usd": ACTION_CAP_USD,
-        "expires_at": contract.approval_expires_at,
+        "kind": CAMPAIGN_AUTHORITY_KIND,
+        "statement_sha256": CAMPAIGN_STATEMENT_SHA256,
+        "cumulative_lifetime_cap_usd": "4.00",
+        "provider_environment": "low-bit-lab",
+        "gpu": "A100-80GB:1",
+        "max_concurrent_containers": 1,
+        "timeout_seconds": 2700,
+        "provider_retries": 0,
+        "application_retries": 0,
         "weights_authorized": False,
+        "user_payloads_authorized": False,
+        "secrets_authorized": False,
+        "mounts_authorized": False,
+        "volumes_authorized": False,
+        "scheduling_authorized": False,
+        "destructive_cleanup_authorized": False,
+        "target_activation_authorized": False,
         "u8_authorized": False,
     }
 
@@ -91,30 +98,12 @@ def test_contract_is_closed_and_binds_every_field() -> None:
         validate_contract(changed)
 
 
-def test_approval_is_exact_expiring_and_scope_bound() -> None:
-    contract = _contract()
-    approval = _approval(contract)
-    now = TEST_NOW
-    assert len(validate_approval(approval, contract, now=now)) == 64
-    approval["execution_scope_sha256"] = "b" * 64
-    with pytest.raises(ProviderSmokeError, match="does not match"):
-        validate_approval(approval, contract, now=now)
-    approval = _approval(contract)
-    with pytest.raises(ProviderSmokeError, match="expired"):
-        validate_approval(approval, contract, now=now + timedelta(days=2))
-    future_contract = _contract(
-        issued_at=now + timedelta(minutes=1),
-        expires_at=now + timedelta(minutes=20),
-    )
-    with pytest.raises(ProviderSmokeError, match="not yet valid"):
-        validate_approval(_approval(future_contract), future_contract, now=now)
-
-
-def test_approval_accepts_equivalent_utc_timestamp_spellings() -> None:
-    contract = _contract()
-    value = _approval(contract)
-    value["expires_at"] = value["expires_at"].replace("+00:00", "Z")
-    assert len(validate_approval(value, contract, now=TEST_NOW)) == 64
+def test_campaign_authority_is_exact_closed_and_reusable() -> None:
+    authority = _campaign_authority()
+    assert validate_campaign_authority(authority) == CAMPAIGN_AUTHORITY_SHA256
+    authority["weights_authorized"] = True
+    with pytest.raises(ProviderSmokeError, match="campaign authority"):
+        validate_campaign_authority(authority)
 
 
 def test_cli_validation_failure_emits_json_to_stderr(tmp_path: Path, capsys) -> None:
@@ -129,7 +118,7 @@ def test_cli_validation_failure_emits_json_to_stderr(tmp_path: Path, capsys) -> 
                 "verify",
                 "--contract",
                 str(contract_path),
-                "--approval",
+                "--authority",
                 str(approval_path),
             ]
         )
@@ -166,7 +155,9 @@ def test_smoke_reservation_is_atomic_exact_and_replay_safe(tmp_path: Path) -> No
         "action_contract_sha256": contract.action_contract_sha256,
         "execution_scope_sha256": contract.execution_scope_sha256,
         "challenge_sha256": contract.challenge_sha256,
-        "approval_json": json.dumps(_approval(contract), sort_keys=True, separators=(",", ":")),
+        "authority_json": json.dumps(
+            _campaign_authority(), sort_keys=True, separators=(",", ":")
+        ),
         "contract_json": json.dumps(asdict(contract), sort_keys=True, separators=(",", ":")),
         "owner_id": "owner-1",
         "occurred_at": "2026-08-23T12:00:00+00:00",
@@ -190,7 +181,9 @@ def test_ambiguous_provider_start_is_audit_blocked(tmp_path: Path) -> None:
         action_contract_sha256=contract.action_contract_sha256,
         execution_scope_sha256=contract.execution_scope_sha256,
         challenge_sha256=contract.challenge_sha256,
-        approval_json=json.dumps(_approval(contract), sort_keys=True, separators=(",", ":")),
+        authority_json=json.dumps(
+            _campaign_authority(), sort_keys=True, separators=(",", ":")
+        ),
         contract_json=json.dumps(asdict(contract), sort_keys=True, separators=(",", ":")),
         owner_id="owner-1",
         occurred_at="2026-08-23T12:00:00+00:00",
@@ -220,7 +213,9 @@ def test_submission_capability_is_one_shot(tmp_path: Path) -> None:
         action_contract_sha256=contract.action_contract_sha256,
         execution_scope_sha256=contract.execution_scope_sha256,
         challenge_sha256=contract.challenge_sha256,
-        approval_json=json.dumps(_approval(contract), sort_keys=True, separators=(",", ":")),
+        authority_json=json.dumps(
+            _campaign_authority(), sort_keys=True, separators=(",", ":")
+        ),
         contract_json=json.dumps(asdict(contract), sort_keys=True, separators=(",", ":")),
         owner_id="owner-1",
         occurred_at="2026-08-23T12:00:00+00:00",
@@ -253,7 +248,9 @@ def test_real_modal_sdk_constructs_adapter_without_provider_contact(
         action_contract_sha256=contract.action_contract_sha256,
         execution_scope_sha256=contract.execution_scope_sha256,
         challenge_sha256=contract.challenge_sha256,
-        approval_json=json.dumps(_approval(contract), sort_keys=True, separators=(",", ":")),
+        authority_json=json.dumps(
+            _campaign_authority(), sort_keys=True, separators=(",", ":")
+        ),
         contract_json=json.dumps(asdict(contract), sort_keys=True, separators=(",", ":")),
         owner_id="owner-sdk",
         occurred_at="2026-08-23T12:00:00+00:00",
@@ -327,8 +324,8 @@ def test_execute_with_fake_boundary_consumes_one_reservation(
         encoding="utf-8",
     )
     contract = _contract(ledger_sha256=hashlib.sha256(ledger_path.read_bytes()).hexdigest())
-    approval_path = tmp_path / "configs/local/provider-smoke-approval.json"
-    approval_path.write_text(json.dumps(_approval(contract)), encoding="utf-8")
+    approval_path = tmp_path / "configs/local/provider-smoke-campaign-authority.json"
+    approval_path.write_text(json.dumps(_campaign_authority()), encoding="utf-8")
     database_path = Path("results/local/reference.sqlite")
     calls = 0
 
@@ -366,7 +363,7 @@ def test_execute_with_fake_boundary_consumes_one_reservation(
     monkeypatch.setattr("lowbit_lab.provider_smoke._validate_live_lineage", lambda *a, **k: None)
     result = execute(
         contract,
-        Path("configs/local/provider-smoke-approval.json"),
+        Path("configs/local/provider-smoke-campaign-authority.json"),
         database_path,
         Path("configs/local/reference-budget.json"),
         tmp_path,
@@ -407,6 +404,9 @@ def test_live_lineage_accepts_exact_state_and_rejects_drift(
         "git_commit": contract.reviewed_commit_sha256,
         "control_plane_sha256": contract.control_plane_sha256,
     }
+    plan_path = tmp_path / IMPLEMENTATION_PLAN_PATH
+    plan_path.parent.mkdir(parents=True)
+    plan_path.write_bytes((Path.cwd() / IMPLEMENTATION_PLAN_PATH).read_bytes())
     monkeypatch.setattr("lowbit_lab.modal_job.load_reference_job_config", lambda *a, **k: config)
     monkeypatch.setattr("lowbit_lab.runtime.runtime_metadata", lambda *a, **k: runtime)
     _validate_live_lineage(
@@ -429,6 +429,12 @@ def test_live_lineage_accepts_exact_state_and_rejects_drift(
         _validate_live_lineage(
             contract, root=tmp_path, config_path=Path("configs/local/reference.yaml")
         )
+    runtime["control_plane_sha256"] = contract.control_plane_sha256
+    plan_path.write_text("drift", encoding="utf-8")
+    with pytest.raises(ProviderSmokeError, match="implementation plan has drifted"):
+        _validate_live_lineage(
+            contract, root=tmp_path, config_path=Path("configs/local/reference.yaml")
+        )
 
 
 def _settlement_ready_database(path: Path) -> tuple[ResultsDatabase, object]:
@@ -443,7 +449,9 @@ def _settlement_ready_database(path: Path) -> tuple[ResultsDatabase, object]:
         action_contract_sha256=contract.action_contract_sha256,
         execution_scope_sha256=contract.execution_scope_sha256,
         challenge_sha256=contract.challenge_sha256,
-        approval_json=json.dumps(_approval(contract), sort_keys=True, separators=(",", ":")),
+        authority_json=json.dumps(
+            _campaign_authority(), sort_keys=True, separators=(",", ":")
+        ),
         contract_json=contract_json,
         owner_id="owner-settlement",
         occurred_at="2026-08-23T12:00:00+00:00",
@@ -478,12 +486,18 @@ def _settlement_ready_database(path: Path) -> tuple[ResultsDatabase, object]:
     return database, contract
 
 
-def _billing_report(contract, *, authority: str | None = None, cost: str = "3.75") -> str:
+def _billing_report(
+    contract,
+    *,
+    authority: str | None = None,
+    cost: str = "3.75",
+    provider_job_id: str = "provider-call-1",
+) -> str:
     return json.dumps(
         {
             "schema_version": 1,
             "kind": "provider_billing_report_receipt",
-            "provider_job_id": "provider-call-1",
+            "provider_job_id": provider_job_id,
             "billing_authority_sha256": authority or contract.billing_authority_sha256,
             "authoritative_report_identity_sha256": (contract.authoritative_report_identity_sha256),
             "covered_through": TEST_NOW.isoformat(),
@@ -583,6 +597,141 @@ def test_provider_smoke_over_cap_settlement_fails_closed(tmp_path: Path) -> None
         "4.01",
         "provider_actual_cost_exceeded_local_reservation",
     )
+
+
+def test_prelaunch_audit_binds_stopped_app_without_inventing_call_id(tmp_path: Path) -> None:
+    import hashlib
+
+    database = ResultsDatabase(tmp_path / "results.sqlite")
+    database.initialize()
+    contract = _contract()
+    database.reserve_provider_smoke(
+        reservation_id="reservation-prelaunch",
+        action_contract_sha256=contract.action_contract_sha256,
+        execution_scope_sha256=contract.execution_scope_sha256,
+        challenge_sha256=contract.challenge_sha256,
+        authority_json=json.dumps(
+            _campaign_authority(), sort_keys=True, separators=(",", ":")
+        ),
+        contract_json=json.dumps(asdict(contract), sort_keys=True, separators=(",", ":")),
+        owner_id="owner-prelaunch",
+        occurred_at=(TEST_NOW - timedelta(hours=3)).isoformat(),
+    )
+    database.mark_provider_smoke_submission_pending(
+        "reservation-prelaunch",
+        owner_id="owner-prelaunch",
+        occurred_at=(TEST_NOW - timedelta(hours=3)).isoformat(),
+    )
+    database.claim_provider_smoke_submission(
+        reservation_id="reservation-prelaunch",
+        owner_id="owner-prelaunch",
+        action_contract_sha256=contract.action_contract_sha256,
+        execution_scope_sha256=contract.execution_scope_sha256,
+        provider_environment="low-bit-lab",
+        occurred_at=(TEST_NOW - timedelta(hours=3)).isoformat(),
+    )
+    database.mark_provider_smoke_audit_blocked(
+        "reservation-prelaunch",
+        owner_id="owner-prelaunch",
+        reason="provider rejected function resources",
+        occurred_at=(TEST_NOW - timedelta(hours=2)).isoformat(),
+        from_status="submission_claimed",
+    )
+    evidence = {
+        "schema_version": 1,
+        "kind": "provider_smoke_prelaunch_audit",
+        "reservation_id": "reservation-prelaunch",
+        "action_contract_sha256": contract.action_contract_sha256,
+        "execution_scope_sha256": contract.execution_scope_sha256,
+        "provider_app_id": "ap-prelaunch",
+        "provider_environment": "low-bit-lab",
+        "provider_app_state": "stopped",
+        "provider_task_count": 0,
+        "provider_container_count": 0,
+        "provider_created_at": (TEST_NOW - timedelta(hours=2)).isoformat(),
+        "provider_stopped_at": (TEST_NOW - timedelta(hours=2)).isoformat(),
+        "provider_report_sha256": "e" * 64,
+    }
+    evidence_json = json.dumps(evidence, sort_keys=True, separators=(",", ":"))
+    database.mark_provider_smoke_prelaunch_audited(
+        "reservation-prelaunch",
+        evidence_json=evidence_json,
+        evidence_sha256=hashlib.sha256(evidence_json.encode()).hexdigest(),
+        occurred_at=(TEST_NOW - timedelta(hours=1)).isoformat(),
+    )
+    with database.connect_readonly() as connection:
+        row = connection.execute(
+            "SELECT status, provider_call_id FROM provider_smoke_reservations"
+        ).fetchone()
+    assert tuple(row) == ("settlement_pending", None)
+    report = _billing_report(contract, cost="0.00", provider_job_id="ap-prelaunch")
+    assert database.settle_provider_smoke(
+        "reservation-prelaunch",
+        billing_report_json=report,
+        billing_report_sha256=hashlib.sha256(report.encode()).hexdigest(),
+        occurred_at=TEST_NOW.isoformat(),
+    ) == {"status": "settled", "provider_actual_cost_usd": "0.00"}
+
+
+def test_zero_cost_settlement_restores_campaign_balance(tmp_path: Path) -> None:
+    import hashlib
+
+    database, contract = _settlement_ready_database(tmp_path / "results.sqlite")
+    report = _billing_report(contract, cost="0.00")
+    database.settle_provider_smoke(
+        "reservation-settlement",
+        billing_report_json=report,
+        billing_report_sha256=hashlib.sha256(report.encode()).hexdigest(),
+        occurred_at=TEST_NOW.isoformat(),
+    )
+    second = _contract(
+        challenge_sha256="3" * 64,
+        issued_at=TEST_NOW - timedelta(minutes=4),
+        expires_at=TEST_NOW + timedelta(minutes=26),
+    )
+    database.reserve_provider_smoke(
+        reservation_id="reservation-second",
+        action_contract_sha256=second.action_contract_sha256,
+        execution_scope_sha256=second.execution_scope_sha256,
+        challenge_sha256=second.challenge_sha256,
+        authority_json=json.dumps(
+            _campaign_authority(), sort_keys=True, separators=(",", ":")
+        ),
+        contract_json=json.dumps(asdict(second), sort_keys=True, separators=(",", ":")),
+        owner_id="owner-second",
+        occurred_at=TEST_NOW.isoformat(),
+    )
+
+
+def test_partial_cost_blocks_a_full_safe_reservation(tmp_path: Path) -> None:
+    import hashlib
+
+    database, contract = _settlement_ready_database(tmp_path / "results.sqlite")
+    report = _billing_report(contract, cost="0.01")
+    database.settle_provider_smoke(
+        "reservation-settlement",
+        billing_report_json=report,
+        billing_report_sha256=hashlib.sha256(report.encode()).hexdigest(),
+        occurred_at=TEST_NOW.isoformat(),
+    )
+    second = _contract(
+        challenge_sha256="3" * 64,
+        issued_at=TEST_NOW - timedelta(minutes=4),
+        expires_at=TEST_NOW + timedelta(minutes=26),
+    )
+    with pytest.raises(DatabaseError, match="exceeds the local ledger"):
+        database.reserve_provider_smoke(
+            reservation_id="reservation-second",
+            action_contract_sha256=second.action_contract_sha256,
+            execution_scope_sha256=second.execution_scope_sha256,
+            challenge_sha256=second.challenge_sha256,
+            authority_json=json.dumps(
+                _campaign_authority(), sort_keys=True, separators=(",", ":")
+            ),
+            contract_json=json.dumps(asdict(second), sort_keys=True, separators=(",", ":")),
+            owner_id="owner-second",
+            occurred_at=TEST_NOW.isoformat(),
+        )
 
 
 def test_provider_smoke_settlement_rejects_symlinked_results_escape(tmp_path: Path, capsys) -> None:
