@@ -292,6 +292,7 @@ def validate_approval(
         raise ProviderSmokeError("provider smoke approval does not match the action contract")
     try:
         expiry = datetime.fromisoformat(str(value["expires_at"]))
+        contract_expiry = datetime.fromisoformat(contract.approval_expires_at)
     except ValueError as exc:
         raise ProviderSmokeError("provider smoke approval expiry is invalid") from exc
     current = now or datetime.now(UTC)
@@ -300,7 +301,7 @@ def validate_approval(
         raise ProviderSmokeError("provider smoke approval is not yet valid")
     if expiry.tzinfo is None or expiry <= current:
         raise ProviderSmokeError("provider smoke approval is expired")
-    if expiry.isoformat() != contract.approval_expires_at:
+    if expiry != contract_expiry:
         raise ProviderSmokeError("provider smoke approval expiry does not match the contract")
     return sha256_json(value)
 

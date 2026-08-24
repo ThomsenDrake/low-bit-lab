@@ -102,6 +102,12 @@ identity is known and a failure after it is known are both audit-blocking; neith
 replay the scope. This separates provider contact from provider completion without inventing a job
 identity during an ambiguous start.
 
+Arm every mutable local authority before hashing the paid-action contract. Flipping an authorization
+flag after approval changes the ledger digest and invalidates the scope. Treat timezone spellings as
+semantic instants at validation boundaries: `Z` and `+00:00` are equivalent UTC representations even
+though their strings differ. Exercise the actual CLI failure path before paid use; a fail-closed
+validator is incomplete if its error reporter raises a second exception and hides the gate result.
+
 ## Why This Matters
 
 These invariants make silent policy drift, config mutation, preflight failure loss, and concurrent overspend observable or impossible. They also let later agents resume from durable state without inheriting hidden judgment from an earlier session.

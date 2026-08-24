@@ -105,6 +105,34 @@ def test_approval_is_exact_expiring_and_scope_bound() -> None:
         validate_approval(_approval(future_contract), future_contract, now=now)
 
 
+def test_approval_accepts_equivalent_utc_timestamp_spellings() -> None:
+    contract = _contract()
+    value = _approval(contract)
+    value["expires_at"] = value["expires_at"].replace("+00:00", "Z")
+    assert len(validate_approval(value, contract, now=TEST_NOW)) == 64
+
+
+def test_cli_validation_failure_emits_json_to_stderr(tmp_path: Path, capsys) -> None:
+    contract = _contract()
+    contract_path = tmp_path / "contract.json"
+    approval_path = tmp_path / "approval.json"
+    contract_path.write_text(json.dumps(asdict(contract)), encoding="utf-8")
+    approval_path.write_text("{}", encoding="utf-8")
+    assert (
+        main(
+            [
+                "verify",
+                "--contract",
+                str(contract_path),
+                "--approval",
+                str(approval_path),
+            ]
+        )
+        == 2
+    )
+    assert json.loads(capsys.readouterr().err)["ok"] is False
+
+
 def test_adapter_has_no_model_or_payload_surface_and_fails_before_modal_import(
     tmp_path: Path,
 ) -> None:
