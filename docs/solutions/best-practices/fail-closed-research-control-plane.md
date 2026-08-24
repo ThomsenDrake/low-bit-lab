@@ -1,7 +1,7 @@
 ---
 title: Fail-closed boundaries for a research control plane
 date: 2026-08-21
-last_updated: 2026-08-23
+last_updated: 2026-08-24
 category: best-practices
 module: experiment-control-plane
 problem_type: best_practice
@@ -107,6 +107,14 @@ flag after approval changes the ledger digest and invalidates the scope. Treat t
 semantic instants at validation boundaries: `Z` and `+00:00` are equivalent UTC representations even
 though their strings differ. Exercise the actual CLI failure path before paid use; a fail-closed
 validator is incomplete if its error reporter raises a second exception and hides the gate result.
+
+Bind provider resource defaults as carefully as explicit limits. Modal's default ephemeral disk is
+512 GiB and its API rejects smaller explicit requests, so a locally plausible 90 GiB request can
+create a stopped app record without launching a task. Encode the provider minimum in the hashed
+resource envelope, test it locally, and treat any app created before a call identity is persisted as
+audit-blocked until delayed billing evidence resolves the attempt. A stopped app with zero tasks and
+zero containers is strong execution evidence, but it is not a substitute for the declared billing
+authority when settling reserved cost.
 
 ## Why This Matters
 

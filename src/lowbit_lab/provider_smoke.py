@@ -27,7 +27,8 @@ SMOKE_RESOURCE_SPEC = {
     "gpu": "A100-80GB:1",
     "cpu_cores": 8,
     "memory_mib": 96 * 1024,
-    "ephemeral_disk_mib": 90 * 1024,
+    # Modal's per-container disk quota defaults to, and cannot be requested below, 512 GiB.
+    "ephemeral_disk_mib": 512 * 1024,
     "timeout_seconds": 2700,
     "retries": 0,
     "max_containers": 1,

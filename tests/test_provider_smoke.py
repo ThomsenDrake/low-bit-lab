@@ -14,6 +14,7 @@ from lowbit_lab.modal_adapter import submit_provider_smoke
 from lowbit_lab.provider_smoke import (
     ACTION_CAP_USD,
     SMOKE_RESOURCE_SHA256,
+    SMOKE_RESOURCE_SPEC,
     ProviderSmokeCapability,
     ProviderSmokeError,
     _validate_live_lineage,
@@ -26,6 +27,10 @@ from lowbit_lab.provider_smoke import (
 )
 
 TEST_NOW = datetime.now(UTC)
+
+
+def test_smoke_requests_modal_minimum_ephemeral_disk() -> None:
+    assert SMOKE_RESOURCE_SPEC["ephemeral_disk_mib"] == 512 * 1024
 
 
 def _contract(
