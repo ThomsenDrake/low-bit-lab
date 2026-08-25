@@ -10,6 +10,8 @@ from typing import Any
 from lowbit_lab.constants import (
     REFERENCE_AUTHORITY_SHA256,
     REFERENCE_AUTHORITY_STATEMENT_SHA256,
+    REFERENCE_CUMULATIVE_CAP_USD,
+    REFERENCE_INCREMENTAL_CAP_USD,
 )
 from lowbit_lab.handoff import sha256_json
 
@@ -56,8 +58,8 @@ def _expected_authority() -> dict[str, Any]:
         },
         "action_classes": list(ACTION_CLASSES),
         "u8_slots": 1,
-        "incremental_u8_cap_usd": "4.00",
-        "cumulative_lab_cap_usd": "4.00270969",
+        "incremental_u8_cap_usd": str(REFERENCE_INCREMENTAL_CAP_USD),
+        "cumulative_lab_cap_usd": str(REFERENCE_CUMULATIVE_CAP_USD),
         "gpu": "A100-80GB:1",
         "max_concurrent_containers": 1,
         "timeout_seconds": 2700,
@@ -78,17 +80,46 @@ def _read(path: Path, label: str) -> bytes:
     try:
         return path.read_bytes()
     except OSError as exc:
-        raise ReferenceAuthorityError(f"cannot read {label}: {exc}") from exc
+        raise ReferenceAuthorityError(f"cannot read {label}") from exc
+
+
+def _confined_path(root: Path, relative_path: Path, label: str) -> Path:
+    if relative_path.is_absolute() or ".." in relative_path.parts:
+        raise ReferenceAuthorityError(f"{label} path is not repository-relative")
+    resolved = (root / relative_path).resolve()
+    if not resolved.is_relative_to(root):
+        raise ReferenceAuthorityError(f"{label} resolves outside repository")
+    return resolved
+
+
+def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ReferenceAuthorityError("reference authority contains duplicate keys")
+        value[key] = item
+    return value
 
 
 def validate_reference_authority(root: Path, authority_path: Path = AUTHORITY_PATH) -> str:
     """Validate exact statement, plan bytes, and the closed semantic authority."""
-    root = root.resolve()
-    resolved_authority = authority_path if authority_path.is_absolute() else root / authority_path
-    if resolved_authority.resolve() != (root / AUTHORITY_PATH).resolve():
+    try:
+        root = root.resolve(strict=True)
+    except OSError as exc:
+        raise ReferenceAuthorityError("reference authority repository root is unavailable") from exc
+    expected_authority = _confined_path(root, AUTHORITY_PATH, "reference authority")
+    resolved_authority = (
+        authority_path.resolve()
+        if authority_path.is_absolute()
+        else (root / authority_path).resolve()
+    )
+    if resolved_authority != expected_authority:
         raise ReferenceAuthorityError("reference authority path is fixed")
 
-    statement = _read(root / STATEMENT_PATH, "reference authority statement")
+    statement = _read(
+        _confined_path(root, STATEMENT_PATH, "reference authority statement"),
+        "reference authority statement",
+    )
     if (
         statement.startswith(b"\xef\xbb\xbf")
         or statement.endswith((b"\r", b"\n"))
@@ -102,18 +133,28 @@ def validate_reference_authority(root: Path, authority_path: Path = AUTHORITY_PA
 
     for _, (relative_path, expected_digest) in CONTROLLING_PLANS.items():
         actual_digest = hashlib.sha256(
-            _read(root / relative_path, "controlling plan")
+            _read(_confined_path(root, relative_path, "controlling plan"), "controlling plan")
         ).hexdigest()
         if actual_digest != expected_digest:
             raise ReferenceAuthorityError(
                 f"controlling plan has drifted: {relative_path.as_posix()}"
             )
 
+    authority_bytes = _read(resolved_authority, "reference authority")
     try:
-        authority = json.loads(_read(resolved_authority, "reference authority"))
+        authority = json.loads(
+            authority_bytes.decode("utf-8", errors="strict"),
+            object_pairs_hook=_reject_duplicate_keys,
+        )
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ReferenceAuthorityError("reference authority is not valid UTF-8 JSON") from exc
-    if authority != _expected_authority() or sha256_json(authority) != REFERENCE_AUTHORITY_SHA256:
+    expected = _expected_authority()
+    canonical_bytes = (
+        json.dumps(expected, sort_keys=True, separators=(",", ":"), ensure_ascii=True) + "\n"
+    ).encode("utf-8")
+    if authority_bytes != canonical_bytes:
+        raise ReferenceAuthorityError("reference authority raw bytes are not canonical")
+    if authority != expected or sha256_json(authority) != REFERENCE_AUTHORITY_SHA256:
         raise ReferenceAuthorityError("reference authority boundary has drifted")
     return REFERENCE_AUTHORITY_SHA256
 

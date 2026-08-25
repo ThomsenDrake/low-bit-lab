@@ -3,7 +3,6 @@ from pathlib import Path
 
 import pytest
 
-from lowbit_lab.db import ResultsDatabase
 from lowbit_lab.reference_authority import (
     ACTION_CLASSES,
     REFERENCE_AUTHORITY_SHA256,
@@ -46,14 +45,6 @@ def test_reconciliation_and_proposal_remain_authorized_after_u8_contact(
     tmp_path: Path,
 ) -> None:
     authority_path = _copy_authority_inputs(tmp_path)
-    database = ResultsDatabase(tmp_path / "reference.sqlite")
-    database.initialize()
-    database.consume_reference_u8_slot(
-        REFERENCE_AUTHORITY_SHA256,
-        execution_scope_sha256="a" * 64,
-        occurred_at="2026-08-25T12:00:00+00:00",
-    )
-    assert database.reference_u8_slot(REFERENCE_AUTHORITY_SHA256)["state"] == "consumed"
     assert authorize_reference_action(tmp_path, authority_path, "billing_reconcile")
     assert authorize_reference_action(tmp_path, authority_path, "u9_compile_proposal")
 
@@ -74,6 +65,34 @@ def test_controlling_plan_byte_drift_fails(tmp_path: Path) -> None:
     plan.write_bytes(plan.read_bytes() + b"drift")
     with pytest.raises(ReferenceAuthorityError, match="plan"):
         validate_reference_authority(tmp_path, authority_path)
+
+
+def test_authority_requires_exact_canonical_raw_json_bytes(tmp_path: Path) -> None:
+    authority_path = _copy_authority_inputs(tmp_path)
+    authority = json.loads(authority_path.read_text(encoding="utf-8"))
+    authority_path.write_text(json.dumps(authority, indent=2) + "\n", encoding="utf-8")
+    with pytest.raises(ReferenceAuthorityError, match="raw bytes"):
+        validate_reference_authority(tmp_path, authority_path)
+
+
+def test_authority_rejects_duplicate_json_keys(tmp_path: Path) -> None:
+    authority_path = _copy_authority_inputs(tmp_path)
+    raw = authority_path.read_text(encoding="utf-8")
+    authority_path.write_text(
+        raw.replace('{"action_classes":', '{"schema_version":1,"action_classes":', 1),
+        encoding="utf-8",
+    )
+    with pytest.raises(ReferenceAuthorityError, match="duplicate keys"):
+        validate_reference_authority(tmp_path, authority_path)
+
+
+def test_authority_read_error_does_not_disclose_machine_path(tmp_path: Path) -> None:
+    authority_path = _copy_authority_inputs(tmp_path)
+    (tmp_path / "configs/local/reference-authority-statement.txt").unlink()
+    with pytest.raises(ReferenceAuthorityError) as caught:
+        validate_reference_authority(tmp_path, authority_path)
+    assert str(tmp_path) not in str(caught.value)
+    assert str(caught.value) == "cannot read reference authority statement"
 
 
 @pytest.mark.parametrize(

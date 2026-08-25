@@ -28,20 +28,16 @@ A100_80GB_BYTES = 80 * 1024**3
 FORMULA_APPROVAL_STATEMENT_SHA256 = (
     "87b42e40c2a290e01d87b721bf381c3c5e259d1eb0a4660e41fdbf8bc73f7ddd"
 )
-REVIEWED_FORMULA_SHA256 = (
-    "b7d1b7495f2f5396059c693dcde62525a278854b4b8953ce300cd6054f31c163"
-)
-APPROVED_FORMULA_SHA256 = (
-    "a2ee227c0cba04ac2b9af3ff1ca293fe0aabe4b2abe71f7f949a8d54f1f93e68"
-)
+REVIEWED_FORMULA_SHA256 = "b7d1b7495f2f5396059c693dcde62525a278854b4b8953ce300cd6054f31c163"
+APPROVED_FORMULA_SHA256 = "a2ee227c0cba04ac2b9af3ff1ca293fe0aabe4b2abe71f7f949a8d54f1f93e68"
 
 
 @dataclass(frozen=True)
 class GateResult:
     proven: bool
     evidence_sha256: str
-    required: int | float
-    available: int | float
+    required: int | float | None
+    available: int | float | None
 
 
 def _closed(value: object, keys: set[str], label: str) -> Mapping[str, Any]:
@@ -195,8 +191,96 @@ def verify_memory_fit_evidence(
     expected_method_sha256: str,
     expected_evaluation_lock_sha256: str,
     expected_maximum_context_tokens: int,
+    expected_runtime_receipt_sha256: str | None = None,
+    expected_image_build_identity_sha256: str | None = None,
+    require_schema_v2: bool = False,
 ) -> GateResult:
     raw, digest = _load(path, expected_sha256)
+    if raw.get("schema_version") == 2:
+        evidence = _closed(
+            raw,
+            {
+                "schema_version",
+                "kind",
+                "method_sha256",
+                "inventory_sha256",
+                "architecture_sha256",
+                "runtime_receipt_sha256",
+                "image_build_identity_sha256",
+                "evaluation_lock_sha256",
+                "maximum_context_tokens",
+                "tensor_bytes",
+                "known_required_lower_bound_bytes",
+                "required_bytes",
+                "available_bytes",
+                "proven",
+                "blockers",
+            },
+            "memory-fit evidence",
+        )
+        if evidence["kind"] != "memory_fit_evidence":
+            raise ReferenceGateError("unsupported memory-fit evidence")
+        if _sha256(evidence["inventory_sha256"], "inventory_sha256") != expected_inventory_sha256:
+            raise ReferenceGateError("memory-fit inventory mismatch")
+        _sha256(evidence["architecture_sha256"], "architecture_sha256")
+        if expected_runtime_receipt_sha256 is not None and (
+            _sha256(evidence["runtime_receipt_sha256"], "runtime_receipt_sha256")
+            != expected_runtime_receipt_sha256
+        ):
+            raise ReferenceGateError("memory-fit runtime receipt mismatch")
+        if expected_image_build_identity_sha256 is not None and (
+            _sha256(
+                evidence["image_build_identity_sha256"],
+                "image_build_identity_sha256",
+            )
+            != expected_image_build_identity_sha256
+        ):
+            raise ReferenceGateError("memory-fit image identity mismatch")
+        if (
+            _sha256(evidence["evaluation_lock_sha256"], "evaluation_lock_sha256")
+            != expected_evaluation_lock_sha256
+            or _positive_int(evidence["maximum_context_tokens"], "maximum_context_tokens")
+            != expected_maximum_context_tokens
+        ):
+            raise ReferenceGateError("memory-fit evaluation context mismatch")
+        if _sha256(evidence["method_sha256"], "method_sha256") != expected_method_sha256:
+            raise ReferenceGateError("memory-fit method authority mismatch")
+        if _positive_int(evidence["tensor_bytes"], "tensor_bytes") != expected_tensor_bytes:
+            raise ReferenceGateError("memory-fit tensor byte count mismatch")
+        known_required = _positive_int(
+            evidence["known_required_lower_bound_bytes"],
+            "known_required_lower_bound_bytes",
+        )
+        if known_required < expected_tensor_bytes:
+            raise ReferenceGateError("memory-fit known lower bound is inconsistent")
+        blockers = evidence["blockers"]
+        if (
+            not isinstance(blockers, list)
+            or any(not isinstance(item, str) or not item for item in blockers)
+            or blockers != sorted(set(blockers))
+        ):
+            raise ReferenceGateError("memory-fit blockers must be unique sorted strings")
+        required = evidence["required_bytes"]
+        available = evidence["available_bytes"]
+        if required is not None:
+            required = _positive_int(required, "required_bytes")
+            if required < known_required:
+                raise ReferenceGateError("memory-fit required total is inconsistent")
+        if available is not None:
+            available = _positive_int(available, "available_bytes")
+            if available > A100_80GB_BYTES:
+                raise ReferenceGateError("usable GPU memory exceeds the A100-80GB hard envelope")
+        calculated = (
+            required is not None
+            and available is not None
+            and not blockers
+            and required <= available
+        )
+        if evidence["proven"] is not calculated:
+            raise ReferenceGateError("memory-fit proven claim is inconsistent")
+        return GateResult(calculated, digest, required, available)
+    if require_schema_v2:
+        raise ReferenceGateError("paid memory-fit evidence requires schema version 2")
     evidence = _closed(
         raw,
         {
@@ -251,8 +335,78 @@ def verify_cold_path_time_evidence(
     timeout_seconds: int,
     expected_method_sha256: str,
     expected_evaluation_lock_sha256: str,
+    expected_maximum_context_tokens: int | None = None,
+    expected_inventory_sha256: str | None = None,
+    expected_runtime_receipt_sha256: str | None = None,
+    expected_image_build_identity_sha256: str | None = None,
+    require_schema_v2: bool = False,
 ) -> GateResult:
     raw, digest = _load(path, expected_sha256)
+    if raw.get("schema_version") == 2:
+        evidence = _closed(
+            raw,
+            {
+                "schema_version",
+                "kind",
+                "method_sha256",
+                "inventory_sha256",
+                "runtime_receipt_sha256",
+                "image_build_identity_sha256",
+                "evaluation_lock_sha256",
+                "maximum_context_tokens",
+                "timeout_seconds",
+                "required_seconds",
+                "available_seconds",
+                "proven",
+                "blockers",
+            },
+            "cold-path time evidence",
+        )
+        if evidence["kind"] != "cold_path_time_evidence":
+            raise ReferenceGateError("unsupported cold-path time evidence")
+        for field, expected in (
+            ("inventory_sha256", expected_inventory_sha256),
+            ("runtime_receipt_sha256", expected_runtime_receipt_sha256),
+            ("image_build_identity_sha256", expected_image_build_identity_sha256),
+        ):
+            actual = _sha256(evidence[field], field)
+            if expected is not None and actual != expected:
+                raise ReferenceGateError(f"cold-path {field} mismatch")
+        if (
+            _sha256(evidence["evaluation_lock_sha256"], "evaluation_lock_sha256")
+            != expected_evaluation_lock_sha256
+        ):
+            raise ReferenceGateError("cold-path evaluation lock mismatch")
+        maximum_context_tokens = _positive_int(
+            evidence["maximum_context_tokens"], "maximum_context_tokens"
+        )
+        if (
+            expected_maximum_context_tokens is not None
+            and maximum_context_tokens != expected_maximum_context_tokens
+        ):
+            raise ReferenceGateError("cold-path evaluation context mismatch")
+        if _positive_int(evidence["timeout_seconds"], "timeout_seconds") != timeout_seconds:
+            raise ReferenceGateError("cold-path timeout mismatch")
+        if evidence["available_seconds"] != timeout_seconds:
+            raise ReferenceGateError("cold-path available time mismatch")
+        if _sha256(evidence["method_sha256"], "method_sha256") != expected_method_sha256:
+            raise ReferenceGateError("cold-path method authority mismatch")
+        blockers = evidence["blockers"]
+        if (
+            not isinstance(blockers, list)
+            or any(not isinstance(item, str) or not item for item in blockers)
+            or blockers != sorted(set(blockers))
+        ):
+            raise ReferenceGateError("cold-path blockers must be unique sorted strings")
+        required = evidence["required_seconds"]
+        if required is not None:
+            required = _nonnegative_int(required, "required_seconds")
+        calculated = required is not None and not blockers and required <= timeout_seconds
+        if evidence["proven"] is not calculated:
+            raise ReferenceGateError("cold-path proven claim is inconsistent")
+        return GateResult(calculated, digest, required, timeout_seconds)
+    if require_schema_v2:
+        raise ReferenceGateError("paid cold-path evidence requires schema version 2")
     evidence = _closed(
         raw,
         {
@@ -325,13 +479,9 @@ def verify_provider_constraint_contract(
         raise ReferenceGateError("provider identity mismatch")
 
     workspace_scope = _sha256(contract["workspace_scope_sha256"], "workspace_scope_sha256")
-    environment_scope = _sha256(
-        contract["environment_scope_sha256"], "environment_scope_sha256"
-    )
+    environment_scope = _sha256(contract["environment_scope_sha256"], "environment_scope_sha256")
     method_sha256 = _sha256(contract["observation_method_sha256"], "observation_method_sha256")
-    amendment_sha256 = _sha256(
-        contract["approved_amendment_sha256"], "approved_amendment_sha256"
-    )
+    amendment_sha256 = _sha256(contract["approved_amendment_sha256"], "approved_amendment_sha256")
     if workspace_scope != expected_workspace_scope_sha256:
         raise ReferenceGateError("provider workspace scope mismatch")
     if environment_scope != expected_environment_scope_sha256:
@@ -342,9 +492,7 @@ def verify_provider_constraint_contract(
     maximum_containers = _positive_int(
         contract["maximum_concurrent_containers"], "maximum_concurrent_containers"
     )
-    maximum_gpus = _positive_int(
-        contract["maximum_concurrent_gpus"], "maximum_concurrent_gpus"
-    )
+    maximum_gpus = _positive_int(contract["maximum_concurrent_gpus"], "maximum_concurrent_gpus")
     if maximum_containers != 1:
         raise ReferenceGateError("provider container concurrency limit must equal one")
     if maximum_gpus != 1:
@@ -408,15 +556,9 @@ def _verify_provider_observation_receipt(
         raise ReferenceGateError("provider identity mismatch")
 
     workspace_scope = _sha256(receipt["workspace_scope_sha256"], "workspace_scope_sha256")
-    environment_scope = _sha256(
-        receipt["environment_scope_sha256"], "environment_scope_sha256"
-    )
-    amendment_sha256 = _sha256(
-        receipt["approved_amendment_sha256"], "approved_amendment_sha256"
-    )
-    contract_sha256 = _sha256(
-        receipt["constraint_contract_sha256"], "constraint_contract_sha256"
-    )
+    environment_scope = _sha256(receipt["environment_scope_sha256"], "environment_scope_sha256")
+    amendment_sha256 = _sha256(receipt["approved_amendment_sha256"], "approved_amendment_sha256")
+    contract_sha256 = _sha256(receipt["constraint_contract_sha256"], "constraint_contract_sha256")
     screenshot_sha256 = _sha256(receipt["screenshot_sha256"], "screenshot_sha256")
     if workspace_scope != expected_workspace_scope_sha256:
         raise ReferenceGateError("provider workspace scope mismatch")
@@ -552,9 +694,7 @@ def verify_provider_billing_authority(
         raise ReferenceGateError("unsupported provider billing authority contract")
     if authority["provider"] != "modal":
         raise ReferenceGateError("provider identity mismatch")
-    environment_scope = _sha256(
-        authority["environment_scope_sha256"], "environment_scope_sha256"
-    )
+    environment_scope = _sha256(authority["environment_scope_sha256"], "environment_scope_sha256")
     if environment_scope != expected_environment_scope_sha256:
         raise ReferenceGateError("provider billing environment scope mismatch")
     attribution_method = _sha256(
@@ -615,10 +755,7 @@ def verify_provider_observation_trust_override(
         },
         "provider observation trust override",
     )
-    if (
-        override["schema_version"] != 1
-        or override["kind"] != "provider_observation_trust_override"
-    ):
+    if override["schema_version"] != 1 or override["kind"] != "provider_observation_trust_override":
         raise ReferenceGateError("unsupported provider observation trust override")
     expected = {
         "original_approved_plan_sha256": expected_original_plan_sha256,

@@ -14,6 +14,9 @@ from lowbit_lab.constants import (
     FROZEN_SINGLE_JOB_CAP,
     FROZEN_TOTAL_CREDITS,
     REFERENCE_AUTHORITY_SHA256,
+    REFERENCE_CUMULATIVE_CAP_USD,
+    REFERENCE_INCREMENTAL_CAP_USD,
+    REFERENCE_SETTLED_SMOKE_USD,
 )
 
 
@@ -53,18 +56,6 @@ def _money(value: object, label: str) -> Decimal:
 
 
 def _rate(value: object, label: str) -> Decimal:
-    if not isinstance(value, str):
-        raise BudgetError(f"{label} must be a decimal string")
-    try:
-        parsed = Decimal(value)
-    except InvalidOperation as exc:
-        raise BudgetError(f"{label} is not a decimal") from exc
-    if not parsed.is_finite() or parsed < 0 or parsed.as_tuple().exponent < -10:
-        raise BudgetError(f"{label} must be finite, non-negative, and at most 10 decimals")
-    return parsed
-
-
-def _precise_money(value: object, label: str) -> Decimal:
     if not isinstance(value, str):
         raise BudgetError(f"{label} must be a decimal string")
     try:
@@ -159,9 +150,9 @@ class BudgetGuard:
 class ReferenceBudgetGuard:
     """Validate a local reference-run budget without weakening the public zero ledger."""
 
-    LOCAL_RESERVATION_LIMIT = Decimal("4.00")
-    SETTLED_PROVIDER_SMOKE_ACTUAL = Decimal("0.00270969")
-    CUMULATIVE_LAB_LIMIT = Decimal("4.00270969")
+    LOCAL_RESERVATION_LIMIT = REFERENCE_INCREMENTAL_CAP_USD
+    SETTLED_PROVIDER_SMOKE_ACTUAL = REFERENCE_SETTLED_SMOKE_USD
+    CUMULATIVE_LAB_LIMIT = REFERENCE_CUMULATIVE_CAP_USD
     _LEGACY_FIELDS = {
         "schema_version",
         "kind",
@@ -222,14 +213,14 @@ class ReferenceBudgetGuard:
         self.phase = raw["phase"]
         self.phase_cap = _money(raw["phase_cap_usd"], "phase_cap_usd")
         self.total_cap = (
-            _precise_money(raw["total_cap_usd"], "total_cap_usd")
+            _rate(raw["total_cap_usd"], "total_cap_usd")
             if schema_version == 2
             else _money(raw["total_cap_usd"], "total_cap_usd")
         )
         self.single_job_cap = _money(raw["single_job_cap_usd"], "single_job_cap_usd")
         self.settled_provider_smoke_actual = Decimal("0")
         if schema_version == 2:
-            self.settled_provider_smoke_actual = _precise_money(
+            self.settled_provider_smoke_actual = _rate(
                 raw["settled_provider_smoke_actual_usd"],
                 "settled_provider_smoke_actual_usd",
             )
