@@ -29,6 +29,8 @@ from lowbit_lab.reference_contract import (
 
 SCHEMA_VERSION = 9
 REFERENCE_RESERVATION_USD = Decimal("4.00")
+REFERENCE_SETTLED_SMOKE_USD = Decimal("0.00270969")
+REFERENCE_CUMULATIVE_CAP_USD = Decimal("4.00270969")
 TERMINAL_STATES = {"completed", "failed"}
 TRANSITIONS = {
     "created": {"validated", "failed"},
@@ -462,6 +464,38 @@ def _committed_provider_cost(connection: sqlite3.Connection) -> Decimal:
         value = row["provider_actual_cost_usd"] if use_actual else row["requested_cost_usd"]
         parser = _database_actual_money if use_actual else _database_money
         committed += parser(value, "stored reference reservation cost")
+    for row in connection.execute(
+        """SELECT status, requested_cost_usd, provider_actual_cost_usd
+        FROM provider_smoke_reservations"""
+    ):
+        use_actual = (
+            row["status"] in {"settled", "failed"}
+            and row["provider_actual_cost_usd"] is not None
+        )
+        value = row["provider_actual_cost_usd"] if use_actual else row["requested_cost_usd"]
+        parser = _database_actual_money if use_actual else _database_money
+        committed += parser(value, "stored provider smoke cost")
+    return committed
+
+
+def _committed_reference_cost(connection: sqlite3.Connection) -> Decimal:
+    committed = Decimal("0")
+    for row in connection.execute(
+        """SELECT status, requested_cost_usd, provider_actual_cost_usd
+        FROM budget_reservations WHERE status != 'released'"""
+    ):
+        use_actual = (
+            row["status"] in {"settled", "failed"}
+            and row["provider_actual_cost_usd"] is not None
+        )
+        value = row["provider_actual_cost_usd"] if use_actual else row["requested_cost_usd"]
+        parser = _database_actual_money if use_actual else _database_money
+        committed += parser(value, "stored reference reservation cost")
+    return committed
+
+
+def _committed_provider_smoke_cost(connection: sqlite3.Connection) -> Decimal:
+    committed = Decimal("0")
     for row in connection.execute(
         """SELECT status, requested_cost_usd, provider_actual_cost_usd
         FROM provider_smoke_reservations"""
@@ -973,36 +1007,6 @@ class ResultsDatabase:
                 "consumed_at": None,
             }
         return dict(row)
-
-    def consume_reference_u8_slot(
-        self,
-        authority_sha256: str,
-        *,
-        execution_scope_sha256: str,
-        occurred_at: str,
-    ) -> None:
-        """Permanently consume the sole U8 slot at first provider contact."""
-        if authority_sha256 != REFERENCE_AUTHORITY_SHA256:
-            raise DatabaseError("reference authority is invalid")
-        _database_sha256(execution_scope_sha256, "execution_scope_sha256")
-        _database_timestamp(occurred_at, "occurred_at")
-        try:
-            with self.connect() as connection:
-                connection.execute("BEGIN IMMEDIATE")
-                if connection.execute(
-                    "SELECT 1 FROM reference_authority_slots WHERE singleton = 1"
-                ).fetchone():
-                    raise DatabaseError("reference U8 authority slot is already consumed")
-                connection.execute(
-                    """INSERT INTO reference_authority_slots(
-                        singleton, authority_sha256, state,
-                        execution_scope_sha256, consumed_at
-                    ) VALUES (1, ?, 'consumed', ?, ?)""",
-                    (authority_sha256, execution_scope_sha256, occurred_at),
-                )
-                connection.commit()
-        except sqlite3.IntegrityError as exc:
-            raise DatabaseError("reference U8 authority slot is already consumed") from exc
 
     def reserve_provider_smoke(
         self,
@@ -2508,18 +2512,24 @@ class ResultsDatabase:
         started_at: str,
         challenge_sha256: str,
         approval_digest: str,
+        standing_authority_sha256: str,
     ) -> None:
         requested = _database_money(requested_cost_usd, "requested_cost_usd")
         phase_cap = _database_money(phase_cap_usd, "phase_cap_usd")
-        total_cap = _database_money(total_cap_usd, "total_cap_usd")
+        total_cap = _database_actual_money(total_cap_usd, "total_cap_usd")
         single_job_cap = _database_money(single_job_cap_usd, "single_job_cap_usd")
         if (
             requested != REFERENCE_RESERVATION_USD
             or single_job_cap != REFERENCE_RESERVATION_USD
             or phase_cap != REFERENCE_RESERVATION_USD
-            or total_cap != REFERENCE_RESERVATION_USD
+            or total_cap != REFERENCE_CUMULATIVE_CAP_USD
         ):
-            raise DatabaseError("reference reservation and all caps must equal USD 4.00")
+            raise DatabaseError(
+                "reference reservation, phase, and single-job caps must equal USD 4.00 "
+                "and cumulative cap must equal USD 4.00270969"
+            )
+        if standing_authority_sha256 != REFERENCE_AUTHORITY_SHA256:
+            raise DatabaseError("reference standing authority is invalid")
         if not owner_id or not idempotency_key:
             raise DatabaseError("reference reservation requires owner and idempotency key")
         _database_sha256(challenge_sha256, "challenge_sha256")
@@ -2615,9 +2625,29 @@ class ResultsDatabase:
                         raise DatabaseError(
                             "released reference scope requires a new challenge and approval"
                         )
-            committed = _committed_provider_cost(connection)
-            if committed + requested > phase_cap or committed + requested > total_cap:
-                raise DatabaseError("reference reservation exceeds phase or total cap")
+            phase_committed = _committed_reference_cost(connection)
+            smoke_committed = _committed_provider_smoke_cost(connection)
+            total_committed = phase_committed + smoke_committed
+            if smoke_committed != REFERENCE_SETTLED_SMOKE_USD:
+                raise DatabaseError(
+                    "reference cumulative ledger does not contain the exact settled "
+                    "provider smoke cost"
+                )
+            if phase_committed + requested > phase_cap:
+                raise DatabaseError("reference reservation exceeds phase cap")
+            if total_committed + requested > total_cap:
+                raise DatabaseError("reference reservation exceeds cumulative cap")
+            if connection.execute(
+                "SELECT 1 FROM reference_authority_slots WHERE singleton = 1"
+            ).fetchone():
+                raise DatabaseError("reference U8 authority slot is already consumed")
+            connection.execute(
+                """INSERT INTO reference_authority_slots(
+                    singleton, authority_sha256, state,
+                    execution_scope_sha256, consumed_at
+                ) VALUES (1, ?, 'consumed', ?, ?)""",
+                (standing_authority_sha256, execution_scope_sha256, started_at),
+            )
             registered = connection.execute(
                 "SELECT config_sha256, config_json FROM experiment_configs WHERE experiment_id = ?",
                 (experiment_id,),

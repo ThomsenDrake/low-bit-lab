@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from lowbit_lab.constants import REFERENCE_AUTHORITY_SHA256
 from lowbit_lab.db import SCHEMA_VERSION, DatabaseError, ResultsDatabase
 from lowbit_lab.reference_contract import (
     APPROVED_PROVIDER_AMENDMENT_PATH,
@@ -354,7 +355,18 @@ def _reserve(
     observation_receipt_sha256: str = "b" * 64,
     lease_expires_at: str = "2026-08-22T00:05:00+00:00",
     started_at: str = "2026-08-22T00:00:00+00:00",
+    settled_smoke_actual_usd: str | None = "0.00270969",
+    standing_authority_sha256: str = REFERENCE_AUTHORITY_SHA256,
 ) -> None:
+    if settled_smoke_actual_usd is not None:
+        with database.connect_readonly() as connection:
+            smoke_exists = connection.execute(
+                "SELECT 1 FROM provider_smoke_reservations LIMIT 1"
+            ).fetchone()
+        if smoke_exists is None:
+            _record_settled_provider_smoke(
+                database, actual_cost_usd=settled_smoke_actual_usd
+            )
     inputs = {
         "source_revision": "d" * 40,
         "weight_inventory_sha256": "1" * 64,
@@ -482,7 +494,7 @@ def _reserve(
         hardware=hardware or {},
         requested_cost_usd=amount,
         phase_cap_usd="4.00",
-        total_cap_usd="4.00",
+        total_cap_usd="4.00270969",
         single_job_cap_usd="4.00",
         idempotency_key=f"idempotency-{suffix}",
         owner_id="owner",
@@ -490,7 +502,34 @@ def _reserve(
         started_at=started_at,
         challenge_sha256=challenge,
         approval_digest=approval,
+        standing_authority_sha256=standing_authority_sha256,
     )
+
+
+def _record_settled_provider_smoke(
+    database: ResultsDatabase, *, actual_cost_usd: str = "0.00270969"
+) -> None:
+    with database.connect() as connection:
+        connection.execute(
+            """INSERT INTO provider_smoke_reservations(
+                reservation_id, action_contract_sha256, execution_scope_sha256,
+                challenge_sha256, approval_digest, contract_json, status,
+                requested_cost_usd, owner_id, provider_actual_cost_usd,
+                settlement_identity, created_at, updated_at
+            ) VALUES (
+                'settled-smoke', ?, ?, ?, ?, '{}', 'settled', '4.00', 'owner', ?, ?, ?, ?
+            )""",
+            (
+                "1" * 64,
+                "2" * 64,
+                "3" * 64,
+                "4" * 64,
+                actual_cost_usd,
+                "5" * 64,
+                "2026-08-25T00:00:00+00:00",
+                "2026-08-25T01:00:00+00:00",
+            ),
+        )
 
 
 def _submit(database: ResultsDatabase, reservation_id: str, *, lease: str) -> None:
@@ -704,7 +743,7 @@ def test_reference_reservation_is_atomic_and_prevents_cap_overlap(tmp_path: Path
     database = ResultsDatabase(tmp_path / "results.sqlite")
     database.initialize()
     _reserve(database, suffix="one")
-    with pytest.raises(DatabaseError, match="cap"):
+    with pytest.raises(DatabaseError, match="cap|consumed"):
         _reserve(database, suffix="two")
     assert database.get_attempt("attempt-two")["status"] == "received"
     assert database.get_reservation("reservation-one")["status"] == "reserved"
@@ -716,7 +755,7 @@ def test_reference_reservation_is_atomic_and_prevents_cap_overlap(tmp_path: Path
         ).fetchone()[0] == 0
 
 
-def test_zero_cost_settled_smoke_restores_reference_reservation_balance(
+def test_reference_requires_the_exact_authoritative_smoke_cost(
     tmp_path: Path,
 ) -> None:
     database = ResultsDatabase(tmp_path / "results.sqlite")
@@ -739,8 +778,9 @@ def test_zero_cost_settled_smoke_restores_reference_reservation_balance(
                 "2026-08-21T23:30:00+00:00",
             ),
         )
-    _reserve(database, suffix="after-zero-smoke")
-    assert database.get_reservation("reservation-after-zero-smoke")["status"] == "reserved"
+    with pytest.raises(DatabaseError, match="exact settled provider smoke"):
+        _reserve(database, suffix="after-zero-smoke")
+    assert database.reference_u8_slot(REFERENCE_AUTHORITY_SHA256)["state"] == "available"
 
 
 def test_reference_reservation_requires_unconsumed_unexpired_approval(tmp_path: Path) -> None:
@@ -1004,27 +1044,11 @@ def test_stale_reference_reservations_release_only_before_submission(tmp_path: P
     assert released == {"released": ["reservation-pre"], "audit_blocked": []}
     assert database.get_run("run-pre")["status"] == "failed"
 
-    _reserve(database, suffix="post", observation_receipt_sha256="e" * 64)
-    _submit(database, "reservation-post", lease="2026-08-22T00:06:00+00:00")
-    blocked = database.reconcile_stale_reservations(now="2026-08-22T00:10:00+00:00")
-    assert blocked == {"released": [], "audit_blocked": ["reservation-post"]}
-    assert database.get_run("run-post")["modal_cost_actual_usd"] is None
-    reservation = database.get_reservation("reservation-post")
-    assert reservation["status"] == "audit_blocked"
-    assert reservation["requested_cost_usd"] == "4.00"
-    assert reservation["provider_actual_cost_usd"] is None
-    with pytest.raises(DatabaseError, match="cap"):
-        _reserve(
-            database,
-            suffix="blocked-overlap",
-            observation_receipt_sha256="f" * 64,
-            mutate_config=lambda raw: raw["inputs"].__setitem__(
-                "source_revision", "e" * 40
-            ),
-        )
+    with pytest.raises(DatabaseError, match="consumed"):
+        _reserve(database, suffix="post", observation_receipt_sha256="e" * 64)
 
 
-def test_released_scope_requires_new_observation_challenge_and_approval(tmp_path: Path) -> None:
+def test_released_reference_reservation_does_not_restore_u8_slot(tmp_path: Path) -> None:
     database = ResultsDatabase(tmp_path / "results.sqlite")
     database.initialize()
     _reserve(database, suffix="first")
@@ -1033,17 +1057,17 @@ def test_released_scope_requires_new_observation_challenge_and_approval(tmp_path
     with pytest.raises(DatabaseError, match="observation"):
         _reserve(database, suffix="same-observation")
 
-    _reserve(
-        database,
-        suffix="fresh",
-        observation_receipt_sha256="e" * 64,
-    )
-    assert database.get_reservation("reservation-fresh")["status"] == "reserved"
+    with pytest.raises(DatabaseError, match="consumed"):
+        _reserve(
+            database,
+            suffix="fresh",
+            observation_receipt_sha256="e" * 64,
+        )
     with database.connect() as connection:
         consumed = connection.execute(
             "SELECT count(*) FROM reference_approval_challenges WHERE consumed_at IS NOT NULL"
         ).fetchone()[0]
-    assert consumed == 2
+    assert consumed == 1
 
 
 @pytest.mark.parametrize(
@@ -1087,7 +1111,9 @@ def test_submitted_or_later_scope_is_permanently_consumed(
 
 def test_concurrent_connections_cannot_reserve_the_same_scope_twice(tmp_path: Path) -> None:
     path = tmp_path / "race.sqlite"
-    ResultsDatabase(path).initialize()
+    database = ResultsDatabase(path)
+    database.initialize()
+    _record_settled_provider_smoke(database)
 
     def reserve(suffix: str, observation: str) -> str:
         try:
@@ -1121,18 +1147,18 @@ def test_over_cap_settlement_is_durable_and_unambiguously_fails(tmp_path: Path) 
         database.settle_reservation(
             "reservation-over",
             occurred_at="2026-08-22T01:02:00+00:00",
-            **_billing_report("reservation-over", "4.01"),
+            **_billing_report("reservation-over", "4.00000001"),
         )
     reservation = database.get_reservation("reservation-over")
     assert reservation["status"] == "failed"
-    assert reservation["provider_actual_cost_usd"] == "4.01"
+    assert reservation["provider_actual_cost_usd"] == "4.00000001"
     assert reservation["settlement_identity"] == _billing_report(
-        "reservation-over", "4.01"
+        "reservation-over", "4.00000001"
     )["billing_report_sha256"]
     run = database.get_run("run-over")
     assert run["status"] == "failed"
-    assert run["modal_cost_actual_usd"] == "4.01"
-    with pytest.raises(DatabaseError, match="cap"):
+    assert run["modal_cost_actual_usd"] == "4.00000001"
+    with pytest.raises(DatabaseError, match="cap|consumed"):
         _reserve(
             database,
             suffix="different-scope-after-over",
@@ -1175,7 +1201,7 @@ def test_legacy_submitted_or_later_reservation_retains_the_full_cap(tmp_path: Pa
         )
     database = ResultsDatabase(path)
     database.initialize()
-    with pytest.raises(DatabaseError, match="cap"):
+    with pytest.raises(DatabaseError, match="cap|consumed"):
         _reserve(
             database,
             suffix="after-legacy",
@@ -1462,43 +1488,42 @@ def test_controller_acquire_atomically_reconciles_expired_cycle(tmp_path: Path) 
     assert database.get_controller_cycle("cycle-one")["state"] == "failed"
 
 
-def test_reference_u8_slot_is_consumed_once_but_zero_spend_is_reusable(tmp_path: Path) -> None:
-    from lowbit_lab.reference_authority import REFERENCE_AUTHORITY_SHA256
-
+def test_reference_reservation_atomically_consumes_u8_slot(tmp_path: Path) -> None:
     database = ResultsDatabase(tmp_path / "reference-authority.sqlite")
     database.initialize()
+    _record_settled_provider_smoke(database)
     assert database.reference_u8_slot(REFERENCE_AUTHORITY_SHA256)["state"] == "available"
-    database.consume_reference_u8_slot(
-        REFERENCE_AUTHORITY_SHA256,
-        execution_scope_sha256="a" * 64,
-        occurred_at="2026-08-25T12:00:00+00:00",
-    )
-    assert database.reference_u8_slot(REFERENCE_AUTHORITY_SHA256) == {
+    _reserve(database, suffix="atomic")
+    slot = database.reference_u8_slot(REFERENCE_AUTHORITY_SHA256)
+    assert slot == {
         "state": "consumed",
-        "execution_scope_sha256": "a" * 64,
-        "consumed_at": "2026-08-25T12:00:00+00:00",
+        "execution_scope_sha256": database.get_reservation("reservation-atomic")[
+            "reference_execution_scope_sha256"
+        ],
+        "consumed_at": "2026-08-22T00:00:00+00:00",
     }
-    with pytest.raises(DatabaseError, match="consumed"):
-        database.consume_reference_u8_slot(
-            REFERENCE_AUTHORITY_SHA256,
-            execution_scope_sha256="b" * 64,
-            occurred_at="2026-08-25T12:00:01+00:00",
-        )
-    assert database.reference_u8_slot(REFERENCE_AUTHORITY_SHA256)["state"] == "consumed"
 
 
-def test_concurrent_reference_u8_consumers_cannot_both_acquire(tmp_path: Path) -> None:
-    from lowbit_lab.reference_authority import REFERENCE_AUTHORITY_SHA256
+def test_failed_reference_reservation_does_not_preconsume_u8_slot(tmp_path: Path) -> None:
+    database = ResultsDatabase(tmp_path / "reference-authority.sqlite")
+    database.initialize()
+    with pytest.raises(DatabaseError, match="cumulative"):
+        _reserve(database, suffix="no-smoke", settled_smoke_actual_usd=None)
+    assert database.reference_u8_slot(REFERENCE_AUTHORITY_SHA256)["state"] == "available"
 
+
+def test_concurrent_reference_reservations_cannot_both_acquire_u8(tmp_path: Path) -> None:
     path = tmp_path / "reference-authority-race.sqlite"
-    ResultsDatabase(path).initialize()
+    database = ResultsDatabase(path)
+    database.initialize()
+    _record_settled_provider_smoke(database)
 
-    def consume(scope: str) -> str:
+    def consume(suffix: str) -> str:
         try:
-            ResultsDatabase(path).consume_reference_u8_slot(
-                REFERENCE_AUTHORITY_SHA256,
-                execution_scope_sha256=scope * 64,
-                occurred_at="2026-08-25T12:00:00+00:00",
+            _reserve(
+                ResultsDatabase(path),
+                suffix=suffix,
+                observation_receipt_sha256=("e" if suffix == "a" else "f") * 64,
             )
         except DatabaseError as exc:
             return str(exc)
@@ -1507,18 +1532,20 @@ def test_concurrent_reference_u8_consumers_cannot_both_acquire(tmp_path: Path) -
     with ThreadPoolExecutor(max_workers=2) as executor:
         outcomes = list(executor.map(consume, ("a", "b")))
     assert outcomes.count("ok") == 1
-    assert sum("consumed" in outcome for outcome in outcomes) == 1
+    assert sum("consumed" in outcome or "cap" in outcome for outcome in outcomes) == 1
 
 
 def test_reference_u8_slot_rejects_direct_authority_bypass(tmp_path: Path) -> None:
     database = ResultsDatabase(tmp_path / "reference-authority.sqlite")
     database.initialize()
-    with pytest.raises(DatabaseError, match="authority"):
-        database.consume_reference_u8_slot(
-            "f" * 64,
-            execution_scope_sha256="a" * 64,
-            occurred_at="2026-08-25T12:00:00+00:00",
+    with pytest.raises(DatabaseError, match="standing authority"):
+        _reserve(
+            database,
+            suffix="wrong-standing-authority",
+            standing_authority_sha256="f" * 64,
         )
+    assert database.reference_u8_slot(REFERENCE_AUTHORITY_SHA256)["state"] == "available"
+    assert not hasattr(database, "consume_reference_u8_slot")
     with database.connect() as connection, pytest.raises(
         sqlite3.IntegrityError, match="CHECK constraint"
     ):
@@ -1528,3 +1555,22 @@ def test_reference_u8_slot_rejects_direct_authority_bypass(tmp_path: Path) -> No
             ) VALUES (1, ?, 'consumed', ?, ?)""",
             ("f" * 64, "a" * 64, "2026-08-25T12:00:00+00:00"),
         )
+
+
+def test_reference_total_counts_settled_smoke_but_phase_does_not(tmp_path: Path) -> None:
+    database = ResultsDatabase(tmp_path / "reference-budget.sqlite")
+    database.initialize()
+    _record_settled_provider_smoke(database)
+    _reserve(database, suffix="exact-total")
+    assert database.get_reservation("reservation-exact-total")["requested_cost_usd"] == "4.00"
+
+
+def test_reference_reservation_rejects_smoke_actual_above_exact_cumulative_cap(
+    tmp_path: Path,
+) -> None:
+    database = ResultsDatabase(tmp_path / "reference-budget.sqlite")
+    database.initialize()
+    _record_settled_provider_smoke(database, actual_cost_usd="0.00270970")
+    with pytest.raises(DatabaseError, match="cumulative"):
+        _reserve(database, suffix="over-total")
+    assert database.reference_u8_slot(REFERENCE_AUTHORITY_SHA256)["state"] == "available"
