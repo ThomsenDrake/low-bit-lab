@@ -759,6 +759,8 @@ _STAGE_MEASUREMENTS: dict[str, set[str]] = {
         "full_context_completed",
         "levels_completed",
         "max_completed_context_tokens",
+        "reference_manifest_bytes",
+        "reference_manifest_sha256",
         "usefulness_proven",
     },
     "evidence_finalization": {"receipt_bytes"},
@@ -809,6 +811,8 @@ def _validate_stage_mapping(raw: object, request: BootstrapRequest) -> StageRece
     if len(measurements) > 16:
         raise ReferenceBootstrapError("stage measurements exceed the response cap")
     for name, value in measurements.items():
+        if name == "reference_manifest_sha256" and value is None:
+            continue
         if name.endswith("sha256"):
             _sha256(value, f"{stage}.{name}")
         elif name in {"loaded", "full_context_completed", "usefulness_proven"}:
@@ -829,6 +833,16 @@ def _validate_stage_mapping(raw: object, request: BootstrapRequest) -> StageRece
             and measurements["full_context_completed"] is not True
         ):
             raise ReferenceBootstrapError("context usefulness cannot exceed completed evidence")
+        manifest_sha = measurements["reference_manifest_sha256"]
+        manifest_bytes = measurements["reference_manifest_bytes"]
+        if status == "completed" and (
+            manifest_sha is None
+            or manifest_bytes <= 0
+            or not measurements["full_context_completed"]
+        ):
+            raise ReferenceBootstrapError("completed evaluation must bind the reference manifest")
+        if status == "failed" and (manifest_sha is not None or manifest_bytes != 0):
+            raise ReferenceBootstrapError("failed evaluation cannot bind a reference manifest")
     encoded = canonical_json(stage_receipt)
     return StageReceipt(
         canonical_json=encoded,

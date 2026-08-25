@@ -119,7 +119,10 @@ class FakeEvaluator:
     raises_at: int | None = None
     calls: list[int] = field(default_factory=list)
 
-    def evaluate(self, model: object, context_tokens: int) -> EvaluationObservation:
+    def evaluate_context(
+        self, model: object, context_tokens: int, *, deadline_monotonic: float
+    ) -> EvaluationObservation:
+        del model, deadline_monotonic
         self.calls.append(context_tokens)
         if context_tokens == self.raises_at:
             raise RuntimeError("sensitive target and local path")
@@ -127,7 +130,53 @@ class FakeEvaluator:
         return EvaluationObservation(
             completed=context_tokens != self.incomplete_at,
             usefulness_proven=context_tokens == 262_144,
+            manifest=_manifest() if context_tokens == 262_144 else None,
         )
+
+
+def _manifest(evaluation_lock_sha256: str = SHA_A) -> bytes:
+    metrics = {
+        "coding": {"exact_match": 1.0},
+        "tool_call_validity": {"schema_valid_rate": 1.0},
+        "long_context_retrieval": {"retrieval_accuracy": 1.0},
+        "throughput": {"decode_tokens_per_second": 1.0},
+        "memory": {"peak_vram_bytes": 1},
+        "soak": {"completed_minutes": 1.0, "failure_free_rate": 1.0, "runtime_errors": 0},
+    }
+    measurements = []
+    for family in metrics:
+        levels = (
+            [65_536, 131_072, 196_608, 262_144] if family == "long_context_retrieval" else [262_144]
+        )
+        measurements.extend(
+            {
+                "context_level_tokens": level,
+                "family": family,
+                "fixture_id": f"generic-{family}",
+                "metrics": metrics[family],
+                "response_bytes": 0,
+                "response_sha256": hashlib.sha256(b"").hexdigest(),
+                "response_tokens": 0,
+                "status": "completed",
+            }
+            for level in levels
+        )
+    raw = {
+        "evaluation_lock_sha256": evaluation_lock_sha256,
+        "execution_identity": {
+            "provenance_manifest_sha256": "1" * 64,
+            "resource_spec_sha256": "2" * 64,
+            "reviewed_commit_sha256": "3" * 40,
+            "runtime_receipt_sha256": "4" * 64,
+            "weight_inventory_sha256": "5" * 64,
+        },
+        "executor_identity": {"runtime_sha256": "6" * 64, "scorer_sha256": "7" * 64},
+        "kind": "reference_metrics",
+        "measurements": measurements,
+        "schema_version": 1,
+        "status": "completed",
+    }
+    return json.dumps(raw, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()
 
 
 def _request(
@@ -149,6 +198,7 @@ def _request(
         "approved_https_hosts": ["artifacts.example", "cdn.example"],
         "context_ladder_tokens": [65_536, 131_072, 196_608, 262_144],
         "known_memory_lower_bound_bytes": 50,
+        "lineage": {"evaluation_lock_sha256": SHA_A},
         "source_artifacts": artifacts,
     }
     encoded = canonical_json(raw)
@@ -206,10 +256,10 @@ def _run(
 ) -> dict[str, object]:
     actual_request = request or _request()
     actual_dependencies = dependencies or _dependencies()[0]
-    encoded = ReferenceExecution(
+    result = ReferenceExecution(
         actual_request, actual_dependencies, deadline_started_monotonic=0
     ).run()
-    validated = validate_bootstrap_receipt_bytes(encoded, request=actual_request)
+    validated = validate_bootstrap_receipt_bytes(result.receipt, request=actual_request)
     return json.loads(validated.canonical_json)
 
 
@@ -237,9 +287,22 @@ def test_fake_end_to_end_visits_each_stage_once_and_returns_bounded_receipt() ->
     assert evaluator.calls == [65_536, 131_072, 196_608, 262_144]
     assert receipt["configured_context_tokens"] == 262_144
     assert receipt["full_context_usefulness_proven"] is True
+    evaluation = receipt["stages"][4]["measurements"]
+    assert evaluation["reference_manifest_sha256"] == hashlib.sha256(_manifest()).hexdigest()
+    assert evaluation["reference_manifest_bytes"] == len(_manifest())
     receipt_size = len(canonical_json(receipt).encode())
     assert receipt_size <= 65_536
     assert receipt["stages"][-1]["measurements"]["receipt_bytes"] == receipt_size
+
+    direct_dependencies = _dependencies()[0]
+    result = ReferenceExecution(_request(), direct_dependencies, deadline_started_monotonic=0).run()
+    assert result.manifest == _manifest()
+    rebound = validate_bootstrap_receipt_bytes(result.receipt, request=_request())
+    rebound_raw = json.loads(rebound.canonical_json)
+    assert (
+        rebound_raw["stages"][4]["measurements"]["reference_manifest_sha256"]
+        == hashlib.sha256(result.manifest).hexdigest()
+    )
 
 
 @pytest.mark.parametrize(
@@ -348,6 +411,7 @@ def test_load_failure_and_unknown_exception_are_sanitized() -> None:
     receipt = _run(dependencies=unknown_deps)
     assert _failure(receipt) == ("evaluation", "unknown_failure")
     assert "sensitive" not in canonical_json(receipt)
+    assert receipt["stages"][-1]["measurements"]["reference_manifest_sha256"] is None
 
 
 def test_malformed_runtime_metrics_fail_without_becoming_evidence() -> None:
@@ -368,6 +432,31 @@ def test_incomplete_context_never_relabels_configured_context_as_proven() -> Non
     assert receipt["full_context_usefulness_proven"] is False
     assert receipt["empirical_facts"]["provider_image_identity"] is True
     assert receipt["empirical_facts"]["empirical_fit"] is True
+
+
+def test_terminal_failure_never_returns_or_binds_a_manifest() -> None:
+    request = _request()
+    dependencies, clock, _, _, evaluator = _dependencies()
+
+    def malformed(
+        model: object, context_tokens: int, *, deadline_monotonic: float
+    ) -> EvaluationObservation:
+        del model, deadline_monotonic
+        evaluator.calls.append(context_tokens)
+        clock.advance(0.001)
+        return EvaluationObservation(
+            True, False, b'{"not":"a manifest"}' if context_tokens == 262_144 else None
+        )
+
+    evaluator.evaluate_context = malformed  # type: ignore[method-assign]
+    result = ReferenceExecution(request, dependencies, deadline_started_monotonic=0).run()
+    receipt = json.loads(
+        validate_bootstrap_receipt_bytes(result.receipt, request=request).canonical_json
+    )
+
+    assert result.manifest is None
+    assert _failure(receipt) == ("evaluation", "manifest_binding_drift")
+    assert receipt["stages"][-1]["measurements"]["reference_manifest_sha256"] is None
 
 
 def test_shared_deadline_and_nonmonotonic_clock_fail_closed() -> None:
@@ -407,12 +496,17 @@ def test_transfer_projection_uses_observed_bytes_and_preserves_future_stages(
 def test_quadratic_context_projection_stops_before_next_level() -> None:
     dependencies, _, _, _, evaluator = _dependencies()
 
-    def slow_evaluate(model: object, context_tokens: int) -> EvaluationObservation:
+    def slow_evaluate(
+        model: object, context_tokens: int, *, deadline_monotonic: float
+    ) -> EvaluationObservation:
+        del model, deadline_monotonic
         evaluator.calls.append(context_tokens)
         evaluator.clock.advance(100)
-        return EvaluationObservation(True, False)
+        return EvaluationObservation(
+            True, False, _manifest() if context_tokens == 262_144 else None
+        )
 
-    evaluator.evaluate = slow_evaluate  # type: ignore[method-assign]
+    evaluator.evaluate_context = slow_evaluate  # type: ignore[method-assign]
     receipt = _run(dependencies=dependencies)
     assert _failure(receipt) == ("evaluation", "projected_timeout")
     assert evaluator.calls == [65_536]

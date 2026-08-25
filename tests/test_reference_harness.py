@@ -25,6 +25,7 @@ def _execution_identity() -> dict[str, str]:
         "resource_spec_sha256": "5" * 64,
     }
 
+
 METRICS = {
     "coding": ["exact_match"],
     "tool_call_validity": ["schema_valid_rate"],
@@ -159,10 +160,7 @@ class DeterministicExecutor:
             return ReferenceObservation(
                 status="failed", metrics={}, response=b"", generated_tokens=0
             )
-        values = {
-            metric: (0 if metric == "runtime_errors" else 1.0)
-            for metric in request.metrics
-        }
+        values = {metric: (0 if metric == "runtime_errors" else 1.0) for metric in request.metrics}
         return ReferenceObservation(
             status="completed", metrics=values, response=b"{}", generated_tokens=1
         )
@@ -313,9 +311,7 @@ def test_response_byte_cap_and_metric_shape_fail_closed() -> None:
     lock = validate_pending_evaluation_lock(raw, fixture_bytes=fixture_bytes)
 
     with pytest.raises(ReferenceHarnessError, match="response byte cap"):
-        run_reference_harness(
-            lock, fixture_bytes, DeterministicExecutor(), _execution_identity()
-        )
+        run_reference_harness(lock, fixture_bytes, DeterministicExecutor(), _execution_identity())
 
     class MissingMetricExecutor(DeterministicExecutor):
         def evaluate(self, request):
@@ -383,9 +379,7 @@ def test_executor_identity_and_metric_domains_fail_closed() -> None:
             return {"scorer_sha256": "f" * 64, "runtime_sha256": "b" * 64}
 
     with pytest.raises(ReferenceHarnessError, match="does not match"):
-        run_reference_harness(
-            lock, fixture_bytes, WrongIdentityExecutor(), _execution_identity()
-        )
+        run_reference_harness(lock, fixture_bytes, WrongIdentityExecutor(), _execution_identity())
 
     class ImpossibleRateExecutor(DeterministicExecutor):
         def evaluate(self, request):
@@ -395,6 +389,69 @@ def test_executor_identity_and_metric_domains_fail_closed() -> None:
             return observation
 
     with pytest.raises(ReferenceHarnessError, match="outside"):
+        run_reference_harness(lock, fixture_bytes, ImpossibleRateExecutor(), _execution_identity())
+
+
+def test_precomputed_long_context_is_validated_and_not_reexecuted() -> None:
+    materials = _materials()
+    raw = _raw_lock(materials)
+    fixture_bytes = _fixture_bytes(raw, materials)
+    lock = validate_pending_evaluation_lock(raw, fixture_bytes=fixture_bytes)
+    baseline_executor = DeterministicExecutor()
+    baseline = run_reference_harness(lock, fixture_bytes, baseline_executor, _execution_identity())
+    precomputed = {
+        request.context_level_tokens: ReferenceObservation(
+            status="completed",
+            metrics={"retrieval_accuracy": 1.0},
+            response=b"{}",
+            generated_tokens=1,
+        )
+        for request in baseline_executor.requests
+        if request.family == "long_context_retrieval"
+    }
+    executor = DeterministicExecutor()
+
+    result = run_reference_harness(
+        lock,
+        fixture_bytes,
+        executor,
+        _execution_identity(),
+        precomputed_long_context=precomputed,
+    )
+
+    assert result == baseline
+    assert all(request.family != "long_context_retrieval" for request in executor.requests)
+    assert {request.family for request in executor.requests} == set(EVALUATION_FAMILIES) - {
+        "long_context_retrieval"
+    }
+
+
+def test_precomputed_long_context_requires_exact_ladder_and_valid_observations() -> None:
+    materials = _materials()
+    raw = _raw_lock(materials)
+    fixture_bytes = _fixture_bytes(raw, materials)
+    lock = validate_pending_evaluation_lock(raw, fixture_bytes=fixture_bytes)
+    observation = ReferenceObservation(
+        status="completed",
+        metrics={"retrieval_accuracy": 1.0},
+        response=b"{}",
+        generated_tokens=1,
+    )
+    with pytest.raises(ReferenceHarnessError, match="set drift"):
         run_reference_harness(
-            lock, fixture_bytes, ImpossibleRateExecutor(), _execution_identity()
+            lock,
+            fixture_bytes,
+            DeterministicExecutor(),
+            _execution_identity(),
+            precomputed_long_context={8192: observation},
+        )
+    malformed = {level: observation for level in lock.context.ladder_tokens}
+    malformed[8192] = replace(observation, metrics={"exact_match": 1.0})
+    with pytest.raises(ReferenceHarnessError, match="metric set"):
+        run_reference_harness(
+            lock,
+            fixture_bytes,
+            DeterministicExecutor(),
+            _execution_identity(),
+            precomputed_long_context=malformed,
         )

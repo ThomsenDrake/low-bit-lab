@@ -7,6 +7,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Protocol
 
+from lowbit_lab.constants import EVALUATION_FAMILIES
 from lowbit_lab.evaluation_lock import (
     EvaluationLockError,
     PendingEvaluationLock,
@@ -50,6 +51,145 @@ class ReferenceManifest:
     status: str
     canonical_json: str
     sha256: str
+
+
+def validate_reference_manifest_bytes(
+    content: bytes,
+    *,
+    evaluation_lock_sha256: str,
+    context_ladder_tokens: tuple[int, ...] | None = None,
+) -> ReferenceManifest:
+    if not isinstance(content, bytes) or len(content) > 65_536:
+        raise ReferenceHarnessError("reference manifest exceeds the response cap")
+    try:
+        raw = json.loads(content)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise ReferenceHarnessError("reference manifest is invalid JSON") from None
+    if not isinstance(raw, Mapping) or set(raw) != {
+        "evaluation_lock_sha256",
+        "execution_identity",
+        "executor_identity",
+        "kind",
+        "measurements",
+        "schema_version",
+        "status",
+    }:
+        raise ReferenceHarnessError("reference manifest schema drift")
+    if (
+        raw["schema_version"] != 1
+        or raw["kind"] != "reference_metrics"
+        or raw["evaluation_lock_sha256"] != evaluation_lock_sha256
+        or raw["status"] != "completed"
+        or not isinstance(raw["measurements"], list)
+    ):
+        raise ReferenceHarnessError("reference manifest identity drift")
+    validate_execution_identity(raw["execution_identity"])
+    executor_identity = raw["executor_identity"]
+    if (
+        not isinstance(executor_identity, Mapping)
+        or set(executor_identity) != {"runtime_sha256", "scorer_sha256"}
+        or any(
+            not isinstance(value, str)
+            or len(value) != 64
+            or any(character not in "0123456789abcdef" for character in value)
+            for value in executor_identity.values()
+        )
+    ):
+        raise ReferenceHarnessError("reference executor identity drift")
+    families: list[str] = []
+    for measurement in raw["measurements"]:
+        if not isinstance(measurement, Mapping) or set(measurement) != {
+            "context_level_tokens",
+            "family",
+            "fixture_id",
+            "metrics",
+            "response_bytes",
+            "response_sha256",
+            "response_tokens",
+            "status",
+        }:
+            raise ReferenceHarnessError("reference manifest measurement drift")
+        family = measurement["family"]
+        if family not in EVALUATION_FAMILIES or measurement["status"] != "completed":
+            raise ReferenceHarnessError("reference manifest measurement drift")
+        context_tokens = measurement["context_level_tokens"]
+        magnitudes = (measurement["response_bytes"], measurement["response_tokens"])
+        if (
+            not isinstance(measurement["fixture_id"], str)
+            or not measurement["fixture_id"]
+            or not isinstance(context_tokens, int)
+            or isinstance(context_tokens, bool)
+            or context_tokens <= 0
+            or any(
+                not isinstance(value, int) or isinstance(value, bool) or value < 0
+                for value in magnitudes
+            )
+        ):
+            raise ReferenceHarnessError("reference manifest measurement drift")
+        digest = measurement["response_sha256"]
+        if (
+            not isinstance(digest, str)
+            or len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+            or not isinstance(measurement["metrics"], Mapping)
+            or not measurement["metrics"]
+            or any(
+                not isinstance(name, str)
+                or not isinstance(value, int | float)
+                or isinstance(value, bool)
+                or not math.isfinite(value)
+                for name, value in measurement["metrics"].items()
+            )
+        ):
+            raise ReferenceHarnessError("reference manifest measurement drift")
+        families.append(str(family))
+    if set(families) != set(EVALUATION_FAMILIES):
+        raise ReferenceHarnessError("reference manifest family set drift")
+    if any(
+        families.count(family) != 1
+        for family in EVALUATION_FAMILIES
+        if family != "long_context_retrieval"
+    ):
+        raise ReferenceHarnessError("reference manifest family set drift")
+    if context_ladder_tokens is not None:
+        levels = tuple(
+            measurement["context_level_tokens"]
+            for measurement in raw["measurements"]
+            if measurement["family"] == "long_context_retrieval"
+        )
+        if levels != context_ladder_tokens:
+            raise ReferenceHarnessError("reference manifest context ladder drift")
+    canonical = json.dumps(raw, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    if content != canonical.encode():
+        raise ReferenceHarnessError("reference manifest must be canonical JSON")
+    return ReferenceManifest(
+        status=str(raw["status"]),
+        canonical_json=canonical,
+        sha256=hashlib.sha256(content).hexdigest(),
+    )
+
+
+def validate_execution_identity(value: object) -> dict[str, str]:
+    fields = {
+        "weight_inventory_sha256",
+        "provenance_manifest_sha256",
+        "runtime_receipt_sha256",
+        "reviewed_commit_sha256",
+        "resource_spec_sha256",
+    }
+    if not isinstance(value, Mapping) or set(value) != fields:
+        raise ReferenceHarnessError("reference execution identity is incomplete")
+    result: dict[str, str] = {}
+    for name, digest in value.items():
+        expected_length = 40 if name == "reviewed_commit_sha256" else 64
+        if (
+            not isinstance(digest, str)
+            or len(digest) != expected_length
+            or any(character not in "0123456789abcdef" for character in digest)
+        ):
+            raise ReferenceHarnessError("reference execution identity is invalid")
+        result[name] = digest
+    return dict(sorted(result.items()))
 
 
 def _validate_lock_identity(lock: PendingEvaluationLock) -> dict[str, object]:
@@ -126,6 +266,8 @@ def run_reference_harness(
     fixture_bytes: Mapping[str, bytes],
     executor: ReferenceExecutor,
     execution_identity: Mapping[str, str],
+    *,
+    precomputed_long_context: Mapping[int, ReferenceObservation] | None = None,
 ) -> ReferenceManifest:
     """Run the deterministic suite and emit reference evidence without promotion behavior."""
 
@@ -148,23 +290,7 @@ def run_reference_harness(
         raise ReferenceHarnessError("reference executor identity is missing") from None
     if executor_identity != expected_executor_identity:
         raise ReferenceHarnessError("reference executor identity does not match the lock")
-    identity_fields = {
-        "weight_inventory_sha256",
-        "provenance_manifest_sha256",
-        "runtime_receipt_sha256",
-        "reviewed_commit_sha256",
-        "resource_spec_sha256",
-    }
-    if not isinstance(execution_identity, Mapping) or set(execution_identity) != identity_fields:
-        raise ReferenceHarnessError("reference execution identity is incomplete")
-    for name, digest in execution_identity.items():
-        expected_length = 40 if name == "reviewed_commit_sha256" else 64
-        if (
-            not isinstance(digest, str)
-            or len(digest) != expected_length
-            or any(character not in "0123456789abcdef" for character in digest)
-        ):
-            raise ReferenceHarnessError("reference execution identity is invalid")
+    bound_execution_identity = validate_execution_identity(execution_identity)
     fixtures = {fixture.fixture_id: fixture for fixture in lock.fixtures}
     generation = lock.generation
     generation_json = json.dumps(
@@ -174,6 +300,15 @@ def run_reference_harness(
     byte_caps = generation["response_caps_bytes"]
     measurements: list[dict[str, object]] = []
     complete = True
+    if precomputed_long_context is not None and (
+        not isinstance(precomputed_long_context, Mapping)
+        or set(precomputed_long_context) != set(lock.context.ladder_tokens)
+        or any(
+            not isinstance(level, int) or isinstance(level, bool)
+            for level in precomputed_long_context
+        )
+    ):
+        raise ReferenceHarnessError("precomputed long-context set drift")
 
     for fixture_id in lock.fixture_order:
         fixture = fixtures[fixture_id]
@@ -194,10 +329,13 @@ def run_reference_harness(
                 response_cap_tokens=token_caps[fixture.family],
                 response_cap_bytes=byte_caps[fixture.family],
             )
-            try:
-                raw_observation = executor.evaluate(request)
-            except Exception:
-                raise ReferenceHarnessError("reference executor failed") from None
+            if fixture.family == "long_context_retrieval" and precomputed_long_context is not None:
+                raw_observation = precomputed_long_context[context_level]
+            else:
+                try:
+                    raw_observation = executor.evaluate(request)
+                except Exception:
+                    raise ReferenceHarnessError("reference executor failed") from None
             observation = _validated_observation(
                 raw_observation,
                 expected_metrics=fixture.metrics,
@@ -223,7 +361,7 @@ def run_reference_harness(
 
     identity = {
         "evaluation_lock_sha256": lock.sha256,
-        "execution_identity": dict(sorted(execution_identity.items())),
+        "execution_identity": bound_execution_identity,
         "executor_identity": dict(sorted(executor_identity.items())),
         "kind": "reference_metrics",
         "measurements": measurements,

@@ -24,6 +24,10 @@ from lowbit_lab.reference_bootstrap import (
     validate_bootstrap_request_bytes,
     validate_stage_receipt,
 )
+from lowbit_lab.reference_harness import (
+    ReferenceHarnessError,
+    validate_reference_manifest_bytes,
+)
 
 MIN_PROJECTION_BYTES = 67_108_864
 MAX_REDIRECTS = 5
@@ -106,10 +110,13 @@ class Loader(Protocol):
 class EvaluationObservation:
     completed: bool
     usefulness_proven: bool
+    manifest: bytes | None = None
 
 
 class Evaluator(Protocol):
-    def evaluate(self, model: object, context_tokens: int) -> EvaluationObservation: ...
+    def evaluate_context(
+        self, model: object, context_tokens: int, *, deadline_monotonic: float
+    ) -> EvaluationObservation: ...
 
 
 @dataclass(frozen=True)
@@ -122,6 +129,12 @@ class ExecutionDependencies:
     loader: Loader
     evaluator: Evaluator
     environment: Mapping[str, str] | None = None
+
+
+@dataclass(frozen=True)
+class ExecutionResult:
+    receipt: bytes
+    manifest: bytes | None
 
 
 class ExecutionFailure(RuntimeError):
@@ -160,8 +173,9 @@ class ReferenceExecution:
         self.model: object | None = None
         self.max_context = 0
         self.full_usefulness = False
+        self.manifest: bytes | None = None
 
-    def run(self) -> bytes:
+    def run(self) -> ExecutionResult:
         stage_functions = (
             self._runtime_identity,
             self._source_transfer,
@@ -176,18 +190,20 @@ class ReferenceExecution:
                 self._append_stage(ordinal, "completed", None, measurements)
             except Exception as exc:  # fail closed for unexpected backend failures
                 code = exc.code if isinstance(exc, ExecutionFailure) else "unknown_failure"
+                if ordinal == 4:
+                    self.manifest = None
                 if isinstance(exc, _StageFailure):
                     code = exc.code
                     measurements = (
-                        exc.measurements
-                        if exc.measurements is not None
-                        else self._empty_measurements(ordinal)
+                        self._empty_measurements(ordinal)
+                        if ordinal == 4 or exc.measurements is None
+                        else exc.measurements
                     )
                 else:
                     measurements = self._empty_measurements(ordinal)
                 self._append_stage(ordinal, "failed", code, measurements, tolerate_clock=True)
-                return self._final_receipt(False)
-        return self._final_receipt(True)
+                return ExecutionResult(self._final_receipt(False), None)
+        return ExecutionResult(self._final_receipt(True), self.manifest)
 
     def _now(self) -> float:
         now = self.deps.clock.monotonic()
@@ -443,19 +459,40 @@ class ReferenceExecution:
         usefulness = False
         for tokens in self.request.context_ladder_tokens:
             started = self._now()
-            result = self.deps.evaluator.evaluate(self.model, tokens)
+            result = self.deps.evaluator.evaluate_context(
+                self.model,
+                tokens,
+                deadline_monotonic=self.deadline - FUTURE_STAGE_RESERVES_SECONDS["finalization"],
+            )
             ended = self._now()
             duration = ended - started
             if (
                 not isinstance(result.completed, bool)
                 or not isinstance(result.usefulness_proven, bool)
+                or (result.manifest is not None and not isinstance(result.manifest, bytes))
                 or duration < 0
             ):
                 raise _StageFailure("malformed_metrics")
+            is_final = tokens == self.request.context_ladder_tokens[-1]
+            if (result.manifest is not None) != is_final:
+                raise _StageFailure("manifest_binding_drift")
             if not result.completed:
                 raise _StageFailure("context_incomplete", self._evaluation_measurements())
             self.max_context = tokens
             usefulness = result.usefulness_proven
+            if result.manifest is not None:
+                try:
+                    lineage = self.raw["lineage"]
+                    manifest = validate_reference_manifest_bytes(
+                        result.manifest,
+                        evaluation_lock_sha256=lineage["evaluation_lock_sha256"],
+                        context_ladder_tokens=self.request.context_ladder_tokens,
+                    )
+                    if manifest.status != "completed":
+                        raise ReferenceHarnessError("reference manifest is incomplete")
+                except (KeyError, ReferenceHarnessError):
+                    raise _StageFailure("manifest_binding_drift") from None
+                self.manifest = result.manifest
             observations.append((tokens, duration))
             remaining_tokens = self.request.context_ladder_tokens[len(observations) :]
             if remaining_tokens:
@@ -474,6 +511,8 @@ class ReferenceExecution:
                 )
                 self._require_seconds(projected + FUTURE_STAGE_RESERVES_SECONDS["finalization"])
         self.full_usefulness = usefulness and self.max_context == CONFIGURED_CONTEXT_TOKENS
+        if self.manifest is None:
+            raise _StageFailure("manifest_missing", self._evaluation_measurements())
         measurements = self._evaluation_measurements()
         self._require_seconds(
             FUTURE_STAGE_RESERVES_SECONDS["finalization"], measurements=measurements
@@ -489,6 +528,10 @@ class ReferenceExecution:
                 tokens <= self.max_context for tokens in self.request.context_ladder_tokens
             ),
             "max_completed_context_tokens": self.max_context,
+            "reference_manifest_bytes": len(self.manifest or b""),
+            "reference_manifest_sha256": (
+                hashlib.sha256(self.manifest).hexdigest() if self.manifest is not None else None
+            ),
             "usefulness_proven": self.full_usefulness if full else False,
         }
 
@@ -655,7 +698,7 @@ def execute_reference_request(
     dependencies: ExecutionDependencies,
     *,
     deadline_started_monotonic: float,
-) -> bytes:
+) -> ExecutionResult:
     """Validated boundary used by fake and provider adapters."""
     validated_request = validate_bootstrap_request_bytes(request.canonical_json.encode("utf-8"))
     if validated_request != request:
