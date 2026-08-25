@@ -406,6 +406,21 @@ def _database_money(value: str, label: str) -> Decimal:
     return parsed
 
 
+def _database_actual_money(value: str, label: str) -> Decimal:
+    try:
+        parsed = Decimal(value)
+    except (InvalidOperation, TypeError) as exc:
+        raise DatabaseError(f"{label} must be a decimal string") from exc
+    if (
+        not isinstance(value, str)
+        or not parsed.is_finite()
+        or parsed < 0
+        or parsed.as_tuple().exponent < -10
+    ):
+        raise DatabaseError(f"{label} must be finite, non-negative, and at most 10 decimals")
+    return parsed
+
+
 def _database_sha256(value: str, label: str) -> str:
     if not isinstance(value, str) or SHA256_RE.fullmatch(value) is None:
         raise DatabaseError(f"{label} must be lowercase SHA-256")
@@ -429,25 +444,25 @@ def _committed_provider_cost(connection: sqlite3.Connection) -> Decimal:
             reference_execution_scope_sha256
         FROM budget_reservations WHERE status != 'released'"""
     ):
-        value = (
-            row["provider_actual_cost_usd"]
-            if row["reference_execution_scope_sha256"] is not None
+        use_actual = (
+            row["reference_execution_scope_sha256"] is not None
             and row["status"] in {"settled", "failed"}
             and row["provider_actual_cost_usd"] is not None
-            else row["requested_cost_usd"]
         )
-        committed += _database_money(value, "stored reference reservation cost")
+        value = row["provider_actual_cost_usd"] if use_actual else row["requested_cost_usd"]
+        parser = _database_actual_money if use_actual else _database_money
+        committed += parser(value, "stored reference reservation cost")
     for row in connection.execute(
         """SELECT status, requested_cost_usd, provider_actual_cost_usd
         FROM provider_smoke_reservations"""
     ):
-        value = (
-            row["provider_actual_cost_usd"]
-            if row["status"] in {"settled", "failed"}
+        use_actual = (
+            row["status"] in {"settled", "failed"}
             and row["provider_actual_cost_usd"] is not None
-            else row["requested_cost_usd"]
         )
-        committed += _database_money(value, "stored provider smoke cost")
+        value = row["provider_actual_cost_usd"] if use_actual else row["requested_cost_usd"]
+        parser = _database_actual_money if use_actual else _database_money
+        committed += parser(value, "stored provider smoke cost")
     return committed
 
 
@@ -488,7 +503,7 @@ def _reference_billing_report(
     _database_timestamp(report["covered_through"], "covered_through")
     if not isinstance(report.get("actual_cost_usd"), str):
         raise DatabaseError("billing report receipt cost is invalid")
-    return report, _database_money(report["actual_cost_usd"], "actual_cost_usd")
+    return report, _database_actual_money(report["actual_cost_usd"], "actual_cost_usd")
 
 
 def _reference_challenge(config_json: str, config_sha256: str) -> tuple[str, dict[str, Any]]:
@@ -2794,7 +2809,7 @@ class ResultsDatabase:
         billing_report_sha256: str,
         occurred_at: str,
     ) -> None:
-        actual = _database_money(actual_cost_usd, "actual_cost_usd")
+        actual = _database_actual_money(actual_cost_usd, "actual_cost_usd")
         _database_sha256(billing_authority_sha256, "billing_authority_sha256")
         _database_sha256(
             authoritative_report_identity_sha256,

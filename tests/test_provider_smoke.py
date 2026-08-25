@@ -516,7 +516,7 @@ def test_provider_smoke_settlement_requires_complete_authoritative_billing(
     root = tmp_path
     database, contract = _settlement_ready_database(root / "results/local/reference.sqlite")
 
-    report = _billing_report(contract)
+    report = _billing_report(contract, cost="0.00270969")
     report_sha256 = hashlib.sha256(report.encode()).hexdigest()
     with pytest.raises(DatabaseError, match="authority"):
         database.settle_provider_smoke(
@@ -556,7 +556,7 @@ def test_provider_smoke_settlement_requires_complete_authoritative_billing(
     assert settlement == {
         "command": "settle",
         "ok": True,
-        "provider_actual_cost_usd": "3.75",
+        "provider_actual_cost_usd": "0.00270969",
         "provider_contacted": False,
         "status": "settled",
     }
@@ -572,7 +572,7 @@ def test_provider_smoke_settlement_requires_complete_authoritative_billing(
             "SELECT status, provider_actual_cost_usd, settlement_identity "
             "FROM provider_smoke_reservations"
         ).fetchone()
-    assert tuple(row) == ("settled", "3.75", report_sha256)
+    assert tuple(row) == ("settled", "0.00270969", report_sha256)
 
 
 def test_provider_smoke_over_cap_settlement_fails_closed(tmp_path: Path) -> None:
