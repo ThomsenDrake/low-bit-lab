@@ -10,6 +10,9 @@ from typing import Any
 from lowbit_lab.constants import (
     REFERENCE_AUTHORITY_SHA256,
     REFERENCE_AUTHORITY_STATEMENT_SHA256,
+    REFERENCE_BOOTSTRAP_AUTHORITY_SHA256,
+    REFERENCE_BOOTSTRAP_MERGE_COMMIT,
+    REFERENCE_BOOTSTRAP_STATEMENT_SHA256,
     REFERENCE_CUMULATIVE_CAP_USD,
     REFERENCE_INCREMENTAL_CAP_USD,
 )
@@ -24,6 +27,8 @@ ACTION_CLASSES = (
 
 STATEMENT_PATH = Path("configs/local/reference-authority-statement.txt")
 AUTHORITY_PATH = Path("configs/local/reference-campaign-authority.json")
+BOOTSTRAP_STATEMENT_PATH = Path("configs/local/reference-bootstrap-statement.txt")
+BOOTSTRAP_AUTHORITY_PATH = Path("configs/local/reference-bootstrap-authority.json")
 CONTROLLING_PLANS = {
     "original_reference_baseline": (
         Path("docs/plans/local/2026-08-21-2358-feat-full-weight-baseline-plan.md"),
@@ -43,6 +48,26 @@ CONTROLLING_PLANS = {
     ),
 }
 
+BOOTSTRAP_ACTION_CLASS = "u8_reference_once"
+BOOTSTRAPPED_PROVIDER_FACTS = (
+    "cold_path_timing",
+    "provider_image_identity",
+    "runtime_allocator_overhead",
+    "usable_gpu_memory",
+)
+BOOTSTRAP_PRE_SUBMIT_GATES = (
+    "clean_tree",
+    "cumulative_budget",
+    "evaluation_lock",
+    "immutable_inventory",
+    "known_memory_lower_bound",
+    "privacy",
+    "provenance",
+    "resource_envelope",
+    "source_hashes",
+    "static_lineage",
+)
+
 
 class ReferenceAuthorityError(ValueError):
     pass
@@ -53,9 +78,7 @@ def _expected_authority() -> dict[str, Any]:
         "schema_version": 1,
         "kind": "autonomous_reference_baseline_authority",
         "statement_sha256": REFERENCE_AUTHORITY_STATEMENT_SHA256,
-        "controlling_plans": {
-            name: digest for name, (_, digest) in CONTROLLING_PLANS.items()
-        },
+        "controlling_plans": {name: digest for name, (_, digest) in CONTROLLING_PLANS.items()},
         "action_classes": list(ACTION_CLASSES),
         "u8_slots": 1,
         "incremental_u8_cap_usd": str(REFERENCE_INCREMENTAL_CAP_USD),
@@ -73,6 +96,45 @@ def _expected_authority() -> dict[str, Any]:
         "persistent_storage_authorized": False,
         "scheduling_authorized": False,
         "destructive_cleanup_authorized": False,
+    }
+
+
+def _expected_bootstrap_authority() -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "kind": "reference_bootstrap_evidence_amendment",
+        "statement_sha256": REFERENCE_BOOTSTRAP_STATEMENT_SHA256,
+        "parent_authority_sha256": REFERENCE_AUTHORITY_SHA256,
+        "merge_commit": REFERENCE_BOOTSTRAP_MERGE_COMMIT,
+        "action_class": BOOTSTRAP_ACTION_CLASS,
+        "u8_slots": 1,
+        "incremental_u8_cap_usd": str(REFERENCE_INCREMENTAL_CAP_USD),
+        "cumulative_lab_cap_usd": str(REFERENCE_CUMULATIVE_CAP_USD),
+        "gpu": "A100-80GB:1",
+        "max_concurrent_containers": 1,
+        "timeout_seconds": 2700,
+        "ephemeral_disk_mib": 524288,
+        "provider_retries": 0,
+        "application_retries": 0,
+        "configured_context_tokens": 262144,
+        "empirical_provider_facts_may_be_bootstrapped": list(BOOTSTRAPPED_PROVIDER_FACTS),
+        "required_pre_submit_gates": list(BOOTSTRAP_PRE_SUBMIT_GATES),
+        "staged_fail_closed_checkpoints_required": True,
+        "immutable_public_file_hash_verification_required": True,
+        "projected_timeout_stop_required": True,
+        "sanitized_evidence_only": True,
+        "context_reduction_authorized": False,
+        "additional_provider_actions_authorized": False,
+        "overlapping_reservations_authorized": False,
+        "retries_or_fallback_authorized": False,
+        "weights_remote_public_retrieval_authorized": True,
+        "audited_function_definition_only": True,
+        "secrets_mounts_volumes_schedules_authorized": False,
+        "private_data_or_local_weight_transfer_authorized": False,
+        "candidate_conversion_training_promotion_authorized": False,
+        "submitted_failed_or_ambiguous_consumes_slot": True,
+        "authoritative_billing_settlement_required": True,
+        "u9_proposal_only": True,
     }
 
 
@@ -168,6 +230,70 @@ def authorize_reference_action(
     if action_class not in ACTION_CLASSES:
         raise ReferenceAuthorityError("reference action class is not authorized")
     authority_sha256 = validate_reference_authority(root, authority_path)
-    return sha256_json(
-        {"authority_sha256": authority_sha256, "action_class": action_class}
+    return sha256_json({"authority_sha256": authority_sha256, "action_class": action_class})
+
+
+def validate_reference_bootstrap_authority(
+    root: Path,
+    authority_path: Path = BOOTSTRAP_AUTHORITY_PATH,
+) -> str:
+    """Validate the amendment without replacing or broadening its parent."""
+    validate_reference_authority(root, AUTHORITY_PATH)
+    root = root.resolve(strict=True)
+    expected_path = _confined_path(root, BOOTSTRAP_AUTHORITY_PATH, "reference bootstrap authority")
+    resolved_path = (
+        authority_path.resolve()
+        if authority_path.is_absolute()
+        else (root / authority_path).resolve()
     )
+    if resolved_path != expected_path:
+        raise ReferenceAuthorityError("reference bootstrap authority path is fixed")
+
+    statement = _read(
+        _confined_path(root, BOOTSTRAP_STATEMENT_PATH, "reference bootstrap authority statement"),
+        "reference bootstrap authority statement",
+    )
+    if (
+        statement.startswith(b"\xef\xbb\xbf")
+        or statement.endswith((b"\r", b"\n"))
+        or hashlib.sha256(statement).hexdigest() != REFERENCE_BOOTSTRAP_STATEMENT_SHA256
+    ):
+        raise ReferenceAuthorityError("reference bootstrap authority statement bytes have drifted")
+    try:
+        statement.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as exc:
+        raise ReferenceAuthorityError(
+            "reference bootstrap authority statement is not UTF-8"
+        ) from exc
+
+    authority_bytes = _read(resolved_path, "reference bootstrap authority")
+    try:
+        authority = json.loads(
+            authority_bytes.decode("utf-8", errors="strict"),
+            object_pairs_hook=_reject_duplicate_keys,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ReferenceAuthorityError(
+            "reference bootstrap authority is not valid UTF-8 JSON"
+        ) from exc
+    expected = _expected_bootstrap_authority()
+    canonical_bytes = (
+        json.dumps(expected, sort_keys=True, separators=(",", ":"), ensure_ascii=True) + "\n"
+    ).encode("utf-8")
+    if authority_bytes != canonical_bytes:
+        raise ReferenceAuthorityError("reference bootstrap authority raw bytes are not canonical")
+    if authority != expected or sha256_json(authority) != REFERENCE_BOOTSTRAP_AUTHORITY_SHA256:
+        raise ReferenceAuthorityError("reference bootstrap authority boundary has drifted")
+    return REFERENCE_BOOTSTRAP_AUTHORITY_SHA256
+
+
+def authorize_reference_bootstrap_action(
+    root: Path,
+    authority_path: Path,
+    action_class: str,
+) -> str:
+    """Authorize only the already-granted one-shot U8 action."""
+    if action_class != BOOTSTRAP_ACTION_CLASS:
+        raise ReferenceAuthorityError("reference bootstrap action class is not authorized")
+    authority_sha256 = validate_reference_bootstrap_authority(root, authority_path)
+    return sha256_json({"authority_sha256": authority_sha256, "action_class": action_class})

@@ -15,6 +15,7 @@ from typing import Any
 from lowbit_lab.config import IMMUTABLE_REVISION_RE, SHA256_RE
 from lowbit_lab.constants import (
     REFERENCE_AUTHORITY_SHA256,
+    REFERENCE_BOOTSTRAP_AUTHORITY_SHA256,
     REFERENCE_CUMULATIVE_CAP_USD,
     REFERENCE_INCREMENTAL_CAP_USD,
     REFERENCE_SETTLED_SMOKE_USD,
@@ -22,8 +23,10 @@ from lowbit_lab.constants import (
 from lowbit_lab.jsonio import emit
 from lowbit_lab.reference_authority import (
     AUTHORITY_PATH,
+    BOOTSTRAP_AUTHORITY_PATH,
     ReferenceAuthorityError,
     validate_reference_authority,
+    validate_reference_bootstrap_authority,
 )
 from lowbit_lab.reference_contract import (
     APPROVED_PROVIDER_AMENDMENT_PATH,
@@ -485,8 +488,7 @@ def _committed_reference_cost(connection: sqlite3.Connection) -> Decimal:
         FROM budget_reservations WHERE status != 'released'"""
     ):
         use_actual = (
-            row["status"] in {"settled", "failed"}
-            and row["provider_actual_cost_usd"] is not None
+            row["status"] in {"settled", "failed"} and row["provider_actual_cost_usd"] is not None
         )
         value = row["provider_actual_cost_usd"] if use_actual else row["requested_cost_usd"]
         parser = _database_actual_money if use_actual else _database_money
@@ -501,8 +503,7 @@ def _committed_provider_smoke_cost(connection: sqlite3.Connection) -> Decimal:
         FROM provider_smoke_reservations"""
     ):
         use_actual = (
-            row["status"] in {"settled", "failed"}
-            and row["provider_actual_cost_usd"] is not None
+            row["status"] in {"settled", "failed"} and row["provider_actual_cost_usd"] is not None
         )
         value = row["provider_actual_cost_usd"] if use_actual else row["requested_cost_usd"]
         parser = _database_actual_money if use_actual else _database_money
@@ -986,9 +987,7 @@ class ResultsDatabase:
                     consumed_at TEXT NOT NULL
                 )"""
             )
-            if connection.execute(
-                "SELECT 1 FROM reference_authority_slots LIMIT 1"
-            ).fetchone():
+            if connection.execute("SELECT 1 FROM reference_authority_slots LIMIT 1").fetchone():
                 raise DatabaseError("schema v9 authority-slot history is ambiguous")
             history_tables = connection.execute(
                 """SELECT name FROM sqlite_master
@@ -1049,9 +1048,9 @@ class ResultsDatabase:
                 WHERE type = 'table' AND name = 'budget_reservations'"""
             ).fetchone()
             if exists is not None:
-                before = connection.execute(
-                    "SELECT count(*) FROM budget_reservations"
-                ).fetchone()[0]
+                before = connection.execute("SELECT count(*) FROM budget_reservations").fetchone()[
+                    0
+                ]
                 connection.execute(
                     """CREATE TABLE budget_reservations_v10 (
                         reservation_id TEXT PRIMARY KEY,
@@ -1141,9 +1140,7 @@ class ResultsDatabase:
                     """CREATE INDEX budget_reservations_reference_scope
                     ON budget_reservations(reference_execution_scope_sha256, status)"""
                 )
-                if connection.execute(
-                    "PRAGMA foreign_key_check('budget_reservations')"
-                ).fetchall():
+                if connection.execute("PRAGMA foreign_key_check('budget_reservations')").fetchall():
                     raise DatabaseError("schema v10 budget foreign-key validation failed")
             connection.execute(
                 """INSERT INTO schema_info(version, applied_at)
@@ -1385,9 +1382,7 @@ class ResultsDatabase:
             evidence = json.loads(evidence_json)
         except json.JSONDecodeError as exc:
             raise DatabaseError("provider smoke prelaunch evidence must be JSON") from exc
-        canonical = json.dumps(
-            evidence, sort_keys=True, separators=(",", ":"), ensure_ascii=True
-        )
+        canonical = json.dumps(evidence, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
         fields = {
             "schema_version",
             "kind",
@@ -2677,8 +2672,10 @@ class ResultsDatabase:
         challenge_sha256: str,
         approval_digest: str,
         standing_authority_sha256: str,
+        bootstrap_authority_sha256: str,
         authority_root: Path,
         authority_path: Path = AUTHORITY_PATH,
+        bootstrap_authority_path: Path = BOOTSTRAP_AUTHORITY_PATH,
     ) -> None:
         requested = _database_money(requested_cost_usd, "requested_cost_usd")
         phase_cap = _database_money(phase_cap_usd, "phase_cap_usd")
@@ -2696,14 +2693,23 @@ class ResultsDatabase:
             )
         if standing_authority_sha256 != REFERENCE_AUTHORITY_SHA256:
             raise DatabaseError("reference standing authority is invalid")
+        if bootstrap_authority_sha256 != REFERENCE_BOOTSTRAP_AUTHORITY_SHA256:
+            raise DatabaseError("reference bootstrap authority is invalid")
         try:
             validated_authority_sha256 = validate_reference_authority(
                 authority_root, authority_path
             )
+            validated_bootstrap_sha256 = validate_reference_bootstrap_authority(
+                authority_root, bootstrap_authority_path
+            )
         except ReferenceAuthorityError as exc:
-            raise DatabaseError("reference standing authority files are invalid") from exc
+            raise DatabaseError(
+                "reference standing or bootstrap authority files are invalid"
+            ) from exc
         if validated_authority_sha256 != standing_authority_sha256:
             raise DatabaseError("reference standing authority digest does not match its files")
+        if validated_bootstrap_sha256 != bootstrap_authority_sha256:
+            raise DatabaseError("reference bootstrap authority digest does not match its files")
         if not owner_id or not idempotency_key:
             raise DatabaseError("reference reservation requires owner and idempotency key")
         _database_sha256(challenge_sha256, "challenge_sha256")
@@ -2914,22 +2920,35 @@ class ResultsDatabase:
         *,
         owner_id: str,
         standing_authority_sha256: str,
+        bootstrap_authority_sha256: str,
         authority_root: Path,
         occurred_at: str,
         authority_path: Path = AUTHORITY_PATH,
+        bootstrap_authority_path: Path = BOOTSTRAP_AUTHORITY_PATH,
     ) -> None:
         """Consume the one U8 slot immediately before any provider import or contact."""
         occurred = _database_timestamp(occurred_at, "occurred_at")
-        if not owner_id or standing_authority_sha256 != REFERENCE_AUTHORITY_SHA256:
+        if (
+            not owner_id
+            or standing_authority_sha256 != REFERENCE_AUTHORITY_SHA256
+            or bootstrap_authority_sha256 != REFERENCE_BOOTSTRAP_AUTHORITY_SHA256
+        ):
             raise DatabaseError("reference submission boundary authority is invalid")
         try:
             validated_authority_sha256 = validate_reference_authority(
                 authority_root, authority_path
             )
+            validated_bootstrap_sha256 = validate_reference_bootstrap_authority(
+                authority_root, bootstrap_authority_path
+            )
         except ReferenceAuthorityError as exc:
-            raise DatabaseError("reference standing authority files are invalid") from exc
+            raise DatabaseError(
+                "reference standing or bootstrap authority files are invalid"
+            ) from exc
         if validated_authority_sha256 != standing_authority_sha256:
             raise DatabaseError("reference standing authority digest does not match its files")
+        if validated_bootstrap_sha256 != bootstrap_authority_sha256:
+            raise DatabaseError("reference bootstrap authority digest does not match its files")
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
@@ -3036,13 +3055,9 @@ class ResultsDatabase:
                 """SELECT execution_scope_sha256 FROM reference_authority_slots
                 WHERE singleton = 1"""
             ).fetchone()
-            if (
-                row["reference_execution_scope_sha256"] is not None
-                and (
-                    slot is None
-                    or slot["execution_scope_sha256"]
-                    != row["reference_execution_scope_sha256"]
-                )
+            if row["reference_execution_scope_sha256"] is not None and (
+                slot is None
+                or slot["execution_scope_sha256"] != row["reference_execution_scope_sha256"]
             ):
                 raise DatabaseError("reference provider-contact boundary was not consumed")
             cursor = connection.execute(
