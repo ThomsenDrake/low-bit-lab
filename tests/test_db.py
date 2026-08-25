@@ -1,5 +1,6 @@
 import hashlib
 import json
+import sqlite3
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -606,7 +607,10 @@ def test_populated_v4_migration_preserves_legacy_rows_without_scope_authority(
     database = ResultsDatabase(path)
     database.initialize()
     with database.connect() as connection:
-        assert connection.execute("SELECT max(version) FROM schema_info").fetchone()[0] == 8
+        assert (
+            connection.execute("SELECT max(version) FROM schema_info").fetchone()[0]
+            == SCHEMA_VERSION
+        )
         assert connection.execute("SELECT count(*) FROM experiments").fetchone()[0] == 1
         assert connection.execute("SELECT count(*) FROM budget_reservations").fetchone()[0] == 1
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
@@ -1217,7 +1221,10 @@ def test_v6_to_v7_migration_adds_controller_cycles(tmp_path: Path) -> None:
     database.initialize()
     assert _acquire_controller_cycle(database, "cycle-after-migration") == 1
     with database.connect() as connection:
-        assert connection.execute("SELECT max(version) FROM schema_info").fetchone()[0] == 8
+        assert (
+            connection.execute("SELECT max(version) FROM schema_info").fetchone()[0]
+            == SCHEMA_VERSION
+        )
 
 
 def test_controller_cycle_lifecycle_commits_artifact_with_fencing(tmp_path: Path) -> None:
@@ -1453,3 +1460,71 @@ def test_controller_acquire_atomically_reconciles_expired_cycle(tmp_path: Path) 
         lease_expires_at="2026-08-23T12:07:00+00:00",
     ) == 2
     assert database.get_controller_cycle("cycle-one")["state"] == "failed"
+
+
+def test_reference_u8_slot_is_consumed_once_but_zero_spend_is_reusable(tmp_path: Path) -> None:
+    from lowbit_lab.reference_authority import REFERENCE_AUTHORITY_SHA256
+
+    database = ResultsDatabase(tmp_path / "reference-authority.sqlite")
+    database.initialize()
+    assert database.reference_u8_slot(REFERENCE_AUTHORITY_SHA256)["state"] == "available"
+    database.consume_reference_u8_slot(
+        REFERENCE_AUTHORITY_SHA256,
+        execution_scope_sha256="a" * 64,
+        occurred_at="2026-08-25T12:00:00+00:00",
+    )
+    assert database.reference_u8_slot(REFERENCE_AUTHORITY_SHA256) == {
+        "state": "consumed",
+        "execution_scope_sha256": "a" * 64,
+        "consumed_at": "2026-08-25T12:00:00+00:00",
+    }
+    with pytest.raises(DatabaseError, match="consumed"):
+        database.consume_reference_u8_slot(
+            REFERENCE_AUTHORITY_SHA256,
+            execution_scope_sha256="b" * 64,
+            occurred_at="2026-08-25T12:00:01+00:00",
+        )
+    assert database.reference_u8_slot(REFERENCE_AUTHORITY_SHA256)["state"] == "consumed"
+
+
+def test_concurrent_reference_u8_consumers_cannot_both_acquire(tmp_path: Path) -> None:
+    from lowbit_lab.reference_authority import REFERENCE_AUTHORITY_SHA256
+
+    path = tmp_path / "reference-authority-race.sqlite"
+    ResultsDatabase(path).initialize()
+
+    def consume(scope: str) -> str:
+        try:
+            ResultsDatabase(path).consume_reference_u8_slot(
+                REFERENCE_AUTHORITY_SHA256,
+                execution_scope_sha256=scope * 64,
+                occurred_at="2026-08-25T12:00:00+00:00",
+            )
+        except DatabaseError as exc:
+            return str(exc)
+        return "ok"
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        outcomes = list(executor.map(consume, ("a", "b")))
+    assert outcomes.count("ok") == 1
+    assert sum("consumed" in outcome for outcome in outcomes) == 1
+
+
+def test_reference_u8_slot_rejects_direct_authority_bypass(tmp_path: Path) -> None:
+    database = ResultsDatabase(tmp_path / "reference-authority.sqlite")
+    database.initialize()
+    with pytest.raises(DatabaseError, match="authority"):
+        database.consume_reference_u8_slot(
+            "f" * 64,
+            execution_scope_sha256="a" * 64,
+            occurred_at="2026-08-25T12:00:00+00:00",
+        )
+    with database.connect() as connection, pytest.raises(
+        sqlite3.IntegrityError, match="CHECK constraint"
+    ):
+        connection.execute(
+            """INSERT INTO reference_authority_slots(
+                singleton, authority_sha256, state, execution_scope_sha256, consumed_at
+            ) VALUES (1, ?, 'consumed', ?, ?)""",
+            ("f" * 64, "a" * 64, "2026-08-25T12:00:00+00:00"),
+        )

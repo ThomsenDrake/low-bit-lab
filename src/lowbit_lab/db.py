@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from lowbit_lab.config import IMMUTABLE_REVISION_RE, SHA256_RE
+from lowbit_lab.constants import REFERENCE_AUTHORITY_SHA256
 from lowbit_lab.jsonio import emit
 from lowbit_lab.reference_contract import (
     APPROVED_PROVIDER_AMENDMENT_PATH,
@@ -26,7 +27,7 @@ from lowbit_lab.reference_contract import (
     reference_execution_scope_sha256,
 )
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 REFERENCE_RESERVATION_USD = Decimal("4.00")
 TERMINAL_STATES = {"completed", "failed"}
 TRANSITIONS = {
@@ -248,6 +249,15 @@ CREATE TABLE IF NOT EXISTS provider_smoke_reservations (
     CHECK((status = 'submitted' AND provider_call_id IS NOT NULL) OR status != 'submitted'),
     CHECK((status IN ('failed', 'audit_blocked') AND failure_reason IS NOT NULL)
           OR status NOT IN ('failed', 'audit_blocked'))
+);
+CREATE TABLE IF NOT EXISTS reference_authority_slots (
+    singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+    authority_sha256 TEXT NOT NULL CHECK(
+        authority_sha256 = '8be94c8db6adae0de538ca41f43e7d250b9d4b5af4ffa6cd14ee445ca45d0d61'
+    ),
+    state TEXT NOT NULL CHECK(state = 'consumed'),
+    execution_scope_sha256 TEXT NOT NULL UNIQUE CHECK(length(execution_scope_sha256) = 64),
+    consumed_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS controller_cycles (
     cycle_id TEXT PRIMARY KEY,
@@ -871,6 +881,9 @@ class ResultsDatabase:
             if existing == 7:
                 self._migrate_v7_to_v8(connection)
                 existing = 8
+            if existing == 8:
+                self._migrate_v8_to_v9(connection)
+                existing = 9
             if existing != SCHEMA_VERSION:
                 raise DatabaseError(f"database schema {existing} != supported {SCHEMA_VERSION}")
 
@@ -919,6 +932,77 @@ class ResultsDatabase:
         except Exception as exc:
             connection.rollback()
             raise DatabaseError(f"database schema v8 migration failed: {exc}") from exc
+
+    def _migrate_v8_to_v9(self, connection: sqlite3.Connection) -> None:
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """CREATE TABLE IF NOT EXISTS reference_authority_slots (
+                    singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                    authority_sha256 TEXT NOT NULL CHECK(
+                        authority_sha256 =
+                        '8be94c8db6adae0de538ca41f43e7d250b9d4b5af4ffa6cd14ee445ca45d0d61'
+                    ),
+                    state TEXT NOT NULL CHECK(state = 'consumed'),
+                    execution_scope_sha256 TEXT NOT NULL UNIQUE
+                        CHECK(length(execution_scope_sha256) = 64),
+                    consumed_at TEXT NOT NULL
+                )"""
+            )
+            connection.execute(
+                """INSERT INTO schema_info(version, applied_at)
+                VALUES (9, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))"""
+            )
+            connection.commit()
+        except Exception as exc:
+            connection.rollback()
+            raise DatabaseError(f"database schema v9 migration failed: {exc}") from exc
+
+    def reference_u8_slot(self, authority_sha256: str) -> dict[str, str | None]:
+        if authority_sha256 != REFERENCE_AUTHORITY_SHA256:
+            raise DatabaseError("reference authority is invalid")
+        with self.connect_readonly() as connection:
+            row = connection.execute(
+                """SELECT state, execution_scope_sha256, consumed_at
+                FROM reference_authority_slots WHERE singleton = 1"""
+            ).fetchone()
+        if row is None:
+            return {
+                "state": "available",
+                "execution_scope_sha256": None,
+                "consumed_at": None,
+            }
+        return dict(row)
+
+    def consume_reference_u8_slot(
+        self,
+        authority_sha256: str,
+        *,
+        execution_scope_sha256: str,
+        occurred_at: str,
+    ) -> None:
+        """Permanently consume the sole U8 slot at first provider contact."""
+        if authority_sha256 != REFERENCE_AUTHORITY_SHA256:
+            raise DatabaseError("reference authority is invalid")
+        _database_sha256(execution_scope_sha256, "execution_scope_sha256")
+        _database_timestamp(occurred_at, "occurred_at")
+        try:
+            with self.connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                if connection.execute(
+                    "SELECT 1 FROM reference_authority_slots WHERE singleton = 1"
+                ).fetchone():
+                    raise DatabaseError("reference U8 authority slot is already consumed")
+                connection.execute(
+                    """INSERT INTO reference_authority_slots(
+                        singleton, authority_sha256, state,
+                        execution_scope_sha256, consumed_at
+                    ) VALUES (1, ?, 'consumed', ?, ?)""",
+                    (authority_sha256, execution_scope_sha256, occurred_at),
+                )
+                connection.commit()
+        except sqlite3.IntegrityError as exc:
+            raise DatabaseError("reference U8 authority slot is already consumed") from exc
 
     def reserve_provider_smoke(
         self,
