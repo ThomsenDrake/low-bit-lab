@@ -33,7 +33,7 @@ REFERENCE_RESOURCES: dict[str, object] = {
     "gpu_count": 1,
     "cpu_cores": 8,
     "memory_gib": 96,
-    "ephemeral_disk_gib": 90,
+    "ephemeral_disk_gib": 512,
     "timeout_seconds": 2700,
     "startup_timeout_seconds": None,
     "retries": 0,

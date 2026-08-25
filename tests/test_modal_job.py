@@ -68,7 +68,7 @@ def _config(tmp_path: Path, **changes: object) -> Path:
         (plans / name).write_bytes((repository_plans / name).read_bytes())
     _budget(configs / "reference-budget.json", ORIGINAL_APPROVED_PLAN_SHA256)
     raw = {
-        "schema_version": 4,
+        "schema_version": 5,
         "kind": "modal_reference_preview",
         "experiment_id": "reference-preview-v1",
         "original_approved_plan_path": ORIGINAL_PLAN_PATH,
@@ -104,7 +104,7 @@ def _config(tmp_path: Path, **changes: object) -> Path:
             "gpu_count": 1,
             "cpu_cores": 8,
             "memory_gib": 96,
-            "ephemeral_disk_gib": 90,
+            "ephemeral_disk_gib": 512,
             "timeout_seconds": 2700,
             "startup_timeout_seconds": None,
             "retries": 0,
@@ -140,6 +140,15 @@ def _config(tmp_path: Path, **changes: object) -> Path:
             "memory_fit_evidence_sha256": None,
             "cold_path_time_evidence_path": None,
             "cold_path_time_evidence_sha256": None,
+            "memory_method_path": None,
+            "memory_method_sha256": None,
+            "cold_path_method_path": None,
+            "cold_path_method_sha256": None,
+            "architecture_metadata_path": None,
+            "architecture_metadata_sha256": None,
+            "image_build_identity_path": None,
+            "image_build_identity_sha256": None,
+            "bound_receipt_root": None,
         },
         "approval_artifact_path": None,
     }
@@ -163,7 +172,7 @@ def test_reference_preview_is_exact_non_submitting_and_zero_actual(tmp_path: Pat
         "gpu_count": 1,
         "cpu_cores": 8,
         "memory_gib": 96,
-        "ephemeral_disk_gib": 90,
+        "ephemeral_disk_gib": 512,
         "timeout_seconds": 2700,
         "startup_timeout_seconds": None,
         "retries": 0,
@@ -328,16 +337,19 @@ def test_reference_preview_derives_gates_from_hashed_evidence(tmp_path: Path) ->
         "memory_fit_evidence_sha256": hashlib.sha256(memory.read_bytes()).hexdigest(),
         "cold_path_time_evidence_path": "reports/local/time.json",
         "cold_path_time_evidence_sha256": hashlib.sha256(timing.read_bytes()).hexdigest(),
+        "memory_method_path": None,
+        "memory_method_sha256": None,
+        "cold_path_method_path": None,
+        "cold_path_method_sha256": None,
+        "architecture_metadata_path": None,
+        "architecture_metadata_sha256": None,
+        "image_build_identity_path": None,
+        "image_build_identity_sha256": None,
+        "bound_receipt_root": None,
     }
     path.write_text(yaml.safe_dump(raw), encoding="utf-8")
-    config = load_reference_job_config(path, root=tmp_path)
-    blockers = plan_reference_preview(config, root=tmp_path)["blockers"]
-    assert "memory_fit_unproven" not in blockers
-    assert "cold_path_time_budget_unproven" not in blockers
-
-    memory.write_text("{}", encoding="utf-8")
-    blockers = plan_reference_preview(config, root=tmp_path)["blockers"]
-    assert "memory_fit_unproven" in blockers
+    with pytest.raises(ReferenceJobError, match="schema-v2 reproducibility"):
+        load_reference_job_config(path, root=tmp_path)
 
 
 @pytest.mark.parametrize(

@@ -39,6 +39,11 @@ from lowbit_lab.reference_contract import (
     REFERENCE_RESOURCES,
     reference_execution_scope_sha256,
 )
+from lowbit_lab.reference_evidence import (
+    ReferenceEvidenceError,
+    verify_cold_path_evidence_reproducible,
+    verify_memory_evidence_reproducible,
+)
 from lowbit_lab.reference_gates import (
     ReferenceGateError,
     verify_cold_path_time_evidence,
@@ -140,11 +145,15 @@ def _reject_credential_fields(value: Any, *, path: str = "config") -> None:
     if isinstance(value, dict):
         for key, item in value.items():
             lowered = str(key).lower()
-            credential_like = (
-                lowered in {"password", "passwd", "credential", "token", "secret", "api_key"}
-                or lowered.endswith(
-                    ("_password", "_passwd", "_credential", "_token", "_secret", "_api_key")
-                )
+            credential_like = lowered in {
+                "password",
+                "passwd",
+                "credential",
+                "token",
+                "secret",
+                "api_key",
+            } or lowered.endswith(
+                ("_password", "_passwd", "_credential", "_token", "_secret", "_api_key")
             )
             if key not in {"secrets", "credentials_source"} and credential_like:
                 raise ReferenceJobError(f"credential-like field is forbidden: {path}.{key}")
@@ -184,7 +193,7 @@ def load_reference_job_config(path: Path, *, root: Path) -> ReferenceJobConfig:
         raise ReferenceJobError(f"cannot read reference config: {exc}") from exc
     _reject_credential_fields(raw)
     top = _closed(raw, REFERENCE_FIELDS, "reference config")
-    if top["schema_version"] != 4 or top["kind"] != "modal_reference_preview":
+    if top["schema_version"] != 5 or top["kind"] != "modal_reference_preview":
         raise ReferenceJobError("unsupported reference config")
     if not isinstance(top["experiment_id"], str) or not top["experiment_id"]:
         raise ReferenceJobError("reference experiment_id is required")
@@ -314,9 +323,10 @@ def load_reference_job_config(path: Path, *, root: Path) -> ReferenceJobConfig:
         digest = provider[digest_name]
         if not isinstance(digest, str) or SHA256_RE.fullmatch(digest) is None:
             raise ReferenceJobError(f"{digest_name} must be lowercase SHA-256")
-    if not isinstance(provider["observation_screenshot_sha256"], str) or SHA256_RE.fullmatch(
-        provider["observation_screenshot_sha256"]
-    ) is None:
+    if (
+        not isinstance(provider["observation_screenshot_sha256"], str)
+        or SHA256_RE.fullmatch(provider["observation_screenshot_sha256"]) is None
+    ):
         raise ReferenceJobError("observation_screenshot_sha256 must be lowercase SHA-256")
     if (
         not isinstance(provider["authoritative_report_identity_sha256"], str)
@@ -338,13 +348,9 @@ def load_reference_job_config(path: Path, *, root: Path) -> ReferenceJobConfig:
         evidence_path = provider[path_name]
         evidence_sha = provider[digest_name]
         if (evidence_path is None) != (evidence_sha is None):
-            raise ReferenceJobError(
-                f"{path_name} and {digest_name} must be supplied together"
-            )
+            raise ReferenceJobError(f"{path_name} and {digest_name} must be supplied together")
         if evidence_path is not None:
-            provider[path_name] = _repo_path(
-                root, evidence_path, path_name, "reports/local/"
-            )
+            provider[path_name] = _repo_path(root, evidence_path, path_name, "reports/local/")
             if not isinstance(evidence_sha, str) or SHA256_RE.fullmatch(evidence_sha) is None:
                 raise ReferenceJobError(f"{digest_name} must be lowercase SHA-256")
     if (provider["trust_override_sha256"] is None) != (
@@ -356,8 +362,7 @@ def load_reference_job_config(path: Path, *, root: Path) -> ReferenceJobConfig:
     if provider["human_approval_statement_sha256"] is not None and (
         not isinstance(provider["human_approval_statement_sha256"], str)
         or SHA256_RE.fullmatch(provider["human_approval_statement_sha256"]) is None
-        or provider["human_approval_statement_sha256"]
-        != APPROVED_TRUST_OVERRIDE_STATEMENT_SHA256
+        or provider["human_approval_statement_sha256"] != APPROVED_TRUST_OVERRIDE_STATEMENT_SHA256
     ):
         raise ReferenceJobError("human_approval_statement_sha256 must be lowercase SHA-256")
     gates = _closed(
@@ -370,27 +375,70 @@ def load_reference_job_config(path: Path, *, root: Path) -> ReferenceJobConfig:
             "memory_fit_evidence_sha256",
             "cold_path_time_evidence_path",
             "cold_path_time_evidence_sha256",
+            "memory_method_path",
+            "memory_method_sha256",
+            "cold_path_method_path",
+            "cold_path_method_sha256",
+            "architecture_metadata_path",
+            "architecture_metadata_sha256",
+            "image_build_identity_path",
+            "image_build_identity_sha256",
+            "bound_receipt_root",
         },
         "reference gates",
     )
     for path_name, digest_name in (
         ("memory_fit_evidence_path", "memory_fit_evidence_sha256"),
         ("cold_path_time_evidence_path", "cold_path_time_evidence_sha256"),
+        ("memory_method_path", "memory_method_sha256"),
+        ("cold_path_method_path", "cold_path_method_sha256"),
+        ("architecture_metadata_path", "architecture_metadata_sha256"),
+        ("image_build_identity_path", "image_build_identity_sha256"),
     ):
         evidence_path = gates[path_name]
         evidence_digest = gates[digest_name]
         if (evidence_path is None) != (evidence_digest is None):
             raise ReferenceJobError("reference gate path and SHA-256 must be supplied together")
         if evidence_path is not None:
-            gates[path_name] = _repo_path(root, evidence_path, path_name, "reports/local/")
+            prefix = (
+                "artifacts/local/"
+                if path_name == "architecture_metadata_path"
+                else "reports/local/"
+            )
+            gates[path_name] = _repo_path(root, evidence_path, path_name, prefix)
             if not isinstance(evidence_digest, str) or SHA256_RE.fullmatch(evidence_digest) is None:
                 raise ReferenceJobError(f"{digest_name} must be lowercase SHA-256")
+    receipt_root = gates["bound_receipt_root"]
+    if receipt_root is not None:
+        gates["bound_receipt_root"] = _repo_path(
+            root, receipt_root, "bound_receipt_root", "reports/local/"
+        )
+    evidence_present = any(
+        gates[name] is not None
+        for name in (
+            "memory_fit_evidence_path",
+            "cold_path_time_evidence_path",
+        )
+    )
+    reproducibility_fields = (
+        "memory_method_path",
+        "memory_method_sha256",
+        "cold_path_method_path",
+        "cold_path_method_sha256",
+        "architecture_metadata_path",
+        "architecture_metadata_sha256",
+        "image_build_identity_path",
+        "image_build_identity_sha256",
+        "bound_receipt_root",
+    )
+    if evidence_present and any(gates[name] is None for name in reproducibility_fields):
+        raise ReferenceJobError(
+            "paid gate evidence requires complete schema-v2 reproducibility inputs"
+        )
     formula_path = gates["formula_authority_path"]
     formula_sha = inputs["formula_authority_sha256"]
     if (formula_path is None) != (formula_sha is None):
-        raise ReferenceJobError(
-            "formula authority path and SHA-256 must be supplied together"
-        )
+        raise ReferenceJobError("formula authority path and SHA-256 must be supplied together")
     if formula_path is not None:
         gates["formula_authority_path"] = _repo_path(
             root,
@@ -401,9 +449,7 @@ def load_reference_job_config(path: Path, *, root: Path) -> ReferenceJobConfig:
     formula_approval_path = gates["formula_approval_path"]
     formula_approval_sha = gates["formula_approval_sha256"]
     if (formula_approval_path is None) != (formula_approval_sha is None):
-        raise ReferenceJobError(
-            "formula approval path and SHA-256 must be supplied together"
-        )
+        raise ReferenceJobError("formula approval path and SHA-256 must be supplied together")
     if formula_approval_path is not None:
         gates["formula_approval_path"] = _repo_path(
             root,
@@ -411,15 +457,14 @@ def load_reference_job_config(path: Path, *, root: Path) -> ReferenceJobConfig:
             "formula_approval_path",
             "reports/local/",
         )
-        if not isinstance(formula_approval_sha, str) or SHA256_RE.fullmatch(
-            formula_approval_sha
-        ) is None:
+        if (
+            not isinstance(formula_approval_sha, str)
+            or SHA256_RE.fullmatch(formula_approval_sha) is None
+        ):
             raise ReferenceJobError("formula_approval_sha256 must be lowercase SHA-256")
     approval_path = top["approval_artifact_path"]
     if approval_path is not None:
-        approval_path = _repo_path(
-            root, approval_path, "approval_artifact_path", "configs/local/"
-        )
+        approval_path = _repo_path(root, approval_path, "approval_artifact_path", "configs/local/")
     canonical = json.dumps(top, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
     challenge_material = {
         key: value for key, value in top.items() if key != "approval_artifact_path"
@@ -478,9 +523,7 @@ def plan_reference_preview(config: ReferenceJobConfig, *, root: Path) -> dict[st
             formula_result = verify_formula_authority(
                 root / formula_path,
                 expected_sha256=formula_sha,
-                expected_maximum_context_tokens=int(
-                    config.inputs["evaluation_max_context_tokens"]
-                ),
+                expected_maximum_context_tokens=int(config.inputs["evaluation_max_context_tokens"]),
                 expected_timeout_seconds=int(config.resources["timeout_seconds"]),
             )
             formula_verified = bool(formula_result["verified"])
@@ -525,31 +568,21 @@ def plan_reference_preview(config: ReferenceJobConfig, *, root: Path) -> dict[st
             constraint = verify_provider_constraint_contract(
                 root / str(constraint_path),
                 expected_sha256=str(constraint_sha),
-                expected_workspace_scope_sha256=str(
-                    config.provider["workspace_scope_sha256"]
-                ),
-                expected_environment_scope_sha256=str(
-                    config.provider["environment_scope_sha256"]
-                ),
+                expected_workspace_scope_sha256=str(config.provider["workspace_scope_sha256"]),
+                expected_environment_scope_sha256=str(config.provider["environment_scope_sha256"]),
                 expected_amendment_sha256=config.approved_amendment_sha256,
             )
             observation = verify_provider_observation_receipt(
                 root / str(observation_path),
                 expected_sha256=str(observation_sha),
                 expected_contract_sha256=str(constraint_sha),
-                expected_workspace_scope_sha256=str(
-                    config.provider["workspace_scope_sha256"]
-                ),
-                expected_environment_scope_sha256=str(
-                    config.provider["environment_scope_sha256"]
-                ),
+                expected_workspace_scope_sha256=str(config.provider["workspace_scope_sha256"]),
+                expected_environment_scope_sha256=str(config.provider["environment_scope_sha256"]),
                 expected_amendment_sha256=config.approved_amendment_sha256,
                 validated_at=_now_datetime(),
                 maximum_age_seconds=PROVIDER_APPROVAL_OBSERVATION_MAX_AGE_SECONDS,
             )
-            provider_concurrency_proven = bool(
-                constraint["proven"] and observation["proven"]
-            )
+            provider_concurrency_proven = bool(constraint["proven"] and observation["proven"])
             provider_constraint_authority = "fresh_observation"
         except ReferenceGateError:
             trust_path = config.provider["trust_override_path"]
@@ -591,9 +624,7 @@ def plan_reference_preview(config: ReferenceJobConfig, *, root: Path) -> dict[st
                         expected_environment_scope_sha256=str(
                             config.provider["environment_scope_sha256"]
                         ),
-                        expected_human_statement_sha256=(
-                            APPROVED_TRUST_OVERRIDE_STATEMENT_SHA256
-                        ),
+                        expected_human_statement_sha256=(APPROVED_TRUST_OVERRIDE_STATEMENT_SHA256),
                     )
                     provider_concurrency_proven = bool(
                         constraint["proven"]
@@ -610,12 +641,10 @@ def plan_reference_preview(config: ReferenceJobConfig, *, root: Path) -> dict[st
     if isinstance(billing_path, str) and isinstance(billing_sha, str):
         try:
             billing_authority = verify_provider_billing_authority(
-                    root / billing_path,
-                    expected_sha256=billing_sha,
-                    expected_environment_scope_sha256=str(
-                        config.provider["environment_scope_sha256"]
-                    ),
-                )
+                root / billing_path,
+                expected_sha256=billing_sha,
+                expected_environment_scope_sha256=str(config.provider["environment_scope_sha256"]),
+            )
             provider_billing_scope_proven = bool(
                 billing_authority["proven"]
                 and billing_authority["authoritative_report_identity_sha256"]
@@ -633,48 +662,98 @@ def plan_reference_preview(config: ReferenceJobConfig, *, root: Path) -> dict[st
     memory_path = config.gates["memory_fit_evidence_path"]
     memory_sha = config.gates["memory_fit_evidence_sha256"]
     verified_formula_sha = formula_sha if formula_verified else None
+    memory_method_path = config.gates["memory_method_path"]
+    memory_method_sha = config.gates["memory_method_sha256"]
     if (
         isinstance(memory_path, str)
         and isinstance(memory_sha, str)
         and isinstance(verified_formula_sha, str)
+        and isinstance(memory_method_path, str)
+        and isinstance(memory_method_sha, str)
     ):
         try:
-            memory_fit_proven = verify_memory_fit_evidence(
-                root / memory_path,
-                expected_sha256=memory_sha,
-                expected_inventory_sha256=str(config.inputs["weight_inventory_sha256"]),
-                expected_tensor_bytes=int(config.inputs["weight_inventory_tensor_bytes"]),
-                expected_method_sha256=verified_formula_sha,
-                expected_evaluation_lock_sha256=str(
-                    config.inputs["evaluation_lock_sha256"]
+            reproducible = verify_memory_evidence_reproducible(
+                method_path=root / memory_method_path,
+                method_sha256=memory_method_sha,
+                evidence_path=root / memory_path,
+                evidence_sha256=memory_sha,
+                inventory_path=root / str(config.authority_files["weight_inventory_path"]),
+                architecture_path=root / str(config.gates["architecture_metadata_path"]),
+                expected_architecture_sha256=str(
+                    config.gates["architecture_metadata_sha256"]
                 ),
-                expected_maximum_context_tokens=int(
-                    config.inputs["evaluation_max_context_tokens"]
-                ),
-            ).proven
-        except ReferenceGateError:
+                runtime_receipt_path=root / str(config.authority_files["runtime_receipt_path"]),
+                image_build_identity_path=root / str(config.gates["image_build_identity_path"]),
+                evaluation_lock_path=root / str(config.authority_files["evaluation_lock_path"]),
+                receipt_root=root / str(config.gates["bound_receipt_root"]),
+            )
+            memory_fit_proven = (
+                verify_memory_fit_evidence(
+                    root / memory_path,
+                    expected_sha256=memory_sha,
+                    expected_inventory_sha256=str(config.inputs["weight_inventory_sha256"]),
+                    expected_tensor_bytes=int(config.inputs["weight_inventory_tensor_bytes"]),
+                    expected_method_sha256=memory_method_sha,
+                    expected_evaluation_lock_sha256=str(config.inputs["evaluation_lock_sha256"]),
+                    expected_maximum_context_tokens=int(
+                        config.inputs["evaluation_max_context_tokens"]
+                    ),
+                    expected_runtime_receipt_sha256=str(config.inputs["runtime_receipt_sha256"]),
+                    expected_image_build_identity_sha256=str(
+                        config.gates["image_build_identity_sha256"]
+                    ),
+                    require_schema_v2=True,
+                ).proven
+                and reproducible
+            )
+        except (ReferenceGateError, ReferenceEvidenceError):
             memory_fit_proven = False
     if not memory_fit_proven:
         blockers.append("memory_fit_unproven")
     time_budget_proven = False
     time_path = config.gates["cold_path_time_evidence_path"]
     time_sha = config.gates["cold_path_time_evidence_sha256"]
+    time_method_path = config.gates["cold_path_method_path"]
+    time_method_sha = config.gates["cold_path_method_sha256"]
     if (
         isinstance(time_path, str)
         and isinstance(time_sha, str)
         and isinstance(verified_formula_sha, str)
+        and isinstance(time_method_path, str)
+        and isinstance(time_method_sha, str)
     ):
         try:
-            time_budget_proven = verify_cold_path_time_evidence(
-                root / time_path,
-                expected_sha256=time_sha,
-                timeout_seconds=int(config.resources["timeout_seconds"]),
-                expected_method_sha256=verified_formula_sha,
-                expected_evaluation_lock_sha256=str(
-                    config.inputs["evaluation_lock_sha256"]
-                ),
-            ).proven
-        except ReferenceGateError:
+            reproducible = verify_cold_path_evidence_reproducible(
+                method_path=root / time_method_path,
+                method_sha256=time_method_sha,
+                evidence_path=root / time_path,
+                evidence_sha256=time_sha,
+                inventory_path=root / str(config.authority_files["weight_inventory_path"]),
+                runtime_receipt_path=root / str(config.authority_files["runtime_receipt_path"]),
+                image_build_identity_path=root / str(config.gates["image_build_identity_path"]),
+                evaluation_lock_path=root / str(config.authority_files["evaluation_lock_path"]),
+                receipt_root=root / str(config.gates["bound_receipt_root"]),
+            )
+            time_budget_proven = (
+                verify_cold_path_time_evidence(
+                    root / time_path,
+                    expected_sha256=time_sha,
+                    timeout_seconds=int(config.resources["timeout_seconds"]),
+                    expected_method_sha256=time_method_sha,
+                    expected_evaluation_lock_sha256=str(config.inputs["evaluation_lock_sha256"]),
+                    expected_maximum_context_tokens=int(
+                        config.inputs["evaluation_max_context_tokens"]
+                    ),
+                    expected_inventory_sha256=str(config.inputs["weight_inventory_sha256"]),
+                    expected_runtime_receipt_sha256=str(config.inputs["runtime_receipt_sha256"]),
+                    expected_image_build_identity_sha256=str(
+                        config.gates["image_build_identity_sha256"]
+                    ),
+                    require_schema_v2=True,
+                ).proven
+                and reproducible
+            )
+        except (ReferenceGateError, ReferenceEvidenceError):
             time_budget_proven = False
     if not time_budget_proven:
         blockers.append("cold_path_time_budget_unproven")
@@ -687,9 +766,7 @@ def plan_reference_preview(config: ReferenceJobConfig, *, root: Path) -> dict[st
                 expected_challenge_sha256=config.challenge_sha256,
                 expected_original_plan_sha256=config.original_approved_plan_sha256,
                 expected_amendment_sha256=config.approved_amendment_sha256,
-                expected_trust_override_plan_sha256=(
-                    config.approved_trust_override_plan_sha256
-                ),
+                expected_trust_override_plan_sha256=(config.approved_trust_override_plan_sha256),
                 expected_provider={
                     name: config.provider[name]
                     for name in (
@@ -705,9 +782,9 @@ def plan_reference_preview(config: ReferenceJobConfig, *, root: Path) -> dict[st
                 },
                 now=_now_datetime(),
             )
-            approval_valid = approval["reviewed_commit_sha256"] == config.inputs[
-                "reviewed_commit_sha256"
-            ]
+            approval_valid = (
+                approval["reviewed_commit_sha256"] == config.inputs["reviewed_commit_sha256"]
+            )
             residual_risk_accepted = residual_risk_accepted or approval_valid
         except ReferenceJobError:
             approval_valid = False
@@ -723,9 +800,7 @@ def plan_reference_preview(config: ReferenceJobConfig, *, root: Path) -> dict[st
         "cloud_upload": False,
         "weights_transferred": False,
         "actual_cost_usd": "0",
-        "local_reservation_limit_usd": format(
-            budget_preview.local_reservation_limit_usd, "f"
-        ),
+        "local_reservation_limit_usd": format(budget_preview.local_reservation_limit_usd, "f"),
         "estimated_cost_usd": format(budget_preview.estimated_cost_usd, "f"),
         "resources": config.resources,
         "challenge_sha256": config.challenge_sha256,
@@ -755,19 +830,14 @@ def _verify_reference_authorities(config: ReferenceJobConfig, *, root: Path) -> 
             paths["source_shard_metadata_path"].read_text(encoding="utf-8")
         )
         source_shards = {
-            name: (item["size_bytes"], item["lfs_sha256"])
-            for name, item in source_metadata.items()
+            name: (item["size_bytes"], item["lfs_sha256"]) for name, item in source_metadata.items()
         }
-        inventory_raw = json.loads(
-            paths["weight_inventory_path"].read_text(encoding="utf-8")
-        )
+        inventory_raw = json.loads(paths["weight_inventory_path"].read_text(encoding="utf-8"))
         runtime_lock = load_runtime_lock(paths["runtime_lock_path"], root=root)
         evaluation_raw = json.loads(paths["evaluation_lock_path"].read_text(encoding="utf-8"))
         fixture_root = paths["evaluation_fixture_root"]
         fixture_bytes = {
-            fixture["fixture_id"]: (
-                fixture_root / f"{fixture['fixture_id']}.json"
-            ).read_bytes()
+            fixture["fixture_id"]: (fixture_root / f"{fixture['fixture_id']}.json").read_bytes()
             for fixture in evaluation_raw["fixtures"]
         }
         evaluation_lock = validate_pending_evaluation_lock(
@@ -813,9 +883,7 @@ def redact_provider_output(value: str, *, maximum_chars: int = 4096) -> str:
     for pattern in patterns:
         redacted = re.sub(
             pattern,
-            lambda match: f"{match.group(1)}[REDACTED]"
-            if match.lastindex
-            else "[REDACTED]",
+            lambda match: f"{match.group(1)}[REDACTED]" if match.lastindex else "[REDACTED]",
             redacted,
         )
     return redacted[:maximum_chars]
@@ -870,10 +938,7 @@ def validate_reference_approval(
         raise ReferenceJobError("reference approval original plan mismatch")
     if approval["approved_amendment_sha256"] != expected_amendment_sha256:
         raise ReferenceJobError("reference approval amendment mismatch")
-    if (
-        approval["approved_trust_override_plan_sha256"]
-        != expected_trust_override_plan_sha256
-    ):
+    if approval["approved_trust_override_plan_sha256"] != expected_trust_override_plan_sha256:
         raise ReferenceJobError("reference approval trust override plan mismatch")
     for field in (
         "constraint_contract_sha256",
@@ -917,9 +982,7 @@ def validate_reference_approval(
     }
 
 
-def plan_reference_dry_run(
-    config_path: Path, db_path: Path, root: Path
-) -> dict[str, object]:
+def plan_reference_dry_run(config_path: Path, db_path: Path, root: Path) -> dict[str, object]:
     root = root.resolve()
     db_path = confine_results_db(root, db_path)
     database = ResultsDatabase(db_path)
@@ -1076,9 +1139,7 @@ def main() -> None:
             emit(plan_reference_dry_run(args.config, args.db, args.root.resolve()))
         else:
             emit(
-                plan_modal_dry_run(
-                    args.config, args.db, args.root.resolve(), dry_run=args.dry_run
-                )
+                plan_modal_dry_run(args.config, args.db, args.root.resolve(), dry_run=args.dry_run)
             )
     except Exception as exc:
         emit({"ok": False, "error": type(exc).__name__, "message": str(exc)})

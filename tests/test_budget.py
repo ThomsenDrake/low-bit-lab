@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from lowbit_lab.budget import BudgetError, BudgetGuard, ReferenceBudgetGuard
+from lowbit_lab.constants import REFERENCE_AUTHORITY_SHA256
 
 ROOT = Path(__file__).parents[1]
 
@@ -46,14 +47,16 @@ def test_frozen_ledger_cannot_be_raised(tmp_path: Path) -> None:
 
 def _reference_policy(tmp_path: Path, **changes: object) -> Path:
     raw = {
-        "schema_version": 1,
+        "schema_version": 2,
         "kind": "reference_budget_authority",
         "approved_plan_sha256": "a" * 64,
         "currency": "USD",
         "phase": 1,
         "phase_cap_usd": "4.00",
-        "total_cap_usd": "4.00",
+        "total_cap_usd": "4.00270969",
         "single_job_cap_usd": "4.00",
+        "settled_provider_smoke_actual_usd": "0.00270969",
+        "standing_authority_sha256": REFERENCE_AUTHORITY_SHA256,
         "a100_80gb_price_per_second_usd": "0.000694",
         "cpu_core_price_per_second_usd": "0.0000131",
         "memory_gib_price_per_second_usd": "0.00000222",
@@ -79,6 +82,20 @@ def test_reference_budget_preview_is_exact_but_cannot_authorize_submission(
         guard.authorize_submission(requested_cost_usd="4.00")
 
 
+def test_reference_budget_distinguishes_phase_and_cumulative_commitments(
+    tmp_path: Path,
+) -> None:
+    guard = ReferenceBudgetGuard(
+        _reference_policy(tmp_path, submission_authorized=True),
+        expected_plan_sha256="a" * 64,
+    )
+    authorization = guard.authorize_submission(requested_cost_usd="4.00")
+    assert authorization.phase_spent == Decimal("0")
+    assert authorization.total_spent == Decimal("0.00270969")
+    assert authorization.phase_remaining_after == Decimal("0.00")
+    assert authorization.total_remaining_after == Decimal("0E-8")
+
+
 def test_reference_budget_is_closed_and_bound_to_approved_plan(tmp_path: Path) -> None:
     with pytest.raises(BudgetError, match="plan hash"):
         ReferenceBudgetGuard(
@@ -91,5 +108,10 @@ def test_reference_budget_is_closed_and_bound_to_approved_plan(tmp_path: Path) -
     with pytest.raises(BudgetError, match="local reservation limit"):
         ReferenceBudgetGuard(
             _reference_policy(tmp_path, total_cap_usd="4.01"),
+            expected_plan_sha256="a" * 64,
+        )
+    with pytest.raises(BudgetError, match="settled provider smoke"):
+        ReferenceBudgetGuard(
+            _reference_policy(tmp_path, settled_provider_smoke_actual_usd="0.00"),
             expected_plan_sha256="a" * 64,
         )

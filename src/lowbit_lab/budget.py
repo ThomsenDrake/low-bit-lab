@@ -13,6 +13,10 @@ from lowbit_lab.constants import (
     FROZEN_RESERVE,
     FROZEN_SINGLE_JOB_CAP,
     FROZEN_TOTAL_CREDITS,
+    REFERENCE_AUTHORITY_SHA256,
+    REFERENCE_CUMULATIVE_CAP_USD,
+    REFERENCE_INCREMENTAL_CAP_USD,
+    REFERENCE_SETTLED_SMOKE_USD,
 )
 
 
@@ -146,8 +150,10 @@ class BudgetGuard:
 class ReferenceBudgetGuard:
     """Validate a local reference-run budget without weakening the public zero ledger."""
 
-    LOCAL_RESERVATION_LIMIT = Decimal("4.00")
-    _FIELDS = {
+    LOCAL_RESERVATION_LIMIT = REFERENCE_INCREMENTAL_CAP_USD
+    SETTLED_PROVIDER_SMOKE_ACTUAL = REFERENCE_SETTLED_SMOKE_USD
+    CUMULATIVE_LAB_LIMIT = REFERENCE_CUMULATIVE_CAP_USD
+    _LEGACY_FIELDS = {
         "schema_version",
         "kind",
         "approved_plan_sha256",
@@ -160,6 +166,10 @@ class ReferenceBudgetGuard:
         "cpu_core_price_per_second_usd",
         "memory_gib_price_per_second_usd",
         "submission_authorized",
+    }
+    _FIELDS = _LEGACY_FIELDS | {
+        "settled_provider_smoke_actual_usd",
+        "standing_authority_sha256",
     }
 
     def __init__(self, policy_path: Path, *, expected_plan_sha256: str) -> None:
@@ -180,9 +190,13 @@ class ReferenceBudgetGuard:
         return guard
 
     def _initialize(self, raw: object, *, expected_plan_sha256: str) -> None:
-        if not isinstance(raw, dict) or set(raw) != self._FIELDS:
+        if not isinstance(raw, dict):
             raise BudgetError("reference budget policy schema is closed")
-        if raw["schema_version"] != 1 or raw["kind"] != "reference_budget_authority":
+        schema_version = raw.get("schema_version")
+        expected_fields = self._FIELDS if schema_version == 2 else self._LEGACY_FIELDS
+        if set(raw) != expected_fields:
+            raise BudgetError("reference budget policy schema is closed")
+        if schema_version not in {1, 2} or raw["kind"] != "reference_budget_authority":
             raise BudgetError("unsupported reference budget policy")
         if raw["currency"] != "USD" or raw["phase"] != 1:
             raise BudgetError("reference budget must use USD and phase 1")
@@ -198,8 +212,24 @@ class ReferenceBudgetGuard:
         self.approved_plan_sha256 = plan_hash
         self.phase = raw["phase"]
         self.phase_cap = _money(raw["phase_cap_usd"], "phase_cap_usd")
-        self.total_cap = _money(raw["total_cap_usd"], "total_cap_usd")
+        self.total_cap = (
+            _rate(raw["total_cap_usd"], "total_cap_usd")
+            if schema_version == 2
+            else _money(raw["total_cap_usd"], "total_cap_usd")
+        )
         self.single_job_cap = _money(raw["single_job_cap_usd"], "single_job_cap_usd")
+        self.settled_provider_smoke_actual = Decimal("0")
+        if schema_version == 2:
+            self.settled_provider_smoke_actual = _rate(
+                raw["settled_provider_smoke_actual_usd"],
+                "settled_provider_smoke_actual_usd",
+            )
+            if self.settled_provider_smoke_actual != self.SETTLED_PROVIDER_SMOKE_ACTUAL:
+                raise BudgetError(
+                    "settled provider smoke cost does not match authoritative billing"
+                )
+            if raw["standing_authority_sha256"] != REFERENCE_AUTHORITY_SHA256:
+                raise BudgetError("reference budget standing authority is invalid")
         self.gpu_rate = _rate(
             raw["a100_80gb_price_per_second_usd"],
             "a100_80gb_price_per_second_usd",
@@ -212,13 +242,24 @@ class ReferenceBudgetGuard:
             "memory_gib_price_per_second_usd",
         )
         self.submission_authorized = raw["submission_authorized"]
-        if (
+        if schema_version == 2:
+            if (
+                self.phase_cap != self.LOCAL_RESERVATION_LIMIT
+                or self.total_cap != self.CUMULATIVE_LAB_LIMIT
+                or self.single_job_cap != self.LOCAL_RESERVATION_LIMIT
+            ):
+                raise BudgetError(
+                    "reference budget exceeds the local reservation limit or cumulative cap"
+                )
+            if self.settled_provider_smoke_actual + self.phase_cap != self.total_cap:
+                raise BudgetError("reference budget caps are inconsistent")
+        elif (
             self.phase_cap > self.LOCAL_RESERVATION_LIMIT
             or self.total_cap > self.LOCAL_RESERVATION_LIMIT
             or self.single_job_cap > self.LOCAL_RESERVATION_LIMIT
         ):
             raise BudgetError("reference budget exceeds the local reservation limit")
-        if not (self.single_job_cap <= self.phase_cap <= self.total_cap):
+        elif not (self.single_job_cap <= self.phase_cap <= self.total_cap):
             raise BudgetError("reference budget caps are inconsistent")
 
     def preview(
@@ -252,7 +293,9 @@ class ReferenceBudgetGuard:
             phase=self.phase,
             requested=requested,
             phase_spent=Decimal("0"),
-            total_spent=Decimal("0"),
+            total_spent=self.settled_provider_smoke_actual,
             phase_remaining_after=self.phase_cap - requested,
-            total_remaining_after=self.total_cap - requested,
+            total_remaining_after=(
+                self.total_cap - self.settled_provider_smoke_actual - requested
+            ),
         )

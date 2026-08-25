@@ -1,7 +1,7 @@
 ---
 title: Fail-closed boundaries for a research control plane
 date: 2026-08-21
-last_updated: 2026-08-24
+last_updated: 2026-08-25
 category: best-practices
 module: experiment-control-plane
 problem_type: best_practice
@@ -59,6 +59,18 @@ Apply the same transaction rule to controller leases. Reconcile expired active c
 
 Evidence formulas must be versioned and hashed. Memory and cold-path timing evidence should name the method digest and bind the exact evaluation context; otherwise a valid-looking report can be replayed against a larger context or a different accounting method. Promotion-threshold compilation remains a separate authority step and should be mechanically unavailable until implemented and approved.
 
+A digest-shaped source field is not a finite bound. Require each performance or memory bound to
+come from an exact hash-verified, closed receipt whose digest is independently frozen. Reproduce
+the final aggregate from those receipts and the immutable inventory, runtime, image identity, and
+evaluation lock at the paid consumer. Keep the allowlist empty when no defensible receipt exists;
+`proven: false` is the correct outcome, not an invitation to insert a plausible estimate.
+
+Hybrid architectures need cache accounting for every declared layer type. Validate the layer list
+against the declared layer count, then include full-attention KV plus recurrent and convolution
+state for linear-attention layers using the runtime's declared state dtype. Treat the resulting
+sum as only a known lower bound until runtime overhead, allocator reserve, and usable device memory
+also have independently authorized bounds.
+
 Formula approval must be bound at every consumer, including direct preview, challenge derivation, persisted config gates, and execution-scope hashing. Enforcing it only in a higher-level controller leaves lower-level entrypoints able to construct a different decision surface.
 
 Cross-platform receipts must verify in the environment that owns the executable. Windows cannot
@@ -101,6 +113,13 @@ Persist an explicit `submission_pending` state before importing the provider SDK
 identity is known and a failure after it is known are both audit-blocking; neither may release or
 replay the scope. This separates provider contact from provider completion without inventing a job
 identity during an ambiguous start.
+
+Consume a one-shot execution slot at the final pre-provider boundary, not while constructing a
+purely local reservation. The slot insert and boundary transition belong in one immediate
+transaction before provider import. A confirmed pre-contact release may leave the slot unused;
+submitted or ambiguous contact never restores it. Schema migrations must backfill that slot from
+historical provider-contact evidence, including zero-cost terminal rows, and fail closed when the
+old history has no trustworthy scope or contains multiple candidate executions.
 
 Arm every mutable local authority before hashing the paid-action contract. Flipping an authorization
 flag after approval changes the ledger digest and invalidates the scope. Treat timezone spellings as
