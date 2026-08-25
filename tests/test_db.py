@@ -567,12 +567,12 @@ def _record_settled_provider_smoke(
 def _downgrade_v9_to_v8(path: Path) -> None:
     with sqlite3.connect(path) as connection:
         connection.execute("DROP TABLE reference_authority_slots")
-        connection.execute("UPDATE schema_info SET version = 8 WHERE version = 10")
+        connection.execute("UPDATE schema_info SET version = 8 WHERE version IN (10, 11)")
 
 
 def _downgrade_v10_to_v9(path: Path) -> None:
     with sqlite3.connect(path) as connection:
-        connection.execute("UPDATE schema_info SET version = 9 WHERE version = 10")
+        connection.execute("UPDATE schema_info SET version = 9 WHERE version IN (10, 11)")
 
 
 def _submit(database: ResultsDatabase, reservation_id: str, *, lease: str) -> None:
@@ -583,6 +583,14 @@ def _submit(database: ResultsDatabase, reservation_id: str, *, lease: str) -> No
         bootstrap_authority_sha256=REFERENCE_BOOTSTRAP_AUTHORITY_SHA256,
         authority_root=_authority_root(database),
         occurred_at="2026-08-22T00:00:30+00:00",
+    )
+    database.mark_reference_provider_prepared(
+        reservation_id,
+        owner_id="owner",
+        provider_image_identity=f"im-{reservation_id}",
+        app_identity=f"app-{reservation_id}",
+        occurred_at="2026-08-22T00:00:45+00:00",
+        lease_expires_at="2026-08-22T00:05:00+00:00",
     )
     database.mark_reservation_submitted(
         reservation_id,
@@ -1561,6 +1569,44 @@ def test_reference_provider_boundary_atomically_consumes_u8_slot(tmp_path: Path)
         ],
         "consumed_at": "2026-08-22T00:00:30+00:00",
     }
+
+
+def test_reference_provider_identity_is_durable_before_call_identity(tmp_path: Path) -> None:
+    database = ResultsDatabase(tmp_path / "reference-prepared.sqlite")
+    database.initialize()
+    _record_settled_provider_smoke(database)
+    _reserve(database, suffix="prepared")
+    database.mark_reference_submission_pending(
+        "reservation-prepared",
+        owner_id="owner",
+        standing_authority_sha256=REFERENCE_AUTHORITY_SHA256,
+        bootstrap_authority_sha256=REFERENCE_BOOTSTRAP_AUTHORITY_SHA256,
+        authority_root=_authority_root(database),
+        occurred_at="2026-08-22T00:00:30+00:00",
+    )
+    database.mark_reference_provider_prepared(
+        "reservation-prepared",
+        owner_id="owner",
+        provider_image_identity="im-reference-locked",
+        app_identity="ap-reference-run",
+        occurred_at="2026-08-22T00:00:45+00:00",
+        lease_expires_at="2026-08-22T00:10:00+00:00",
+    )
+    prepared = database.get_reservation("reservation-prepared")
+    assert prepared["status"] == "submission_pending"
+    assert prepared["provider_image_identity"] == "im-reference-locked"
+    assert prepared["app_identity"] == "ap-reference-run"
+    database.mark_reservation_submitted(
+        "reservation-prepared",
+        owner_id="owner",
+        provider_job_id="fc-reference-call",
+        app_identity="ap-reference-run",
+        occurred_at="2026-08-22T00:01:00+00:00",
+        lease_expires_at="2026-08-22T00:20:00+00:00",
+    )
+    assert (
+        database.get_reservation("reservation-prepared")["provider_job_id"] == "fc-reference-call"
+    )
 
 
 def test_failed_reference_reservation_does_not_preconsume_u8_slot(tmp_path: Path) -> None:

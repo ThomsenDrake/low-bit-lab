@@ -40,7 +40,7 @@ from lowbit_lab.reference_contract import (
     reference_execution_scope_sha256,
 )
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 REFERENCE_RESERVATION_USD = REFERENCE_INCREMENTAL_CAP_USD
 TERMINAL_STATES = {"completed", "failed"}
 TRANSITIONS = {
@@ -191,6 +191,7 @@ CREATE TABLE IF NOT EXISTS budget_reservations (
     provider_actual_cost_usd TEXT,
     provider_job_id TEXT UNIQUE,
     app_identity TEXT,
+    provider_image_identity TEXT,
     billing_authority_sha256 TEXT,
     authoritative_report_identity_sha256 TEXT,
     billing_completeness_delay_seconds INTEGER,
@@ -209,6 +210,9 @@ CREATE TABLE IF NOT EXISTS budget_reservations (
     CHECK((status IN ('submitted', 'settlement_pending', 'settled')
            AND provider_job_id IS NOT NULL AND app_identity IS NOT NULL)
           OR status NOT IN ('submitted', 'settlement_pending', 'settled')),
+    CHECK(reference_execution_scope_sha256 IS NULL
+          OR status NOT IN ('submitted', 'settlement_pending', 'settled')
+          OR provider_image_identity IS NOT NULL),
     CHECK(reference_execution_scope_sha256 IS NULL OR
           (billing_authority_sha256 IS NOT NULL
            AND authoritative_report_identity_sha256 IS NOT NULL
@@ -227,6 +231,22 @@ WHERE status IN (
 );
 CREATE INDEX IF NOT EXISTS budget_reservations_reference_scope
 ON budget_reservations(reference_execution_scope_sha256, status);
+CREATE TRIGGER IF NOT EXISTS reference_provider_image_insert
+BEFORE INSERT ON budget_reservations
+WHEN NEW.reference_execution_scope_sha256 IS NOT NULL
+ AND NEW.status IN ('submitted', 'settlement_pending', 'settled')
+ AND NEW.provider_image_identity IS NULL
+BEGIN
+    SELECT RAISE(ABORT, 'reference provider image identity required');
+END;
+CREATE TRIGGER IF NOT EXISTS reference_provider_image_update
+BEFORE UPDATE ON budget_reservations
+WHEN NEW.reference_execution_scope_sha256 IS NOT NULL
+ AND NEW.status IN ('submitted', 'settlement_pending', 'settled')
+ AND NEW.provider_image_identity IS NULL
+BEGIN
+    SELECT RAISE(ABORT, 'reference provider image identity required');
+END;
 CREATE TABLE IF NOT EXISTS reference_approval_challenges (
     challenge_sha256 TEXT PRIMARY KEY CHECK(length(challenge_sha256) = 64),
     packet_sha256 TEXT NOT NULL CHECK(length(packet_sha256) = 64),
@@ -922,6 +942,9 @@ class ResultsDatabase:
             if existing == 9:
                 self._migrate_v9_to_v10(connection)
                 existing = 10
+            if existing == 10:
+                self._migrate_v10_to_v11(connection)
+                existing = 11
             if existing != SCHEMA_VERSION:
                 raise DatabaseError(f"database schema {existing} != supported {SCHEMA_VERSION}")
 
@@ -1152,6 +1175,47 @@ class ResultsDatabase:
             raise DatabaseError(f"database schema v10 migration failed: {exc}") from exc
         finally:
             connection.execute("PRAGMA foreign_keys = ON")
+
+    def _migrate_v10_to_v11(self, connection: sqlite3.Connection) -> None:
+        """Add the identity persisted before the sole spawn without losing old evidence."""
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            table_info = connection.execute("PRAGMA table_info(budget_reservations)").fetchall()
+            columns = {row[1] for row in table_info}
+            if "provider_image_identity" in columns:
+                raise DatabaseError("schema v10 budget reservation shape is invalid")
+            if columns:
+                connection.execute(
+                    "ALTER TABLE budget_reservations ADD COLUMN provider_image_identity TEXT"
+                )
+                connection.execute(
+                """CREATE TRIGGER reference_provider_image_insert
+                BEFORE INSERT ON budget_reservations
+                WHEN NEW.reference_execution_scope_sha256 IS NOT NULL
+                 AND NEW.status IN ('submitted', 'settlement_pending', 'settled')
+                 AND NEW.provider_image_identity IS NULL
+                BEGIN
+                    SELECT RAISE(ABORT, 'reference provider image identity required');
+                END"""
+                )
+                connection.execute(
+                """CREATE TRIGGER reference_provider_image_update
+                BEFORE UPDATE ON budget_reservations
+                WHEN NEW.reference_execution_scope_sha256 IS NOT NULL
+                 AND NEW.status IN ('submitted', 'settlement_pending', 'settled')
+                 AND NEW.provider_image_identity IS NULL
+                BEGIN
+                    SELECT RAISE(ABORT, 'reference provider image identity required');
+                END"""
+                )
+            connection.execute(
+                """INSERT INTO schema_info(version, applied_at)
+                VALUES (11, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))"""
+            )
+            connection.commit()
+        except Exception as exc:
+            connection.rollback()
+            raise DatabaseError(f"database schema v11 migration failed: {exc}") from exc
 
     def reference_u8_slot(self, authority_sha256: str) -> dict[str, str | None]:
         if authority_sha256 != REFERENCE_AUTHORITY_SHA256:
@@ -3016,6 +3080,58 @@ class ResultsDatabase:
             if cursor.rowcount != 1:
                 raise DatabaseError("reference approval cannot be attached")
 
+    def mark_reference_provider_prepared(
+        self,
+        reservation_id: str,
+        *,
+        owner_id: str,
+        provider_image_identity: str,
+        app_identity: str,
+        occurred_at: str,
+        lease_expires_at: str,
+    ) -> None:
+        """Persist the first provider identities before the function can be spawned."""
+        occurred = _database_timestamp(occurred_at, "occurred_at")
+        lease_expiry = _database_timestamp(lease_expires_at, "lease_expires_at")
+        if (
+            not owner_id
+            or not _controller_identifier(provider_image_identity, "provider_image_identity")
+            or not _controller_identifier(app_identity, "app_identity")
+            or lease_expiry <= occurred
+        ):
+            raise DatabaseError("provider preparation identity or lease is invalid")
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """SELECT heartbeat_at, lease_expires_at FROM budget_reservations
+                WHERE reservation_id = ? AND owner_id = ? AND status = 'submission_pending'""",
+                (reservation_id, owner_id),
+            ).fetchone()
+            if (
+                row is None
+                or occurred < _database_timestamp(row["heartbeat_at"], "stored heartbeat_at")
+                or occurred
+                > _database_timestamp(row["lease_expires_at"], "stored lease_expires_at")
+            ):
+                raise DatabaseError("reference provider preparation is not current")
+            cursor = connection.execute(
+                """UPDATE budget_reservations
+                SET provider_image_identity = ?, app_identity = ?, heartbeat_at = ?,
+                    lease_expires_at = ?, updated_at = ?
+                WHERE reservation_id = ? AND owner_id = ? AND status = 'submission_pending'""",
+                (
+                    provider_image_identity,
+                    app_identity,
+                    occurred_at,
+                    lease_expires_at,
+                    occurred_at,
+                    reservation_id,
+                    owner_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise DatabaseError("reference provider preparation transition failed")
+
     def mark_reservation_submitted(
         self,
         reservation_id: str,
@@ -3035,7 +3151,8 @@ class ResultsDatabase:
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
-                """SELECT lease_expires_at, heartbeat_at, reference_execution_scope_sha256
+                """SELECT lease_expires_at, heartbeat_at, reference_execution_scope_sha256,
+                    provider_image_identity, app_identity
                 FROM budget_reservations
                 WHERE reservation_id = ?""",
                 (reservation_id,),
@@ -3044,22 +3161,31 @@ class ResultsDatabase:
                 row["lease_expires_at"], "stored lease_expires_at"
             ):
                 raise DatabaseError("submitted reservation lease has expired")
+            slot = connection.execute(
+                """SELECT execution_scope_sha256 FROM reference_authority_slots
+                WHERE singleton = 1"""
+            ).fetchone()
+            if (
+                row is not None
+                and row["reference_execution_scope_sha256"] is not None
+                and (
+                    slot is None
+                    or slot["execution_scope_sha256"] != row["reference_execution_scope_sha256"]
+                )
+            ):
+                raise DatabaseError("reference provider-contact boundary was not consumed")
             if (
                 row is None
                 or occurred < _database_timestamp(row["heartbeat_at"], "stored heartbeat_at")
                 or lease_expiry
                 <= _database_timestamp(row["lease_expires_at"], "stored lease_expires_at")
+                or (
+                    row["reference_execution_scope_sha256"] is not None
+                    and row["provider_image_identity"] is None
+                )
+                or row["app_identity"] != app_identity
             ):
                 raise DatabaseError("submitted reservation lease must advance")
-            slot = connection.execute(
-                """SELECT execution_scope_sha256 FROM reference_authority_slots
-                WHERE singleton = 1"""
-            ).fetchone()
-            if row["reference_execution_scope_sha256"] is not None and (
-                slot is None
-                or slot["execution_scope_sha256"] != row["reference_execution_scope_sha256"]
-            ):
-                raise DatabaseError("reference provider-contact boundary was not consumed")
             cursor = connection.execute(
                 """UPDATE budget_reservations
                 SET status = 'submitted', provider_job_id = ?, app_identity = ?,
@@ -3130,6 +3256,24 @@ class ResultsDatabase:
             )
             if cursor.rowcount != 1:
                 raise DatabaseError(f"reservation cannot await settlement: {reservation_id}")
+
+    def mark_reference_audit_blocked(
+        self, reservation_id: str, *, owner_id: str, reason: str, occurred_at: str
+    ) -> None:
+        """Make every post-boundary uncertainty durable and non-replayable."""
+        _database_timestamp(occurred_at, "occurred_at")
+        safe_reason = _controller_text(reason, "audit reason", maximum=256)
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            cursor = connection.execute(
+                """UPDATE budget_reservations SET status = 'audit_blocked',
+                    failure_reason = ?, heartbeat_at = ?, updated_at = ?
+                WHERE reservation_id = ? AND owner_id = ?
+                  AND status IN ('submission_pending', 'submitted', 'settlement_pending')""",
+                (safe_reason, occurred_at, occurred_at, reservation_id, owner_id),
+            )
+            if cursor.rowcount != 1:
+                raise DatabaseError("reference audit block lost reservation ownership")
 
     def renew_reservation_lease(
         self,

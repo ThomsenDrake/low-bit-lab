@@ -992,6 +992,25 @@ def test_u8_submission_primitives_are_absent() -> None:
                         node.value.id,
                         node.attr,
                     )
+        elif path.as_posix() == "src/lowbit_lab/reference_modal_adapter.py":
+            assert sorted(violations) == [
+                "App",
+                "modal",
+                "modal._serialization",
+                "modal._vendor",
+                "modal._vendor",
+                "spawn",
+            ], path
+            source = path.read_text(encoding="utf-8")
+            assert source.count("modal.App(") == 1
+            assert source.count("remote.spawn(") == 1
+            assert source.count("app.run(") == 1
+            assert source.count("image.build(") == 1
+            assert "include_source=False" in source
+            assert "retries=0" in source
+            assert "gpu=\"A100-80GB:1\"" in source
+            for forbidden in (".deploy(", "modal.Secret", "modal.Volume", "mounts=", "schedule="):
+                assert forbidden not in source, forbidden
         else:
             assert violations == [], path
 
