@@ -1,0 +1,9 @@
+{
+  "approved_formula_sha256": "a2ee227c0cba04ac2b9af3ff1ca293fe0aabe4b2abe71f7f949a8d54f1f93e68",
+  "formula_authority_path": "reports/local/reference-formula-authority.json",
+  "human_origin": "attested",
+  "kind": "formula_approval_receipt",
+  "reviewed_formula_sha256": "b7d1b7495f2f5396059c693dcde62525a278854b4b8953ce300cd6054f31c163",
+  "schema_version": 1,
+  "statement_sha256": "87b42e40c2a290e01d87b721bf381c3c5e259d1eb0a4660e41fdbf8bc73f7ddd"
+}

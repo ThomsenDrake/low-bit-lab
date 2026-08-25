@@ -19,6 +19,9 @@ from urllib.parse import quote, urlsplit, urlunsplit
 MAX_FILE_BYTES = 24 * 1024 * 1024
 MAX_AGGREGATE_BYTES = 32 * 1024 * 1024
 MAX_METADATA_BYTES = 4 * 1024 * 1024
+MAX_WEIGHT_SHARDS = 4096
+MAX_WEIGHT_SHARD_BYTES = 1024 * 1024 * 1024 * 1024
+MAX_WEIGHT_AGGREGATE_BYTES = 4 * MAX_WEIGHT_SHARD_BYTES
 
 REQUIRED_FILES = frozenset(
     {
@@ -74,6 +77,35 @@ class MetadataPolicy:
 
 
 @dataclass(frozen=True)
+class WeightInventoryBindings:
+    provenance_manifest_sha256: str
+    tokenizer_sha256: str
+    runtime_lock_sha256: str
+    evaluation_lock_sha256: str
+    source_index_sha256: str
+
+
+@dataclass(frozen=True)
+class WeightShard:
+    path: str
+    size_bytes: int
+    lfs_sha256: str
+    content_sha256: str
+
+
+@dataclass(frozen=True)
+class WeightInventory:
+    source_identifier: str
+    source_revision: str
+    source_index_path: str
+    index_tensor_bytes: int
+    aggregate_bytes: int
+    shards: tuple[WeightShard, ...]
+    bindings: WeightInventoryBindings
+    sha256: str
+
+
+@dataclass(frozen=True)
 class ResponseMetadata:
     requested_url: str
     final_url: str
@@ -121,6 +153,229 @@ def _closed_mapping(value: object, keys: set[str], label: str) -> Mapping[str, o
     if missing:
         raise MetadataPolicyError(f"{label} is missing keys: {sorted(missing)}")
     return value
+
+
+def _provenance_closed_mapping(value: object, keys: set[str], label: str) -> Mapping[str, object]:
+    try:
+        return _closed_mapping(value, keys, label)
+    except MetadataPolicyError as exc:
+        raise ProvenanceError(str(exc)) from exc
+
+
+def _weight_sha256(value: object, label: str) -> str:
+    if not isinstance(value, str) or not SHA256_RE.fullmatch(value):
+        raise ProvenanceError(f"{label} must be a lowercase SHA-256")
+    return value
+
+
+def _weight_positive_int(value: object, label: str) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+        raise ProvenanceError(f"{label} must be a positive integer")
+    return value
+
+
+def _strict_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ProvenanceError(f"source index contains duplicate key: {key}")
+        result[key] = value
+    return result
+
+
+def _source_index_contract(source_index_bytes: bytes) -> tuple[set[str], int]:
+    try:
+        raw = json.loads(source_index_bytes, object_pairs_hook=_strict_json_object)
+    except ProvenanceError:
+        raise
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ProvenanceError("source index is not valid JSON") from exc
+    index = _provenance_closed_mapping(raw, {"metadata", "weight_map"}, "source index")
+    metadata = _provenance_closed_mapping(index["metadata"], {"total_size"}, "index metadata")
+    raw_tensor_bytes = metadata["total_size"]
+    if (
+        isinstance(raw_tensor_bytes, bool)
+        or not isinstance(raw_tensor_bytes, int | float)
+        or not math.isfinite(raw_tensor_bytes)
+        or raw_tensor_bytes <= 0
+        or not float(raw_tensor_bytes).is_integer()
+    ):
+        raise ProvenanceError("index tensor byte total must be a positive integer value")
+    tensor_bytes = int(raw_tensor_bytes)
+    weight_map = index["weight_map"]
+    if not isinstance(weight_map, Mapping) or not weight_map:
+        raise ProvenanceError("source index weight_map must be a non-empty object")
+    declared_paths: set[str] = set()
+    for tensor_name, path in weight_map.items():
+        if not isinstance(tensor_name, str) or not tensor_name:
+            raise ProvenanceError("source index tensor names must be non-empty strings")
+        if not isinstance(path, str):
+            raise ProvenanceError("source index shard paths must be strings")
+        _validate_weight_shard_path(path)
+        declared_paths.add(path)
+    return declared_paths, tensor_bytes
+
+
+def _validate_weight_shard_path(path: str) -> None:
+    if (
+        PurePosixPath(path).name != path
+        or "/" in path
+        or "\\" in path
+        or not path.endswith(".safetensors")
+    ):
+        raise ProvenanceError("weight shard paths must be root-level safetensors files")
+
+
+def parse_weight_inventory(
+    raw: object,
+    *,
+    source_index_bytes: bytes,
+    source_shards: Mapping[str, tuple[int, str]],
+    expected_bindings: Mapping[str, str] | None = None,
+) -> WeightInventory:
+    """Validate an immutable weight inventory using metadata only.
+
+    ``source_index_bytes`` and ``source_shards`` are metadata inputs; this function has no
+    file-transfer or network capability. ``source_shards`` must come from the independently
+    authenticated repository metadata response.
+    """
+
+    top = _provenance_closed_mapping(
+        raw,
+        {
+            "schema_version",
+            "source",
+            "bindings",
+            "limits",
+            "index",
+            "shards",
+            "aggregate_bytes",
+        },
+        "weight inventory",
+    )
+    if top["schema_version"] != 1:
+        raise ProvenanceError("weight inventory schema_version must be 1")
+    source = _provenance_closed_mapping(
+        top["source"], {"identifier", "revision"}, "weight inventory source"
+    )
+    identifier = source["identifier"]
+    revision = source["revision"]
+    if not isinstance(identifier, str) or not identifier or identifier.strip() != identifier:
+        raise ProvenanceError("weight inventory source identifier must be non-empty and exact")
+    if not isinstance(revision, str) or not REVISION_RE.fullmatch(revision):
+        raise ProvenanceError("weight inventory source revision must be immutable lowercase hex")
+
+    binding_keys = {
+        "provenance_manifest_sha256",
+        "tokenizer_sha256",
+        "runtime_lock_sha256",
+        "evaluation_lock_sha256",
+        "source_index_sha256",
+    }
+    binding_raw = _provenance_closed_mapping(top["bindings"], binding_keys, "bindings")
+    binding_values = {
+        key: _weight_sha256(binding_raw[key], f"bindings.{key}") for key in binding_keys
+    }
+    if expected_bindings is not None:
+        expected = _provenance_closed_mapping(expected_bindings, binding_keys, "expected bindings")
+        for key in sorted(binding_keys):
+            expected_value = _weight_sha256(expected[key], f"expected bindings.{key}")
+            if binding_values[key] != expected_value:
+                raise ProvenanceError(f"{key} binding mismatch")
+
+    actual_index_sha256 = hashlib.sha256(source_index_bytes).hexdigest()
+    if binding_values["source_index_sha256"] != actual_index_sha256:
+        raise ProvenanceError("source index SHA-256 mismatch")
+    declared_paths, declared_tensor_bytes = _source_index_contract(source_index_bytes)
+
+    limits = _provenance_closed_mapping(
+        top["limits"], {"max_shards", "per_shard_bytes", "aggregate_bytes"}, "limits"
+    )
+    max_shards = _weight_positive_int(limits["max_shards"], "limits.max_shards")
+    per_shard_cap = _weight_positive_int(limits["per_shard_bytes"], "limits.per_shard_bytes")
+    aggregate_cap = _weight_positive_int(limits["aggregate_bytes"], "limits.aggregate_bytes")
+    if max_shards > MAX_WEIGHT_SHARDS:
+        raise ProvenanceError("weight inventory max_shards exceeds the hard safety bound")
+    if per_shard_cap > MAX_WEIGHT_SHARD_BYTES:
+        raise ProvenanceError("weight inventory per-shard cap exceeds the hard safety bound")
+    if aggregate_cap > MAX_WEIGHT_AGGREGATE_BYTES:
+        raise ProvenanceError("weight inventory aggregate cap exceeds the hard safety bound")
+    if per_shard_cap > aggregate_cap:
+        raise ProvenanceError("weight inventory per-shard cap exceeds aggregate cap")
+
+    index = _provenance_closed_mapping(top["index"], {"path", "sha256", "tensor_bytes"}, "index")
+    if index["path"] != "model.safetensors.index.json":
+        raise ProvenanceError("weight inventory source index path is unsupported")
+    if _weight_sha256(index["sha256"], "index.sha256") != actual_index_sha256:
+        raise ProvenanceError("source index SHA-256 mismatch")
+    index_tensor_bytes = _weight_positive_int(index["tensor_bytes"], "index.tensor_bytes")
+    if index_tensor_bytes != declared_tensor_bytes:
+        raise ProvenanceError("index tensor byte total mismatch")
+
+    shard_items = top["shards"]
+    if not isinstance(shard_items, list) or not shard_items:
+        raise ProvenanceError("weight inventory shards must be a non-empty list")
+    if len(shard_items) > max_shards:
+        raise ProvenanceError("weight inventory exceeds max_shards")
+    shards: list[WeightShard] = []
+    seen: set[str] = set()
+    aggregate_bytes = 0
+    for position, raw_shard in enumerate(shard_items):
+        shard = _provenance_closed_mapping(
+            raw_shard,
+            {"path", "size_bytes", "lfs_sha256", "content_sha256"},
+            f"shards[{position}]",
+        )
+        path = shard["path"]
+        if not isinstance(path, str):
+            raise ProvenanceError("weight shard path must be a string")
+        _validate_weight_shard_path(path)
+        if path in seen:
+            raise ProvenanceError(f"duplicate weight shard path: {path}")
+        if path not in declared_paths:
+            raise ProvenanceError(f"weight shard is not declared by the source index: {path}")
+        seen.add(path)
+        size_bytes = _weight_positive_int(shard["size_bytes"], f"size for {path}")
+        if size_bytes > per_shard_cap:
+            raise ProvenanceError(f"weight shard exceeds per-shard cap: {path}")
+        lfs_sha256 = _weight_sha256(shard["lfs_sha256"], f"LFS SHA-256 for {path}")
+        content_sha256 = _weight_sha256(shard["content_sha256"], f"content SHA-256 for {path}")
+        if lfs_sha256 != content_sha256:
+            raise ProvenanceError(f"LFS/content SHA-256 mismatch for {path}")
+        source_identity = source_shards.get(path)
+        if source_identity is None:
+            raise ProvenanceError(f"missing source metadata for weight shard: {path}")
+        if source_identity != (size_bytes, lfs_sha256):
+            raise ProvenanceError(f"source metadata mismatch for weight shard: {path}")
+        aggregate_bytes += size_bytes
+        if aggregate_bytes > aggregate_cap:
+            raise ProvenanceError("weight shard bytes exceed aggregate cap")
+        shards.append(WeightShard(path, size_bytes, lfs_sha256, content_sha256))
+    missing = declared_paths - seen
+    if missing:
+        raise ProvenanceError(f"missing index-declared weight shards: {sorted(missing)}")
+    if set(source_shards) != declared_paths:
+        raise ProvenanceError("source metadata shard set does not match the source index")
+    if [shard.path for shard in shards] != sorted(seen):
+        raise ProvenanceError("weight inventory shards must be sorted by path")
+    declared_aggregate = _weight_positive_int(top["aggregate_bytes"], "aggregate_bytes")
+    if declared_aggregate != aggregate_bytes:
+        raise ProvenanceError("weight inventory aggregate byte total mismatch")
+    if index_tensor_bytes > aggregate_bytes:
+        raise ProvenanceError("index tensor bytes exceed aggregate shard bytes")
+
+    bindings = WeightInventoryBindings(**binding_values)
+    canonical = json.dumps(raw, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return WeightInventory(
+        source_identifier=identifier,
+        source_revision=revision,
+        source_index_path="model.safetensors.index.json",
+        index_tensor_bytes=index_tensor_bytes,
+        aggregate_bytes=aggregate_bytes,
+        shards=tuple(shards),
+        bindings=bindings,
+        sha256=hashlib.sha256(canonical.encode()).hexdigest(),
+    )
 
 
 def _positive_int(value: object, label: str, maximum: int) -> int:
@@ -192,9 +447,7 @@ def parse_metadata_policy(raw: object, *, root: Path) -> MetadataPolicy:
         or any(host != host.lower() or host.strip() != host for host in allowed_hosts)
         or len(set(allowed_hosts)) != len(allowed_hosts)
     ):
-        raise MetadataPolicyError(
-            "network.allowed_hosts must contain unique exact lowercase hosts"
-        )
+        raise MetadataPolicyError("network.allowed_hosts must contain unique exact lowercase hosts")
     hosts = tuple(allowed_hosts)
     metadata_url = _https_url(network["metadata_url"], hosts, "network.metadata_url")
     metadata_format = network["metadata_format"]

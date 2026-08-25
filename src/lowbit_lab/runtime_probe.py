@@ -38,6 +38,41 @@ OBSERVED_CHECK_KEYS = {
     "deterministic_operation": {"state"},
     "synchronization": {"state"},
 }
+ENVIRONMENT_INVENTORY_SCRIPT = r"""
+import importlib.metadata
+import hashlib
+import json
+import os
+import platform
+import re
+import sys
+
+items = []
+for distribution in importlib.metadata.distributions():
+    name = distribution.metadata.get("Name")
+    if not isinstance(name, str):
+        raise RuntimeError("distribution name missing")
+    items.append({"name": re.sub(r"[-_.]+", "-", name).lower(), "version": distribution.version})
+items.sort(key=lambda item: item["name"])
+selected_executable = os.path.realpath(sys.executable)
+selected_prefix = os.path.dirname(os.path.dirname(selected_executable))
+expected_root = os.path.realpath(sys.argv[1])
+selected_executable_within_expected_root = (
+    os.path.commonpath((selected_executable, expected_root)) == expected_root
+)
+with open(selected_executable, "rb") as executable:
+    selected_executable_sha256 = hashlib.file_digest(executable, "sha256").hexdigest()
+print(json.dumps({
+    "implementation": platform.python_implementation(),
+    "python_version": platform.python_version(),
+    "cache_tag": sys.implementation.cache_tag,
+    "abi_flags": getattr(sys, "abiflags", ""),
+    "prefix_is_selected_environment": os.path.realpath(sys.prefix) == selected_prefix,
+    "selected_executable_within_expected_root": selected_executable_within_expected_root,
+    "selected_executable_sha256": selected_executable_sha256,
+    "distributions": items,
+}, sort_keys=True))
+"""
 PROBE_SCRIPT = r"""
 import importlib.metadata
 import json
@@ -142,8 +177,7 @@ def run_wsl_cuda_probe(
     if expected_package_versions is not None and (
         set(expected_package_versions) != {"torch", "transformers"}
         or any(
-            not isinstance(value, str) or not value
-            for value in expected_package_versions.values()
+            not isinstance(value, str) or not value for value in expected_package_versions.values()
         )
     ):
         raise RuntimeContractError("expected package versions must identify torch and transformers")
@@ -175,11 +209,14 @@ def run_wsl_cuda_probe(
                 text=True,
                 timeout=5,
             ).stdout.strip()
-            exists = subprocess.run(
-                ["wsl.exe", "-d", "Ubuntu", "--", "test", "-f", converted],
-                check=False,
-                timeout=5,
-            ).returncode == 0
+            exists = (
+                subprocess.run(
+                    ["wsl.exe", "-d", "Ubuntu", "--", "test", "-f", converted],
+                    check=False,
+                    timeout=5,
+                ).returncode
+                == 0
+            )
         except (OSError, subprocess.SubprocessError):
             return _unknown("WSL_PATH_FAILED", lock_sha256, 0)
         if not converted.startswith("/") or "\n" in converted:
@@ -351,3 +388,118 @@ def run_wsl_cuda_probe(
         "target_support_proven": False,
         "inference_compatibility_proven": False,
     }
+
+
+def run_environment_inventory_probe(
+    *,
+    python_path: Path,
+    root: Path,
+    timeout_seconds: int = 30,
+    runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+) -> dict[str, Any]:
+    """Read a bounded, path-free inventory from the selected repository-local interpreter."""
+    if (
+        not isinstance(timeout_seconds, int)
+        or isinstance(timeout_seconds, bool)
+        or not 1 <= timeout_seconds <= 60
+    ):
+        raise RuntimeContractError("inventory timeout must be between 1 and 60 seconds")
+    resolved_root = root.resolve()
+    executable = python_path.resolve()
+    if not executable.is_relative_to(resolved_root):
+        raise RuntimeContractError("inventory Python must be repository-local")
+    converted: str | None = None
+    converted_root: str | None = None
+    if os.name == "nt" and runner is subprocess.run:
+        try:
+            converted = subprocess.run(
+                [
+                    "wsl.exe",
+                    "-d",
+                    "Ubuntu",
+                    "--",
+                    "wslpath",
+                    "-a",
+                    str(executable).replace("\\", "/"),
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            ).stdout.strip()
+            converted_root = subprocess.run(
+                [
+                    "wsl.exe",
+                    "-d",
+                    "Ubuntu",
+                    "--",
+                    "wslpath",
+                    "-a",
+                    str(resolved_root).replace("\\", "/"),
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            ).stdout.strip()
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise RuntimeContractError("inventory WSL path conversion failed") from exc
+        if (
+            not converted.startswith("/")
+            or "\n" in converted
+            or not converted_root.startswith("/")
+            or "\n" in converted_root
+        ):
+            raise RuntimeContractError("inventory WSL path is invalid")
+        command = [
+            "wsl.exe",
+            "-d",
+            "Ubuntu",
+            "--",
+            "env",
+            "-i",
+            "PATH=/usr/bin:/bin",
+            "PYTHONNOUSERSITE=1",
+            "PYTHONHASHSEED=0",
+            converted,
+            "-I",
+            "-c",
+            ENVIRONMENT_INVENTORY_SCRIPT,
+            converted_root,
+        ]
+        environment = None
+    else:
+        if not executable.is_file():
+            raise RuntimeContractError("inventory Python is missing")
+        command = [
+            str(executable),
+            "-I",
+            "-c",
+            ENVIRONMENT_INVENTORY_SCRIPT,
+            str(resolved_root),
+        ]
+        environment = {"PATH": "", "PYTHONNOUSERSITE": "1", "PYTHONHASHSEED": "0"}
+    try:
+        process = runner(
+            command,
+            cwd=resolved_root,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+            env=environment,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RuntimeContractError("environment inventory probe failed") from exc
+    if (
+        process.returncode != 0
+        or len(process.stdout.encode("utf-8", errors="replace")) > 1024 * 1024
+    ):
+        raise RuntimeContractError("environment inventory probe failed")
+    try:
+        payload = json.loads(process.stdout)
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise RuntimeContractError("environment inventory output is invalid") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeContractError("environment inventory output is invalid")
+    return payload

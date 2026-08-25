@@ -8,7 +8,7 @@ Build a reusable, local-first control plane for reproducible low-bit research. T
 
 - The target remains `unconfigured` until a human approves a target-specific plan.
 - Cloud spend, every phase cap, and the single-job cap remain USD 0.
-- Cloud submission, cloud upload, scheduling, weight download, conversion, training, and destructive cleanup remain disabled.
+- Cloud submission, cloud upload, scheduling, weight download, conversion, training, and destructive cleanup remain disabled by default.
 - Credentials, private code, personal data, and work data must never enter configs, results, artifacts, logs, or remote services.
 - Host, driver, firmware, BIOS, and global system changes are outside agent authority.
 - Configured capability and empirically proven usefulness are distinct states.
@@ -16,6 +16,23 @@ Build a reusable, local-first control plane for reproducible low-bit research. T
 - Unknown states and unknown failure modes stop execution.
 
 Changing a frozen constraint requires an explicit human-approved plan, matching policy and code changes, focused tests, and a review before execution.
+
+The approved no-weight provider-smoke amendment, plan SHA-256
+`dd08a09dbdbd6e88f53a50de932fc15f933ee71d41a21f0f16ad28b68b402d61`, permits
+one audited Modal adapter to be represented in code. It does not authorize executing the adapter,
+reserving money, transferring weights, or U8. The adapter accepts no model identifier or payload,
+and originally required a fresh ignored approval plus an atomic local USD 4.00 reservation.
+Representation is not execution authority. The later campaign authority below supersedes only that
+per-action approval mechanism; one-shot contracts and transactional cumulative-cost reservations
+remain mandatory.
+
+The human-approved autonomous provider-smoke campaign is controlled by plan SHA-256
+`64ad51dec6257987e15077564055cd40a4fbd09c96650c9d9acd0b2350a55807` at
+`docs/plans/2026-08-24-2026-feat-autonomous-provider-smoke-campaign-plan.md`. It permits an ignored,
+mechanically validated standing authority for repeated no-weight smokes within one cumulative
+lifetime USD 4.00 ceiling. Every attempt still requires exact clean lineage, confirmed unspent
+balance, and no overlapping or audit-blocked reservation. It does not authorize weights, payloads,
+target activation, scheduling, destructive cleanup, or U8, and does not change public USD 0 defaults.
 
 ## Repository contract
 

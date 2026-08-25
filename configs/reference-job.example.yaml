@@ -1,0 +1,69 @@
+schema_version: 4
+kind: modal_reference_preview
+experiment_id: example-reference-preview-v1
+original_approved_plan_path: docs/plans/local/approved-reference-plan.md
+original_approved_plan_sha256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+approved_amendment_path: docs/plans/local/approved-provider-constraint-amendment.md
+approved_amendment_sha256: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+approved_trust_override_plan_path: docs/plans/local/approved-provider-trust-override.md
+approved_trust_override_plan_sha256: cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+budget_policy_path: configs/local/reference-budget.json
+inputs:
+  source_revision: dddddddddddddddddddddddddddddddddddddddd
+  weight_inventory_sha256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  weight_inventory_tensor_bytes: 1
+  provenance_manifest_sha256: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+  runtime_receipt_sha256: cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+  evaluation_lock_sha256: dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+  evaluation_max_context_tokens: 1
+  formula_authority_sha256: null
+  reviewed_commit_sha256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  control_plane_sha256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+authority_files:
+  weight_inventory_path: null
+  source_shard_metadata_path: null
+  provenance_manifest_path: null
+  runtime_lock_path: null
+  runtime_receipt_path: null
+  evaluation_lock_path: null
+  evaluation_fixture_root: null
+resources:
+  gpu_type: A100-80GB
+  gpu_count: 1
+  cpu_cores: 8
+  memory_gib: 96
+  ephemeral_disk_gib: 90
+  timeout_seconds: 2700
+  startup_timeout_seconds: null
+  retries: 0
+provider:
+  submit: false
+  scheduling_enabled: false
+  cloud_upload: false
+  mounts: []
+  volumes: []
+  secrets: []
+  credentials_source: provider_local
+  workspace_scope_sha256: cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+  environment_scope_sha256: dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+  constraint_contract_path: null
+  constraint_contract_sha256: null
+  observation_receipt_path: null
+  observation_receipt_sha256: null
+  observation_screenshot_sha256: eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+  trust_override_path: null
+  trust_override_sha256: null
+  human_approval_statement_sha256: null
+  billing_authority_path: null
+  billing_authority_sha256: null
+  authoritative_report_identity_sha256: cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+  billing_completeness_delay_seconds: 3600
+gates:
+  formula_authority_path: null
+  formula_approval_path: null
+  formula_approval_sha256: null
+  memory_fit_evidence_path: null
+  memory_fit_evidence_sha256: null
+  cold_path_time_evidence_path: null
+  cold_path_time_evidence_sha256: null
+approval_artifact_path: null

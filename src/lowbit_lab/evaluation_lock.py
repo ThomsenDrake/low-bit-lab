@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import json
-import math
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 
 from lowbit_lab.constants import EVALUATION_FAMILIES
 from lowbit_lab.evaluation import ContextState, validate_context_state
@@ -24,8 +24,8 @@ KNOWN_METRICS = {
     "memory": frozenset({"peak_vram_bytes", "peak_ram_bytes"}),
     "soak": frozenset({"failure_free_rate", "runtime_errors", "completed_minutes"}),
 }
+REQUIRED_SOAK_METRICS = ("failure_free_rate", "runtime_errors", "completed_minutes")
 AGGREGATION_METHODS = frozenset({"arithmetic_mean", "median", "minimum"})
-THRESHOLD_OPERATORS = frozenset({"gte", "lte"})
 
 _CREDENTIAL_PATTERNS = (
     re.compile(r"(?i)\b(?:password|passwd|secret|api[_-]?key|access[_-]?token)\b\s*[:=]"),
@@ -71,7 +71,9 @@ class PendingEvaluationLock:
     suite_id: str
     suite_version: str
     fixtures: tuple[FixtureLock, ...]
+    fixture_order: tuple[str, ...]
     scorer: Mapping[str, object]
+    generation: Mapping[str, object]
     metrics: Mapping[str, tuple[str, ...]]
     aggregation: Mapping[str, object]
     context: ContextState
@@ -209,9 +211,7 @@ def _validate_scorer(value: object, label: str = "scorer") -> Mapping[str, objec
     _safe_id(scorer["id"], f"{label}.id")
     _version(scorer["version"], f"{label}.version")
     _sha256(scorer["sha256"], f"{label}.sha256")
-    runtime = _closed_mapping(
-        scorer["runtime"], {"id", "version", "sha256"}, f"{label}.runtime"
-    )
+    runtime = _closed_mapping(scorer["runtime"], {"id", "version", "sha256"}, f"{label}.runtime")
     _safe_id(runtime["id"], f"{label}.runtime.id")
     _nonempty(runtime["version"], f"{label}.runtime.version")
     _sha256(runtime["sha256"], f"{label}.runtime.sha256")
@@ -238,7 +238,51 @@ def _validate_metrics(value: object) -> dict[str, tuple[str, ...]]:
         ):
             raise EvaluationLockError(f"metrics for {family} are unknown or duplicated")
         result[family] = tuple(family_metrics)
+    if result["soak"] != REQUIRED_SOAK_METRICS:
+        raise EvaluationLockError("soak metrics must declare every required metric in order")
     return result
+
+
+def _validate_family_limits(value: object, label: str) -> dict[str, int]:
+    limits = _closed_mapping(value, set(EVALUATION_FAMILIES), label)
+    return {
+        family: _positive_int(limits[family], f"{label}.{family}") for family in EVALUATION_FAMILIES
+    }
+
+
+def _validate_generation(value: object) -> Mapping[str, object]:
+    generation = _closed_mapping(
+        value,
+        {
+            "batch_size",
+            "do_sample",
+            "temperature",
+            "top_p",
+            "response_caps_tokens",
+            "response_caps_bytes",
+        },
+        "generation",
+    )
+    try:
+        temperature = Decimal(str(generation["temperature"]))
+        top_p = Decimal(str(generation["top_p"]))
+    except (InvalidOperation, ValueError):
+        raise EvaluationLockError("generation numeric values must be finite decimals") from None
+    if (
+        generation["batch_size"] != 1
+        or generation["do_sample"] is not False
+        or not isinstance(generation["temperature"], str)
+        or not isinstance(generation["top_p"], str)
+        or not temperature.is_finite()
+        or temperature < 0
+        or not top_p.is_finite()
+        or top_p <= 0
+        or top_p > 1
+    ):
+        raise EvaluationLockError("generation must use the deterministic reference profile")
+    _validate_family_limits(generation["response_caps_tokens"], "response_caps_tokens")
+    _validate_family_limits(generation["response_caps_bytes"], "response_caps_bytes")
+    return generation
 
 
 def _validate_fixture(
@@ -313,7 +357,9 @@ def validate_pending_evaluation_lock(
             "suite_id",
             "suite_version",
             "fixtures",
+            "fixture_order",
             "scorer",
+            "generation",
             "metrics",
             "aggregation",
             "confidence",
@@ -328,11 +374,12 @@ def validate_pending_evaluation_lock(
     )
     # Lock metadata is scanned before fixture bytes or the canonical lock are hashed.
     _privacy_scan_object(raw)
-    if top["schema_version"] != 1:
-        raise EvaluationLockError("evaluation lock schema_version must be 1")
+    if top["schema_version"] != 2:
+        raise EvaluationLockError("evaluation lock schema_version must be 2")
     suite_id = _safe_id(top["suite_id"], "suite_id")
     suite_version = _version(top["suite_version"], "suite_version")
     scorer = _validate_scorer(top["scorer"])
+    generation = _validate_generation(top["generation"])
     scorer_id = str(scorer["id"])
     metrics = _validate_metrics(top["metrics"])
     aggregation = _validate_aggregation(top["aggregation"])
@@ -349,6 +396,8 @@ def validate_pending_evaluation_lock(
         top["context"],
         {
             "configured_tokens",
+            "ladder_tokens",
+            "stop_on_first_failure",
             "runtime_initialized",
             "usefulness_proven",
             "retrieval_evidence_sha256",
@@ -364,6 +413,8 @@ def validate_pending_evaluation_lock(
             runtime_initialized=context_raw["runtime_initialized"],
             usefulness_proven=context_raw["usefulness_proven"],
             retrieval_evidence_sha256=evidence,
+            ladder_tokens=context_raw["ladder_tokens"],
+            stop_on_first_failure=context_raw["stop_on_first_failure"],
         )
     except ValueError as exc:
         raise EvaluationLockError(str(exc)) from exc
@@ -424,8 +475,12 @@ def validate_pending_evaluation_lock(
         raise EvaluationLockError("fixtures must contain exactly six families")
     if all(isinstance(fixture, Mapping) for fixture in fixtures_raw):
         families = tuple(fixture.get("family") for fixture in fixtures_raw)
-        if families != EVALUATION_FAMILIES:
-            raise EvaluationLockError("fixture families must match the closed registry order")
+        if (
+            any(not isinstance(family, str) for family in families)
+            or set(families) != set(EVALUATION_FAMILIES)
+            or len(set(families)) != len(families)
+        ):
+            raise EvaluationLockError("fixture families must match the closed registry")
         for key in ("fixture_id", "version", "sha256", "seed"):
             values = [fixture.get(key) for fixture in fixtures_raw]
             if len(values) == len(set(values)):
@@ -442,14 +497,25 @@ def validate_pending_evaluation_lock(
     )
     if set(fixture_bytes) != {fixture.fixture_id for fixture in fixtures}:
         raise EvaluationLockError("fixture material set must exactly match the lock")
+    fixture_order = top["fixture_order"]
+    if (
+        not isinstance(fixture_order, list)
+        or any(not isinstance(fixture_id, str) for fixture_id in fixture_order)
+        or len(fixture_order) != len(fixtures)
+        or len(set(fixture_order)) != len(fixture_order)
+        or set(fixture_order) != {fixture.fixture_id for fixture in fixtures}
+    ):
+        raise EvaluationLockError("fixture_order must name every fixture exactly once")
 
     canonical = json.dumps(raw, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
     return PendingEvaluationLock(
-        schema_version=1,
+        schema_version=2,
         suite_id=suite_id,
         suite_version=suite_version,
         fixtures=fixtures,
+        fixture_order=tuple(fixture_order),
         scorer=scorer,
+        generation=generation,
         metrics=metrics,
         aggregation=aggregation,
         context=context,
@@ -461,99 +527,5 @@ def validate_pending_evaluation_lock(
 def apply_threshold_authority(
     pending: PendingEvaluationLock, extension: object
 ) -> FullEvaluationLock:
-    raw = _closed_mapping(
-        extension,
-        {
-            "schema_version",
-            "base_lock_sha256",
-            "authority_id",
-            "authority_version",
-            "authority_sha256",
-            "approved_by_human",
-            "scorer",
-            "aggregation",
-            "thresholds",
-        },
-        "threshold authority extension",
-    )
-    if raw["schema_version"] != 1:
-        raise EvaluationLockError("threshold authority schema_version must be 1")
-    _privacy_scan_object(extension)
-    if raw["base_lock_sha256"] != pending.sha256:
-        raise EvaluationLockError("threshold authority base lock mismatch")
-    _safe_id(raw["authority_id"], "authority_id")
-    _version(raw["authority_version"], "authority_version")
-    authority_sha256 = _sha256(raw["authority_sha256"], "authority_sha256")
-    if raw["approved_by_human"] is not True:
-        raise EvaluationLockError("threshold authority requires explicit human approval")
-    scorer = _validate_scorer(raw["scorer"], "authority scorer")
-    if scorer != pending.scorer:
-        raise EvaluationLockError("authority scorer is incompatible with the pending lock")
-    aggregation = _validate_aggregation(raw["aggregation"])
-    if aggregation != pending.aggregation:
-        raise EvaluationLockError("authority aggregation is incompatible with the pending lock")
-    thresholds = raw["thresholds"]
-    if not isinstance(thresholds, list) or not thresholds:
-        raise EvaluationLockError("authority thresholds must be a non-empty list")
-    seen: set[tuple[str, str]] = set()
-    for value in thresholds:
-        threshold = _closed_mapping(
-            value, {"family", "metric", "operator", "value"}, "threshold"
-        )
-        family = threshold["family"]
-        if family not in EVALUATION_FAMILIES:
-            raise EvaluationLockError("threshold family is unknown")
-        metric = threshold["metric"]
-        if metric not in pending.metrics[family]:
-            raise EvaluationLockError("threshold metric is unknown for its family")
-        if threshold["operator"] not in THRESHOLD_OPERATORS:
-            raise EvaluationLockError("threshold operator is unsupported")
-        number = threshold["value"]
-        if (
-            not isinstance(number, int | float)
-            or isinstance(number, bool)
-            or not math.isfinite(number)
-        ):
-            raise EvaluationLockError("threshold value must be a finite number")
-        key = (str(family), str(metric))
-        if key in seen:
-            raise EvaluationLockError("threshold family and metric pairs must be unique")
-        seen.add(key)
-    if {family for family, _ in seen} != set(EVALUATION_FAMILIES):
-        raise EvaluationLockError("threshold authority must cover every evaluation family")
-
-    authority_payload = {
-        key: raw[key]
-        for key in (
-            "schema_version",
-            "authority_id",
-            "authority_version",
-            "scorer",
-            "aggregation",
-            "thresholds",
-        )
-    }
-    computed_authority_sha256 = hashlib.sha256(
-        json.dumps(
-            authority_payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True
-        ).encode()
-    ).hexdigest()
-    if authority_sha256 != computed_authority_sha256:
-        raise EvaluationLockError("threshold authority content hash mismatch")
-
-    identity = {
-        "schema_version": 1,
-        "base_lock_sha256": pending.sha256,
-        "authority": extension,
-        "status": "locked",
-        "promotion_authorized": True,
-        "candidate_execution": "allowed",
-    }
-    canonical = json.dumps(identity, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
-    return FullEvaluationLock(
-        base_lock_sha256=pending.sha256,
-        authority_sha256=authority_sha256,
-        canonical_json=canonical,
-        sha256=hashlib.sha256(canonical.encode()).hexdigest(),
-        _token=_FULL_LOCK_TOKEN,
-    )
+    del pending, extension
+    raise EvaluationLockError("numeric threshold authority is not implemented or authorized")

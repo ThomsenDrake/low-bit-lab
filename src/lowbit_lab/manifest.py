@@ -10,6 +10,7 @@ from typing import Any
 
 from lowbit_lab.config import load_experiment_config, verify_sources
 from lowbit_lab.jsonio import emit
+from lowbit_lab.provenance import WeightInventory
 from lowbit_lab.runtime import runtime_metadata
 
 
@@ -41,6 +42,24 @@ def build_manifest(root: Path, paths: list[Path], lineage: dict[str, Any]) -> di
         "lineage": lineage,
         "files": entries,
     }
+
+
+def build_reference_manifest(
+    root: Path, paths: list[Path], inventory: WeightInventory
+) -> dict[str, Any]:
+    bindings = inventory.bindings
+    lineage = {
+        "weight_inventory_sha256": inventory.sha256,
+        "source_identifier": inventory.source_identifier,
+        "source_revision": inventory.source_revision,
+        "source_index_sha256": bindings.source_index_sha256,
+        "provenance_manifest_sha256": bindings.provenance_manifest_sha256,
+        "tokenizer_sha256": bindings.tokenizer_sha256,
+        "runtime_lock_sha256": bindings.runtime_lock_sha256,
+        "evaluation_lock_sha256": bindings.evaluation_lock_sha256,
+        "weight_body_transfer": False,
+    }
+    return build_manifest(root, paths, lineage)
 
 
 def write_manifest(

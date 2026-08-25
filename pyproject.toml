@@ -16,6 +16,9 @@ dev = [
   "pytest==8.4.1",
   "ruff==0.12.9",
 ]
+remote = [
+  "modal==1.5.3",
+]
 
 [project.scripts]
 lowbit-db = "lowbit_lab.db:main"
@@ -24,6 +27,8 @@ lowbit-manifest = "lowbit_lab.manifest:main"
 lowbit-modal-plan = "lowbit_lab.modal_job:main"
 lowbit-activate = "lowbit_lab.activation:main"
 lowbit-runtime-artifacts = "lowbit_lab.runtime_artifacts:main"
+lowbit-controller = "lowbit_lab.controller:main"
+lowbit-paid-smoke = "lowbit_lab.provider_smoke:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/lowbit_lab"]

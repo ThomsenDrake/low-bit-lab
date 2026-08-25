@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -29,6 +30,15 @@ class BudgetAuthorization:
     total_remaining_after: Decimal
 
 
+@dataclass(frozen=True)
+class ReferenceBudgetPreview:
+    phase: int
+    estimated_cost_usd: Decimal
+    local_reservation_limit_usd: Decimal
+    submission_authorized: bool
+    approved_plan_sha256: str
+
+
 def _money(value: object, label: str) -> Decimal:
     if not isinstance(value, str):
         raise BudgetError(f"{label} must be a decimal string")
@@ -38,6 +48,18 @@ def _money(value: object, label: str) -> Decimal:
         raise BudgetError(f"{label} is not a decimal") from exc
     if not parsed.is_finite() or parsed < 0 or parsed.as_tuple().exponent < -6:
         raise BudgetError(f"{label} must be finite, non-negative, and at most 6 decimals")
+    return parsed
+
+
+def _rate(value: object, label: str) -> Decimal:
+    if not isinstance(value, str):
+        raise BudgetError(f"{label} must be a decimal string")
+    try:
+        parsed = Decimal(value)
+    except InvalidOperation as exc:
+        raise BudgetError(f"{label} is not a decimal") from exc
+    if not parsed.is_finite() or parsed < 0 or parsed.as_tuple().exponent < -10:
+        raise BudgetError(f"{label} must be finite, non-negative, and at most 10 decimals")
     return parsed
 
 
@@ -119,3 +141,118 @@ class BudgetGuard:
         if not 0 <= gpu_count <= 8 or not 1 <= wall_clock_seconds <= 86_400:
             raise BudgetError("invalid resources for H100 cost estimation")
         return self.h100_price_per_second * gpu_count * wall_clock_seconds
+
+
+class ReferenceBudgetGuard:
+    """Validate a local reference-run budget without weakening the public zero ledger."""
+
+    LOCAL_RESERVATION_LIMIT = Decimal("4.00")
+    _FIELDS = {
+        "schema_version",
+        "kind",
+        "approved_plan_sha256",
+        "currency",
+        "phase",
+        "phase_cap_usd",
+        "total_cap_usd",
+        "single_job_cap_usd",
+        "a100_80gb_price_per_second_usd",
+        "cpu_core_price_per_second_usd",
+        "memory_gib_price_per_second_usd",
+        "submission_authorized",
+    }
+
+    def __init__(self, policy_path: Path, *, expected_plan_sha256: str) -> None:
+        self._initialize(
+            json.loads(policy_path.read_text(encoding="utf-8")),
+            expected_plan_sha256=expected_plan_sha256,
+        )
+
+    @classmethod
+    def from_bytes(
+        cls, policy_bytes: bytes, *, expected_plan_sha256: str
+    ) -> ReferenceBudgetGuard:
+        guard = cls.__new__(cls)
+        guard._initialize(
+            json.loads(policy_bytes.decode("utf-8")),
+            expected_plan_sha256=expected_plan_sha256,
+        )
+        return guard
+
+    def _initialize(self, raw: object, *, expected_plan_sha256: str) -> None:
+        if not isinstance(raw, dict) or set(raw) != self._FIELDS:
+            raise BudgetError("reference budget policy schema is closed")
+        if raw["schema_version"] != 1 or raw["kind"] != "reference_budget_authority":
+            raise BudgetError("unsupported reference budget policy")
+        if raw["currency"] != "USD" or raw["phase"] != 1:
+            raise BudgetError("reference budget must use USD and phase 1")
+        plan_hash = raw["approved_plan_sha256"]
+        if (
+            not isinstance(plan_hash, str)
+            or re.fullmatch(r"[0-9a-f]{64}", plan_hash) is None
+            or plan_hash != expected_plan_sha256
+        ):
+            raise BudgetError("reference budget plan hash does not match approval")
+        if not isinstance(raw["submission_authorized"], bool):
+            raise BudgetError("submission_authorized must be boolean")
+        self.approved_plan_sha256 = plan_hash
+        self.phase = raw["phase"]
+        self.phase_cap = _money(raw["phase_cap_usd"], "phase_cap_usd")
+        self.total_cap = _money(raw["total_cap_usd"], "total_cap_usd")
+        self.single_job_cap = _money(raw["single_job_cap_usd"], "single_job_cap_usd")
+        self.gpu_rate = _rate(
+            raw["a100_80gb_price_per_second_usd"],
+            "a100_80gb_price_per_second_usd",
+        )
+        self.cpu_rate = _rate(
+            raw["cpu_core_price_per_second_usd"], "cpu_core_price_per_second_usd"
+        )
+        self.memory_rate = _rate(
+            raw["memory_gib_price_per_second_usd"],
+            "memory_gib_price_per_second_usd",
+        )
+        self.submission_authorized = raw["submission_authorized"]
+        if (
+            self.phase_cap > self.LOCAL_RESERVATION_LIMIT
+            or self.total_cap > self.LOCAL_RESERVATION_LIMIT
+            or self.single_job_cap > self.LOCAL_RESERVATION_LIMIT
+        ):
+            raise BudgetError("reference budget exceeds the local reservation limit")
+        if not (self.single_job_cap <= self.phase_cap <= self.total_cap):
+            raise BudgetError("reference budget caps are inconsistent")
+
+    def preview(
+        self, *, cpu_cores: int, memory_gib: int, wall_clock_seconds: int
+    ) -> ReferenceBudgetPreview:
+        if cpu_cores != 8 or memory_gib != 96 or wall_clock_seconds != 2700:
+            raise BudgetError("reference resources do not match the approved preview envelope")
+        duration = Decimal(wall_clock_seconds)
+        estimated = duration * (
+            self.gpu_rate
+            + Decimal(cpu_cores) * self.cpu_rate
+            + Decimal(memory_gib) * self.memory_rate
+        )
+        if estimated > self.single_job_cap:
+            raise BudgetError("resource estimate exceeds the single-job cap")
+        return ReferenceBudgetPreview(
+            phase=self.phase,
+            estimated_cost_usd=estimated,
+            local_reservation_limit_usd=self.single_job_cap,
+            submission_authorized=self.submission_authorized,
+            approved_plan_sha256=self.approved_plan_sha256,
+        )
+
+    def authorize_submission(self, *, requested_cost_usd: str) -> BudgetAuthorization:
+        if not self.submission_authorized:
+            raise BudgetError("reference submission is not authorized")
+        requested = _money(requested_cost_usd, "requested_cost_usd")
+        if requested != self.single_job_cap or requested != self.LOCAL_RESERVATION_LIMIT:
+            raise BudgetError("reference submission must reserve exactly USD 4.00")
+        return BudgetAuthorization(
+            phase=self.phase,
+            requested=requested,
+            phase_spent=Decimal("0"),
+            total_spent=Decimal("0"),
+            phase_remaining_after=self.phase_cap - requested,
+            total_remaining_after=self.total_cap - requested,
+        )

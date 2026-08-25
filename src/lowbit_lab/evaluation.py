@@ -19,6 +19,8 @@ class EvaluationRequest:
 @dataclass(frozen=True)
 class ContextState:
     configured_tokens: int
+    ladder_tokens: tuple[int, ...]
+    stop_on_first_failure: bool
     runtime_initialized: bool
     usefulness_proven: bool
     retrieval_evidence_sha256: str | None
@@ -55,6 +57,8 @@ def validate_context_state(
     runtime_initialized: bool,
     usefulness_proven: bool,
     retrieval_evidence_sha256: str | None,
+    ladder_tokens: object | None = None,
+    stop_on_first_failure: object = True,
 ) -> ContextState:
     if (
         not isinstance(configured_tokens, int)
@@ -64,12 +68,31 @@ def validate_context_state(
         raise ValueError("configured context tokens must be a positive integer")
     if not isinstance(runtime_initialized, bool) or not isinstance(usefulness_proven, bool):
         raise ValueError("context proof states must be boolean")
+    if ladder_tokens is None:
+        ladder = (configured_tokens,)
+    elif (
+        not isinstance(ladder_tokens, list | tuple)
+        or not ladder_tokens
+        or any(
+            not isinstance(level, int) or isinstance(level, bool) or level <= 0
+            for level in ladder_tokens
+        )
+    ):
+        raise ValueError("context ladder must contain positive integers")
+    else:
+        ladder = tuple(ladder_tokens)
+    if tuple(sorted(set(ladder))) != ladder or ladder[-1] != configured_tokens:
+        raise ValueError("context ladder must be strictly increasing to configured tokens")
+    if stop_on_first_failure is not True:
+        raise ValueError("context ladder must stop on first failure")
     if usefulness_proven and not runtime_initialized:
         raise ValueError("useful context requires runtime initialization")
     if usefulness_proven and not retrieval_evidence_sha256:
         raise ValueError("useful context requires retrieval evidence")
     return ContextState(
         configured_tokens=configured_tokens,
+        ladder_tokens=ladder,
+        stop_on_first_failure=True,
         runtime_initialized=runtime_initialized,
         usefulness_proven=usefulness_proven,
         retrieval_evidence_sha256=retrieval_evidence_sha256,
@@ -103,9 +126,7 @@ def assert_candidate_execution_allowed(lock: object) -> None:
     promotion_authorized = lock.promotion_authorized
     candidate_execution = lock.candidate_execution
     if not (
-        status == "locked"
-        and promotion_authorized is True
-        and candidate_execution == "allowed"
+        status == "locked" and promotion_authorized is True and candidate_execution == "allowed"
     ):
         raise CandidateExecutionBlocked("candidate execution is blocked by evaluation authority")
 

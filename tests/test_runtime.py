@@ -9,14 +9,22 @@ import pytest
 
 from lowbit_lab.runtime import (
     RuntimeContractError,
+    build_installed_environment_receipt,
     decide_baseline_runtime,
     hardware_metadata,
     load_runtime_lock,
     parse_runtime_lock,
     preview_runtime_lock,
+    verify_current_installed_environment,
+    verify_installed_environment_receipt,
     verify_local_artifact_set,
 )
-from lowbit_lab.runtime_probe import PROBE_SCRIPT, run_wsl_cuda_probe
+from lowbit_lab.runtime_probe import (
+    ENVIRONMENT_INVENTORY_SCRIPT,
+    PROBE_SCRIPT,
+    run_environment_inventory_probe,
+    run_wsl_cuda_probe,
+)
 
 SHA_A = hashlib.sha256(b"uv").hexdigest()
 SHA_B = hashlib.sha256(b"python").hexdigest()
@@ -162,6 +170,14 @@ def test_tracked_example_is_a_valid_target_neutral_schema() -> None:
     assert all("example.invalid" in artifact.url for artifact in lock.artifacts)
 
 
+def test_runtime_receipt_schema_is_closed_and_target_neutral() -> None:
+    root = Path(__file__).resolve().parents[1]
+    schema = json.loads((root / "configs/runtime-receipt.schema.json").read_text())
+    assert schema["additionalProperties"] is False
+    assert schema["properties"]["interpreter"]["additionalProperties"] is False
+    assert "target" not in json.dumps(schema).lower()
+
+
 @pytest.mark.parametrize(
     ("mutation", "match"),
     [
@@ -181,9 +197,7 @@ def test_tracked_example_is_a_valid_target_neutral_schema() -> None:
         ),
         (lambda raw: raw["artifacts"][0].update({"url": "https://example.invalid/a?x=1"}), "HTTPS"),
         (
-            lambda raw: raw["artifacts"][0].update(
-                {"url": "https://example.invalid:8443/a"}
-            ),
+            lambda raw: raw["artifacts"][0].update({"url": "https://example.invalid:8443/a"}),
             "HTTPS",
         ),
         (lambda raw: raw.update({"aggregate_cap_bytes": 12}), "aggregate"),
@@ -268,6 +282,25 @@ def _probe_payload(**overrides: object) -> dict[str, object]:
 
 def test_embedded_probe_script_compiles() -> None:
     compile(PROBE_SCRIPT, "<runtime-probe>", "exec")
+    compile(ENVIRONMENT_INVENTORY_SCRIPT, "<environment-inventory>", "exec")
+
+
+def test_environment_inventory_probe_uses_selected_isolated_python(tmp_path: Path) -> None:
+    python = tmp_path / "artifacts/local/runtime/env/bin/python"
+    python.parent.mkdir(parents=True)
+    python.write_bytes(b"")
+    payload = _installed_inventory()
+
+    def runner(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        command = args[0]
+        assert command[0] == str(python.resolve())
+        assert command[1:3] == ["-I", "-c"]
+        assert kwargs["env"] == {"PATH": "", "PYTHONNOUSERSITE": "1", "PYTHONHASHSEED": "0"}
+        return subprocess.CompletedProcess(command, 0, json.dumps(payload), "private stderr")
+
+    assert (
+        run_environment_inventory_probe(python_path=python, root=tmp_path, runner=runner) == payload
+    )
 
 
 def test_probe_success_is_framework_only_and_sanitized(tmp_path: Path) -> None:
@@ -385,3 +418,198 @@ def test_hardware_metadata_does_not_request_or_persist_gpu_uuid(
 
     assert all("uuid" not in argument.lower() for argument in captured)
     assert "GPU-" not in json.dumps(metadata)
+
+
+def _installed_inventory() -> dict[str, object]:
+    return {
+        "implementation": "CPython",
+        "python_version": "3.12.11",
+        "cache_tag": "cpython-312",
+        "abi_flags": "",
+        "prefix_is_selected_environment": True,
+        "selected_executable_within_expected_root": True,
+        "selected_executable_sha256": hashlib.sha256(b"python-executable").hexdigest(),
+        "distributions": [{"name": "example-dependency", "version": "1.0.0"}],
+    }
+
+
+def _cuda_observations() -> dict[str, object]:
+    return {
+        "status": "observed",
+        "driver_version": "13030",
+        "cuda_build_version": "13.0",
+        "device_capability": [9, 0],
+        "gpu_memory_bytes": 16_000_000_000,
+    }
+
+
+def test_installed_receipt_binds_executable_packages_cuda_and_lock(tmp_path: Path) -> None:
+    lock = parse_runtime_lock(_lock(tmp_path), root=tmp_path)
+    executable = tmp_path / "artifacts/local/runtime/env/bin/python"
+    package_root = tmp_path / "artifacts/local/runtime/env/lib/python3.12/site-packages"
+    executable.parent.mkdir(parents=True)
+    executable.write_bytes(b"python-executable")
+    package_root.mkdir(parents=True)
+    (package_root / "module.py").write_text("VALUE = 1\n", encoding="utf-8")
+
+    receipt = build_installed_environment_receipt(
+        root=tmp_path,
+        lock=lock,
+        executable_path=executable,
+        package_root=package_root,
+        inventory=_installed_inventory(),
+        cuda_observations=_cuda_observations(),
+    )
+
+    assert receipt["runtime_lock_sha256"] == lock.sha256
+    assert receipt["selected_executable"] == "artifacts/local/runtime/env/bin/python"
+    assert receipt["installed_distributions"] == [
+        {"name": "example-dependency", "version": "1.0.0"}
+    ]
+    assert receipt["package_tree"]["file_count"] == 1
+    assert (
+        verify_installed_environment_receipt(
+            receipt,
+            root=tmp_path,
+            lock=lock,
+            inventory=_installed_inventory(),
+            cuda_observations=_cuda_observations(),
+        )["verified"]
+        is True
+    )
+
+
+def test_installed_receipt_rejects_a_forged_executable_digest(tmp_path: Path) -> None:
+    lock = parse_runtime_lock(_lock(tmp_path), root=tmp_path)
+    executable = tmp_path / "artifacts/local/runtime/env/bin/python"
+    package_root = tmp_path / "artifacts/local/runtime/env/lib/python3.12/site-packages"
+    executable.parent.mkdir(parents=True)
+    executable.write_bytes(b"python-executable")
+    package_root.mkdir(parents=True)
+    inventory = _installed_inventory()
+    inventory["selected_executable_sha256"] = "f" * 64
+    with pytest.raises(RuntimeContractError, match="executable digest drift"):
+        build_installed_environment_receipt(
+            root=tmp_path,
+            lock=lock,
+            executable_path=executable,
+            package_root=package_root,
+            inventory=inventory,
+            cuda_observations=_cuda_observations(),
+        )
+
+
+def test_installed_receipt_rejects_executable_symlink_escape(tmp_path: Path) -> None:
+    lock = parse_runtime_lock(_lock(tmp_path), root=tmp_path)
+    outside = tmp_path.parent / f"{tmp_path.name}-outside-python"
+    outside.write_bytes(b"python-executable")
+    executable = tmp_path / "artifacts/local/runtime/env/bin/python"
+    executable.parent.mkdir(parents=True)
+    try:
+        executable.symlink_to(outside)
+    except OSError:
+        pytest.skip("symlink creation is not available")
+    package_root = tmp_path / "artifacts/local/runtime/env/lib/python3.12/site-packages"
+    package_root.mkdir(parents=True)
+    with pytest.raises(RuntimeContractError, match="repository-local"):
+        build_installed_environment_receipt(
+            root=tmp_path,
+            lock=lock,
+            executable_path=executable,
+            package_root=package_root,
+            inventory=_installed_inventory(),
+            cuda_observations=_cuda_observations(),
+        )
+
+
+@pytest.mark.parametrize("drift", ["executable", "package", "version", "cuda", "path"])
+def test_installed_receipt_fails_closed_on_runtime_drift(tmp_path: Path, drift: str) -> None:
+    lock = parse_runtime_lock(_lock(tmp_path), root=tmp_path)
+    executable = tmp_path / "artifacts/local/runtime/env/bin/python"
+    package_root = tmp_path / "artifacts/local/runtime/env/lib/python3.12/site-packages"
+    executable.parent.mkdir(parents=True)
+    executable.write_bytes(b"python-executable")
+    package_root.mkdir(parents=True)
+    (package_root / "module.py").write_text("VALUE = 1\n", encoding="utf-8")
+    receipt = build_installed_environment_receipt(
+        root=tmp_path,
+        lock=lock,
+        executable_path=executable,
+        package_root=package_root,
+        inventory=_installed_inventory(),
+        cuda_observations=_cuda_observations(),
+    )
+    inventory = _installed_inventory()
+    cuda = _cuda_observations()
+    if drift == "executable":
+        executable.write_bytes(b"changed")
+        inventory["selected_executable_sha256"] = hashlib.sha256(b"changed").hexdigest()
+    elif drift == "package":
+        (package_root / "module.py").write_text("VALUE = 2\n", encoding="utf-8")
+    elif drift == "version":
+        inventory["distributions"] = [{"name": "example-dependency", "version": "1.0.1"}]
+    elif drift == "cuda":
+        cuda["driver_version"] = "13031"
+    else:
+        receipt["selected_executable"] = "../outside/python"
+
+    with pytest.raises(RuntimeContractError, match="drift|path|repository-relative"):
+        verify_installed_environment_receipt(
+            receipt,
+            root=tmp_path,
+            lock=lock,
+            inventory=inventory,
+            cuda_observations=cuda,
+        )
+
+
+def test_current_environment_verification_reobserves_immediately(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lock = parse_runtime_lock(_lock(tmp_path), root=tmp_path)
+    executable = tmp_path / "artifacts/local/runtime/env/bin/python"
+    package_root = tmp_path / "artifacts/local/runtime/env/lib/python3.12/site-packages"
+    executable.parent.mkdir(parents=True)
+    executable.write_bytes(b"python-executable")
+    package_root.mkdir(parents=True)
+    (package_root / "module.py").write_text("VALUE = 1\n", encoding="utf-8")
+    receipt = build_installed_environment_receipt(
+        root=tmp_path,
+        lock=lock,
+        executable_path=executable,
+        package_root=package_root,
+        inventory=_installed_inventory(),
+        cuda_observations=_cuda_observations(),
+    )
+    calls = 0
+
+    def observe(**kwargs: object) -> dict[str, object]:
+        nonlocal calls
+        calls += 1
+        return dict(receipt)
+
+    monkeypatch.setattr("lowbit_lab.runtime.observe_installed_environment", observe)
+    result = verify_current_installed_environment(receipt, root=tmp_path, lock=lock)
+    assert result["verified"] is True
+    assert calls == 1
+
+
+def test_installed_receipt_rejects_unlocked_distribution(tmp_path: Path) -> None:
+    lock = parse_runtime_lock(_lock(tmp_path), root=tmp_path)
+    executable = tmp_path / "artifacts/local/runtime/env/bin/python"
+    package_root = tmp_path / "artifacts/local/runtime/env/lib/python3.12/site-packages"
+    executable.parent.mkdir(parents=True)
+    executable.write_bytes(b"python-executable")
+    package_root.mkdir(parents=True)
+    (package_root / "module.py").write_text("VALUE = 1\n", encoding="utf-8")
+    inventory = _installed_inventory()
+    inventory["distributions"].append({"name": "unreviewed-package", "version": "9.9.9"})
+    with pytest.raises(RuntimeContractError, match="distribution inventory drift"):
+        build_installed_environment_receipt(
+            root=tmp_path,
+            lock=lock,
+            executable_path=executable,
+            package_root=package_root,
+            inventory=inventory,
+            cuda_observations=_cuda_observations(),
+        )

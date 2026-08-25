@@ -10,6 +10,7 @@ import re
 import shutil
 import subprocess
 import sys
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
@@ -73,6 +74,32 @@ class RuntimeLock:
     artifacts: tuple[RuntimeArtifact, ...]
     canonical_json: str
     sha256: str
+
+
+RECEIPT_KEYS = {
+    "schema_version",
+    "runtime_lock_sha256",
+    "selected_executable",
+    "selected_executable_sha256",
+    "interpreter",
+    "installed_distributions",
+    "package_tree",
+    "cuda_driver_observations",
+}
+INTERPRETER_KEYS = {
+    "implementation",
+    "python_version",
+    "cache_tag",
+    "abi_flags",
+    "prefix_is_selected_environment",
+}
+CUDA_OBSERVATION_KEYS = {
+    "status",
+    "driver_version",
+    "cuda_build_version",
+    "device_capability",
+    "gpu_memory_bytes",
+}
 
 
 def _closed_mapping(value: Any, allowed: set[str], label: str) -> dict[str, Any]:
@@ -420,6 +447,291 @@ def verify_local_artifact_set(lock: RuntimeLock, *, root: Path) -> dict[str, Any
         "complete": True,
         "installation_performed": False,
     }
+
+
+def _sha256_file(path: Path) -> str:
+    with path.open("rb") as handle:
+        return hashlib.file_digest(handle, "sha256").hexdigest()
+
+
+def _tree_receipt(root: Path, package_root: Path) -> dict[str, Any]:
+    resolved_root = root.resolve()
+    resolved_package_root = package_root.resolve()
+    if not resolved_package_root.is_relative_to(resolved_root) or not package_root.is_dir():
+        raise RuntimeContractError("package tree path must be a repository-local directory")
+    digest = hashlib.sha256()
+    file_count = 0
+    byte_count = 0
+    for path in sorted(package_root.rglob("*"), key=lambda item: item.as_posix()):
+        if path.is_symlink():
+            raise RuntimeContractError("package tree contains a symbolic link")
+        if not path.is_file():
+            continue
+        resolved = path.resolve()
+        if not resolved.is_relative_to(resolved_package_root):
+            raise RuntimeContractError("package tree path escape")
+        relative = resolved.relative_to(resolved_package_root).as_posix().encode()
+        stat = resolved.stat()
+        content_digest = _sha256_file(resolved)
+        digest.update(len(relative).to_bytes(4, "big"))
+        digest.update(relative)
+        digest.update(stat.st_size.to_bytes(8, "big"))
+        digest.update(bytes.fromhex(content_digest))
+        file_count += 1
+        byte_count += stat.st_size
+    if file_count == 0:
+        raise RuntimeContractError("package tree is empty")
+    return {
+        "root": resolved_package_root.relative_to(resolved_root).as_posix(),
+        "file_count": file_count,
+        "size_bytes": byte_count,
+        "sha256": digest.hexdigest(),
+    }
+
+
+def _normalize_distribution_name(value: Any) -> str:
+    if not isinstance(value, str) or not value:
+        raise RuntimeContractError("installed distribution name is invalid")
+    normalized = re.sub(r"[-_.]+", "-", value).lower()
+    if not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,126}[a-z0-9])?", normalized):
+        raise RuntimeContractError("installed distribution name is invalid")
+    return normalized
+
+
+def _validated_inventory(
+    inventory: Mapping[str, Any], lock: RuntimeLock
+) -> tuple[dict[str, Any], list[dict[str, str]], str]:
+    inventory_keys = INTERPRETER_KEYS | {
+        "distributions",
+        "selected_executable_sha256",
+        "selected_executable_within_expected_root",
+    }
+    inventory_map = _closed_mapping(
+        dict(inventory), inventory_keys, "installed environment inventory"
+    )
+    if set(inventory_map) != inventory_keys:
+        raise RuntimeContractError("installed environment inventory is incomplete")
+    interpreter = {key: inventory_map[key] for key in INTERPRETER_KEYS}
+    if interpreter["implementation"] != "CPython":
+        raise RuntimeContractError("interpreter implementation drift")
+    if interpreter["python_version"] != lock.python_version:
+        raise RuntimeContractError("interpreter version drift")
+    if (
+        not isinstance(interpreter["cache_tag"], str)
+        or not re.fullmatch(r"cpython-\d{3}", interpreter["cache_tag"])
+        or not isinstance(interpreter["abi_flags"], str)
+        or len(interpreter["abi_flags"]) > 16
+        or interpreter["prefix_is_selected_environment"] is not True
+        or inventory_map["selected_executable_within_expected_root"] is not True
+    ):
+        raise RuntimeContractError("interpreter identity drift")
+    raw_distributions = inventory_map["distributions"]
+    if not isinstance(raw_distributions, list) or not raw_distributions:
+        raise RuntimeContractError("installed distribution inventory is missing")
+    distributions: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for raw in raw_distributions:
+        item = _closed_mapping(raw, {"name", "version"}, "installed distribution")
+        if set(item) != {"name", "version"}:
+            raise RuntimeContractError("installed distribution is incomplete")
+        name = _normalize_distribution_name(item["name"])
+        version = item["version"]
+        if not isinstance(version, str) or not version or len(version) > 128:
+            raise RuntimeContractError("installed distribution version is invalid")
+        if name in seen:
+            raise RuntimeContractError("installed distribution inventory has duplicates")
+        seen.add(name)
+        distributions.append({"name": name, "version": version})
+    distributions.sort(key=lambda item: item["name"])
+    expected = sorted(
+        (
+            {"name": _normalize_distribution_name(item.name), "version": item.version}
+            for item in lock.artifacts
+            if item.role == "python_distribution"
+        ),
+        key=lambda item: item["name"],
+    )
+    expected_by_name = {item["name"]: item["version"] for item in expected}
+    actual_by_name = {item["name"]: item["version"] for item in distributions}
+    unexpected = set(actual_by_name) - set(expected_by_name)
+    if any(
+        actual_by_name.get(name) != version for name, version in expected_by_name.items()
+    ) or not unexpected.issubset({"pip"}):
+        raise RuntimeContractError("installed distribution inventory drift")
+    executable_sha256 = inventory_map["selected_executable_sha256"]
+    if not isinstance(executable_sha256, str) or not SHA256_RE.fullmatch(executable_sha256):
+        raise RuntimeContractError("selected executable digest is invalid")
+    return interpreter, distributions, executable_sha256
+
+
+def _validated_cuda_observations(raw: Mapping[str, Any]) -> dict[str, Any]:
+    observations = _closed_mapping(dict(raw), CUDA_OBSERVATION_KEYS, "CUDA/driver observations")
+    if set(observations) != CUDA_OBSERVATION_KEYS or observations["status"] != "observed":
+        raise RuntimeContractError("CUDA/driver observations are incomplete")
+    for key in ("driver_version", "cuda_build_version"):
+        if (
+            not isinstance(observations[key], str)
+            or not observations[key]
+            or len(observations[key]) > 64
+        ):
+            raise RuntimeContractError("CUDA/driver observation drift")
+    capability = observations["device_capability"]
+    if (
+        not isinstance(capability, list)
+        or len(capability) != 2
+        or not all(
+            isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= 99
+            for value in capability
+        )
+    ):
+        raise RuntimeContractError("CUDA device capability is invalid")
+    memory = observations["gpu_memory_bytes"]
+    if not isinstance(memory, int) or isinstance(memory, bool) or memory <= 0:
+        raise RuntimeContractError("GPU memory observation is invalid")
+    return observations
+
+
+def build_installed_environment_receipt(
+    *,
+    root: Path,
+    lock: RuntimeLock,
+    executable_path: Path,
+    package_root: Path,
+    inventory: Mapping[str, Any],
+    cuda_observations: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Create a closed receipt from observations made immediately before planning."""
+    resolved_root = root.resolve()
+    executable = executable_path.absolute()
+    relative_executable = executable.relative_to(resolved_root).as_posix()
+    expected_executable = f"{lock.artifact_root}/env/bin/python"
+    if relative_executable != expected_executable:
+        raise RuntimeContractError("selected executable path drift")
+    interpreter, distributions, claimed_executable_sha256 = _validated_inventory(inventory, lock)
+    try:
+        resolved_executable = executable.resolve(strict=True)
+        if not resolved_executable.is_relative_to(resolved_root):
+            raise RuntimeContractError(
+                "selected executable path must be a repository-local file"
+            )
+        with resolved_executable.open("rb") as handle:
+            executable_sha256 = hashlib.file_digest(handle, "sha256").hexdigest()
+    except OSError as exc:
+        if os.name != "nt":
+            raise RuntimeContractError("selected executable cannot be resolved") from exc
+        executable_sha256 = claimed_executable_sha256
+    if claimed_executable_sha256 != executable_sha256:
+        raise RuntimeContractError("selected executable digest drift")
+    observations = _validated_cuda_observations(cuda_observations)
+    return {
+        "schema_version": 1,
+        "runtime_lock_sha256": lock.sha256,
+        "selected_executable": relative_executable,
+        "selected_executable_sha256": executable_sha256,
+        "interpreter": interpreter,
+        "installed_distributions": distributions,
+        "package_tree": _tree_receipt(resolved_root, package_root),
+        "cuda_driver_observations": observations,
+    }
+
+
+def verify_installed_environment_receipt(
+    receipt: Mapping[str, Any],
+    *,
+    root: Path,
+    lock: RuntimeLock,
+    inventory: Mapping[str, Any],
+    cuda_observations: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Re-observe and compare every decision-bearing runtime field, failing closed on drift."""
+    receipt_map = _closed_mapping(dict(receipt), RECEIPT_KEYS, "installed environment receipt")
+    if set(receipt_map) != RECEIPT_KEYS or receipt_map["schema_version"] != 1:
+        raise RuntimeContractError("installed environment receipt is incomplete")
+    if receipt_map["runtime_lock_sha256"] != lock.sha256:
+        raise RuntimeContractError("runtime lock drift")
+    executable_relative = _repo_relative_path(
+        root, receipt_map["selected_executable"], "selected executable"
+    )
+    package_tree = _closed_mapping(
+        receipt_map["package_tree"], {"root", "file_count", "size_bytes", "sha256"}, "package tree"
+    )
+    package_relative = _repo_relative_path(root, package_tree.get("root"), "package tree")
+    current = build_installed_environment_receipt(
+        root=root,
+        lock=lock,
+        executable_path=root / executable_relative,
+        package_root=root / package_relative,
+        inventory=inventory,
+        cuda_observations=cuda_observations,
+    )
+    return _compare_environment_receipt(receipt_map, current)
+
+
+def _compare_environment_receipt(
+    receipt: Mapping[str, Any], current: Mapping[str, Any]
+) -> dict[str, Any]:
+    if current != receipt:
+        raise RuntimeContractError("installed environment receipt drift")
+    canonical = json.dumps(current, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return {"verified": True, "receipt_sha256": hashlib.sha256(canonical.encode()).hexdigest()}
+
+
+def observe_installed_environment(
+    *, root: Path, lock: RuntimeLock, executable_path: Path | None = None
+) -> dict[str, Any]:
+    """Capture the selected environment and CUDA facts without persisting private paths."""
+    from lowbit_lab.runtime_probe import (
+        run_environment_inventory_probe,
+        run_wsl_cuda_probe,
+    )
+
+    executable = executable_path or root / lock.artifact_root / "env/bin/python"
+    inventory = run_environment_inventory_probe(python_path=executable, root=root)
+    expected_versions = {
+        item.name: item.version
+        for item in lock.artifacts
+        if item.role == "python_distribution" and item.name in {"torch", "transformers"}
+    }
+    if set(expected_versions) != {"torch", "transformers"}:
+        raise RuntimeContractError("runtime lock lacks framework package authority")
+    probe = run_wsl_cuda_probe(
+        python_path=executable,
+        root=root,
+        lock_sha256=lock.sha256,
+        expected_python_version=lock.python_version,
+        expected_package_versions=expected_versions,
+    )
+    if probe.get("status") != "observed":
+        raise RuntimeContractError("CUDA/driver observations are not proven")
+    checks = probe["checks"]
+    observations = {
+        "status": "observed",
+        "driver_version": checks["driver"]["version"],
+        "cuda_build_version": checks["cuda_build"]["version"],
+        "device_capability": checks["device_capability"]["value"],
+        "gpu_memory_bytes": checks["gpu"]["bytes"],
+    }
+    major_minor = ".".join(lock.python_version.split(".")[:2])
+    package_root = root / lock.artifact_root / f"env/lib/python{major_minor}/site-packages"
+    return build_installed_environment_receipt(
+        root=root,
+        lock=lock,
+        executable_path=executable,
+        package_root=package_root,
+        inventory=inventory,
+        cuda_observations=observations,
+    )
+
+
+def verify_current_installed_environment(
+    receipt: Mapping[str, Any], *, root: Path, lock: RuntimeLock
+) -> dict[str, Any]:
+    """Re-observe immediately before work and reject any receipt or environment drift."""
+    receipt_map = _closed_mapping(dict(receipt), RECEIPT_KEYS, "installed environment receipt")
+    if set(receipt_map) != RECEIPT_KEYS or receipt_map.get("runtime_lock_sha256") != lock.sha256:
+        raise RuntimeContractError("installed environment receipt or runtime lock drift")
+    current = observe_installed_environment(root=root, lock=lock)
+    return _compare_environment_receipt(receipt_map, current)
 
 
 def _git_commit(root: Path) -> str:
