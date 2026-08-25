@@ -10,6 +10,8 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import math
+import os
 import time
 from collections.abc import Mapping
 from contextlib import suppress
@@ -25,6 +27,7 @@ from lowbit_lab.constants import (
 )
 from lowbit_lab.db import DatabaseError, ResultsDatabase
 from lowbit_lab.evaluation_lock import EvaluationLockError, validate_pending_evaluation_lock
+from lowbit_lab.provider_evidence import validate_provider_capability_receipt
 from lowbit_lab.reference_backend import build_execution_dependencies
 from lowbit_lab.reference_bootstrap import (
     ReferenceBootstrapError,
@@ -32,7 +35,7 @@ from lowbit_lab.reference_bootstrap import (
     validate_bootstrap_request_bytes,
     validate_image_lock,
 )
-from lowbit_lab.reference_execution import ReferenceExecution
+from lowbit_lab.reference_execution import ReferenceDeadlineAbort, ReferenceExecution
 from lowbit_lab.reference_harness import (
     ReferenceHarnessError,
     validate_execution_identity,
@@ -100,7 +103,29 @@ class ValidatedRemoteContract:
     submission_pending_at: datetime
 
 
-def _validate_fresh_deterministic_gates(capability: ReferenceModalCapability) -> None:
+@dataclass(frozen=True)
+class FreshDeterministicEvidence:
+    """Values derived from freshly reproduced local authority, never caller claims."""
+
+    provider_environment: str
+    execution_identity: Mapping[str, str]
+    config_sha256: str
+    reference_execution_scope_sha256: str
+
+
+@dataclass(frozen=True)
+class ValidatedRemoteResult:
+    status: str
+    receipt: bytes
+    receipt_sha256: str
+    manifest: bytes | None
+    manifest_sha256: str | None
+    full_context_usefulness_proven: bool
+
+
+def _validate_fresh_deterministic_gates(
+    capability: ReferenceModalCapability,
+) -> FreshDeterministicEvidence:
     """Recompute decision-bearing local evidence; no caller boolean is authority."""
     from lowbit_lab.modal_job import load_reference_job_config, plan_reference_bootstrap_preview
     from lowbit_lab.runtime import runtime_metadata
@@ -124,6 +149,7 @@ def _validate_fresh_deterministic_gates(capability: ReferenceModalCapability) ->
         config = load_reference_job_config(root / capability.config_path, root=root)
         request = validate_bootstrap_request_bytes(capability.bootstrap_request_bytes)
         request_raw = json.loads(request.canonical_json)
+        image = validate_image_lock(capability.image_lock)
         preview = plan_reference_bootstrap_preview(
             config,
             root=root,
@@ -133,9 +159,7 @@ def _validate_fresh_deterministic_gates(capability: ReferenceModalCapability) ->
             image_lock_sha256=_sha(_canonical_json(capability.image_lock)),
             provider_capability_path=capability.provider_capability_path,
             provider_capability_sha256=str(
-                json.loads(
-                    request.canonical_json
-                )["provider_capability"]["receipt_sha256"]
+                json.loads(request.canonical_json)["provider_capability"]["receipt_sha256"]
             ),
             billing_authority_path=capability.billing_authority_path,
             billing_receipt_path=capability.billing_receipt_path,
@@ -143,6 +167,32 @@ def _validate_fresh_deterministic_gates(capability: ReferenceModalCapability) ->
             publication_manifest_path=capability.publication_manifest_path,
         )
         runtime = runtime_metadata(root)
+        provider_receipt = validate_provider_capability_receipt(
+            root / capability.provider_capability_path,
+            expected_sha256=str(request_raw["provider_capability"]["receipt_sha256"]),
+            image_recipe_sha256=image.recipe_sha256,
+            billing_authority_path=root / capability.billing_authority_path,
+            billing_receipt_path=root / capability.billing_receipt_path,
+            billing_report_path=root / capability.billing_report_path,
+        )
+        expected_identity = validate_execution_identity(
+            {
+                "weight_inventory_sha256": config.inputs["weight_inventory_sha256"],
+                "provenance_manifest_sha256": config.inputs["provenance_manifest_sha256"],
+                "runtime_receipt_sha256": config.inputs["runtime_receipt_sha256"],
+                "reviewed_commit_sha256": config.inputs["reviewed_commit_sha256"],
+                "resource_spec_sha256": _sha(_canonical_json(config.resources)),
+            }
+        )
+        provider_environment = str(provider_receipt["billing"]["environment_identity"])
+        evaluation_lock_path = root / str(config.authority_files["evaluation_lock_path"])
+        capability_identity = validate_execution_identity(capability.execution_identity)
+        request_file_bytes = (root / capability.request_path).read_bytes()
+        evaluation_lock_file_bytes = evaluation_lock_path.read_bytes()
+        image_lock_file_bytes = (root / capability.image_lock_path).read_bytes()
+        reference_scope = config.reference_execution_scope_sha256
+        if reference_scope is None:
+            raise ReferenceModalError("fresh reference execution scope is unavailable")
     except Exception as exc:
         raise ReferenceModalError("fresh deterministic gate could not be reproduced") from exc
     empirical = preview.get("empirical")
@@ -160,8 +210,23 @@ def _validate_fresh_deterministic_gates(capability: ReferenceModalCapability) ->
         or runtime.get("git_dirty") is not False
         or runtime.get("git_commit") != request_raw["lineage"]["reviewed_commit"]
         or runtime.get("control_plane_sha256") != request_raw["lineage"]["control_plane_sha256"]
+        or capability.db_path.resolve() != (root / "results/local/reference.sqlite").resolve()
+        or capability.authority_root.resolve() != root
+        or capability.provider_environment != provider_environment
+        or capability_identity != expected_identity
+        or request_file_bytes != capability.bootstrap_request_bytes
+        or evaluation_lock_file_bytes != capability.evaluation_lock_bytes
+        or _sha(capability.evaluation_lock_bytes)
+        != request_raw["lineage"]["evaluation_lock_sha256"]
+        or image_lock_file_bytes != _canonical_json(capability.image_lock)
     ):
         raise ReferenceModalError("fresh deterministic gate is not bootstrap-ready")
+    return FreshDeterministicEvidence(
+        provider_environment=provider_environment,
+        execution_identity=expected_identity,
+        config_sha256=config.sha256,
+        reference_execution_scope_sha256=reference_scope,
+    )
 
 
 def _canonical_json(value: object) -> bytes:
@@ -170,6 +235,15 @@ def _canonical_json(value: object) -> bytes:
 
 def _sha(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
+
+
+def _optional_local_sha(root: Path, path: Path) -> str | None:
+    if path.is_absolute() or ".." in path.parts:
+        return None
+    try:
+        return _sha((root / path).read_bytes())
+    except OSError:
+        return None
 
 
 def _decode_b64(value: object, name: str) -> bytes:
@@ -251,6 +325,10 @@ def validate_remote_contract_bytes(content: bytes) -> ValidatedRemoteContract:
         or not SHA256_RE.fullmatch(raw["serialized_function_sha256"])
         or raw["timeout_seconds"] != request_raw["deadline_policy"]["timeout_seconds"]
         or raw["response_caps"] != request_raw["response_caps"]
+        or _sha(lock_bytes) != request_raw["lineage"]["evaluation_lock_sha256"]
+        or identity["weight_inventory_sha256"] != request_raw["lineage"]["inventory_sha256"]
+        or identity["runtime_receipt_sha256"] != request_raw["lineage"]["runtime_receipt_sha256"]
+        or identity["reviewed_commit_sha256"] != request_raw["lineage"]["reviewed_commit"]
     ):
         raise ReferenceModalError("remote contract boundary drift")
     return ValidatedRemoteContract(
@@ -320,6 +398,7 @@ def build_remote_contract(
 
 def _run_closed_remote_contract(content: bytes) -> dict[str, object]:
     """Audited production path, serialized by value rather than importing this package remotely."""
+    remote_started_monotonic = time.monotonic()
     contract = validate_remote_contract_bytes(content)
     request = contract.request
     lock = contract.evaluation_lock
@@ -328,18 +407,29 @@ def _run_closed_remote_contract(content: bytes) -> dict[str, object]:
     elapsed = (datetime.now(UTC) - contract.submission_pending_at).total_seconds()
     if elapsed < 0 or elapsed >= 2700:
         raise ReferenceModalError("submission deadline is unavailable")
-    # This fixed ephemeral directory is not caller-controlled and is never mounted or retained.
-    dependencies = build_execution_dependencies(
-        request,
-        lock,
-        fixtures,
-        identity,
-        artifact_root=Path("/tmp/lowbit-lab-reference"),
-        image_identity_sha256=_sha(str(contract.raw["provider_image_identity"]).encode()),
-    )
-    result = ReferenceExecution(
-        request, dependencies, deadline_started_monotonic=time.monotonic() - elapsed
-    ).run()
+    import signal
+
+    def deadline_expired(signum: int, frame: object) -> None:
+        raise ReferenceDeadlineAbort("absolute submission deadline exceeded")
+
+    previous_handler = signal.signal(signal.SIGALRM, deadline_expired)
+    signal.setitimer(signal.ITIMER_REAL, 2700 - elapsed)
+    try:
+        # This fixed ephemeral directory is not caller-controlled and is never mounted or retained.
+        dependencies = build_execution_dependencies(
+            request,
+            lock,
+            fixtures,
+            identity,
+            artifact_root=Path("/tmp/lowbit-lab-reference"),
+            image_identity_sha256=_sha(str(contract.raw["provider_image_identity"]).encode()),
+        )
+        result = ReferenceExecution(
+            request, dependencies, deadline_started_monotonic=remote_started_monotonic - elapsed
+        ).run()
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous_handler)
     receipt = validate_bootstrap_receipt_bytes(result.receipt, request=request)
     manifest: bytes | None = None
     if result.manifest is not None:
@@ -379,19 +469,25 @@ def _serialized_remote_callable() -> tuple[Any, bytes, tuple[Any, ...]]:
         reference_execution,
         reference_harness,
     )
-    for module in modules:
-        cloudpickle.register_pickle_by_value(module)
+    registered: list[Any] = []
+    try:
+        for module in modules:
+            cloudpickle.register_pickle_by_value(module)
+            registered.append(module)
 
-    runner = _run_closed_remote_contract
+        runner = _run_closed_remote_contract
 
-    def remote_entry(contract_bytes: bytes) -> dict[str, object]:
-        return runner(contract_bytes)
+        def remote_entry(contract_bytes: bytes) -> dict[str, object]:
+            return runner(contract_bytes)
 
-    # Modal's FunctionInfo uses this exact serializer during app hydration.
-    payload = serialize(remote_entry)
-    if len(payload) > 16 << 20:
-        raise ReferenceModalError("serialized function exceeds provider cap")
-    return remote_entry, payload, modules
+        # Modal's FunctionInfo uses this exact serializer during app hydration.
+        payload = serialize(remote_entry)
+        if len(payload) > 16 << 20:
+            raise ReferenceModalError("serialized function exceeds provider cap")
+        return remote_entry, payload, modules
+    except Exception:
+        _clear_serialization_policy(tuple(registered))
+        raise
 
 
 def _clear_serialization_policy(modules: tuple[Any, ...]) -> None:
@@ -400,6 +496,22 @@ def _clear_serialization_policy(modules: tuple[Any, ...]) -> None:
     for module in modules:
         with suppress(ValueError):
             cloudpickle.unregister_pickle_by_value(module)
+
+
+def _local_deadline_signal() -> Any:
+    """Require the interruptible Unix watchdog before consuming one-shot authority."""
+    import signal
+    import threading
+
+    names = ("SIGALRM", "ITIMER_REAL", "SIG_DFL", "getitimer", "getsignal", "setitimer")
+    if (
+        not all(hasattr(signal, name) for name in names)
+        or threading.current_thread() is not threading.main_thread()
+        or signal.getsignal(signal.SIGALRM) != signal.SIG_DFL
+        or signal.getitimer(signal.ITIMER_REAL) != (0.0, 0.0)
+    ):
+        raise ReferenceModalError("paid reference execution requires the WSL/Linux watchdog")
+    return signal
 
 
 def _image_from_lock(modal: Any, image_lock: Mapping[str, object]) -> Any:
@@ -421,30 +533,63 @@ def _image_from_lock(modal: Any, image_lock: Mapping[str, object]) -> Any:
 def _audit_block(
     database: ResultsDatabase, capability: ReferenceModalCapability, reason: str
 ) -> None:
-    with suppress(DatabaseError):
-        database.mark_reference_audit_blocked(
-            capability.reservation_id,
-            owner_id=capability.owner_id,
-            reason=f"provider boundary uncertainty: {reason[:64]}",
-            occurred_at=datetime.now(UTC).isoformat(),
-        )
+    database.mark_reference_audit_blocked(
+        capability.reservation_id,
+        owner_id=capability.owner_id,
+        reason=f"provider boundary uncertainty: {reason[:64]}",
+        occurred_at=datetime.now(UTC).isoformat(),
+    )
 
 
 def submit_reference(capability: ReferenceModalCapability) -> dict[str, object]:
     """The only U8 provider call path. Callers must already hold a reservation."""
-    database = ResultsDatabase(capability.db_path)
+    canonical_db_path = capability.root.resolve() / "results/local/reference.sqlite"
+    database = ResultsDatabase(canonical_db_path)
+    attempt_started_at = datetime.now(UTC).isoformat()
+    attempt_id = (
+        "u8-preflight-" + _sha(f"{capability.reservation_id}:{time.time_ns()}".encode())[:24]
+    )
+    audit_config_path = (
+        capability.config_path.as_posix()
+        if not capability.config_path.is_absolute() and ".." not in capability.config_path.parts
+        else "invalid"
+    )
+    database.create_attempt(
+        attempt_id=attempt_id,
+        config_path=audit_config_path,
+        raw_config_sha256=_optional_local_sha(capability.root.resolve(), capability.config_path),
+        started_at=attempt_started_at,
+    )
     # Validate every deterministic byte before consuming the sole action.
     try:
-        _validate_fresh_deterministic_gates(capability)
+        fresh = _validate_fresh_deterministic_gates(capability)
+        deadline_signal = _local_deadline_signal()
         build_remote_contract(
             capability,
             provider_image_identity="im-placeholder",
             serialized_function_sha256="0" * 64,
             submission_pending_at=datetime.now(UTC).isoformat(),
         )
-    except (ReferenceBootstrapError, ReferenceModalError) as exc:
+        reservation = database.get_reservation(capability.reservation_id)
+        run_id = str(reservation["run_id"])
+        run = database.get_run(run_id)
+        if (
+            reservation["owner_id"] != capability.owner_id
+            or reservation["reference_execution_scope_sha256"]
+            != fresh.reference_execution_scope_sha256
+            or run["config_sha256"] != fresh.config_sha256
+        ):
+            raise ReferenceModalError("reservation lineage does not match fresh capability")
+        database.link_attempt(attempt_id, run_id, datetime.now(UTC).isoformat())
+    except (DatabaseError, ReferenceBootstrapError, ReferenceModalError) as exc:
+        database.fail_attempt(
+            attempt_id,
+            "deterministic_remote_contract_gate_failed",
+            datetime.now(UTC).isoformat(),
+        )
         raise ReferenceModalError("deterministic remote contract gate failed") from exc
 
+    started = time.monotonic()
     submission_pending_at = datetime.now(UTC).isoformat()
     database.mark_reference_submission_pending(
         capability.reservation_id,
@@ -454,9 +599,25 @@ def submit_reference(capability: ReferenceModalCapability) -> dict[str, object]:
         authority_root=capability.authority_root,
         occurred_at=submission_pending_at,
     )
-    # This is the local monotonic representation of the durable boundary above.
-    started = time.monotonic()
+
+    def provider_deadline_expired(signum: int, frame: object) -> None:
+        raise ReferenceDeadlineAbort("absolute provider action deadline exceeded")
+
+    remaining_action_seconds = 2700 - (time.monotonic() - started)
+    if remaining_action_seconds <= 0:
+        _audit_block(database, capability, "deadline_before_provider_import")
+        raise ReferenceModalError("reference provider state requires audit")
+    # Starting before the durable transition makes the local clock conservative.
+    handler_may_be_installed = False
+    timer_may_be_armed = False
+    previous_deadline_handler = deadline_signal.SIG_DFL
     try:
+        handler_may_be_installed = True
+        previous_deadline_handler = deadline_signal.signal(
+            deadline_signal.SIGALRM, provider_deadline_expired
+        )
+        timer_may_be_armed = True
+        deadline_signal.setitimer(deadline_signal.ITIMER_REAL, remaining_action_seconds)
         import modal
 
         remote_entry, serialized, serialized_modules = _serialized_remote_callable()
@@ -506,12 +667,33 @@ def submit_reference(capability: ReferenceModalCapability) -> dict[str, object]:
                 occurred_at=datetime.now(UTC).isoformat(),
                 lease_expires_at=(datetime.now(UTC) + timedelta(hours=2)).isoformat(),
             )
-            raw_result = call.get(timeout=2700)
-            result = validate_remote_result(raw_result, capability)
+            remaining = 2700 - (time.monotonic() - started)
+            if remaining < 1:
+                raise ReferenceModalError("absolute submission deadline expired before result wait")
+            raw_result = call.get(timeout=math.floor(remaining))
+            validated_result = validate_remote_result(
+                raw_result, capability, provider_image_identity=image_identity
+            )
             if not isinstance(raw_result, Mapping) or raw_result.get("contract_sha256") != _sha(
                 contract
             ):
                 raise ReferenceModalError("provider return contract binding drift")
+            result = _persist_remote_evidence(capability, validated_result)
+            if "manifest_path" in result:
+                database.add_artifact(
+                    run_id,
+                    path=str(result["manifest_path"]),
+                    sha256=str(result["manifest_sha256"]),
+                    size_bytes=int(result["manifest_size_bytes"]),
+                    kind="reference_manifest",
+                )
+            database.add_artifact(
+                run_id,
+                path=str(result["receipt_path"]),
+                sha256=str(result["receipt_sha256"]),
+                size_bytes=int(result["receipt_size_bytes"]),
+                kind="bootstrap_receipt",
+            )
             now = datetime.now(UTC)
             database.mark_settlement_pending(
                 capability.reservation_id,
@@ -520,10 +702,25 @@ def submit_reference(capability: ReferenceModalCapability) -> dict[str, object]:
                 provider_terminal_at=now.isoformat(),
                 lease_expires_at=(now + timedelta(hours=2)).isoformat(),
             )
-    except Exception as exc:
+        deadline_signal.setitimer(deadline_signal.ITIMER_REAL, 0)
+        timer_may_be_armed = False
+        deadline_signal.signal(deadline_signal.SIGALRM, previous_deadline_handler)
+        handler_may_be_installed = False
+    except (Exception, ReferenceDeadlineAbort) as exc:
+        if timer_may_be_armed:
+            with suppress(BaseException):
+                deadline_signal.setitimer(deadline_signal.ITIMER_REAL, 0)
+        if handler_may_be_installed:
+            with suppress(BaseException):
+                deadline_signal.signal(deadline_signal.SIGALRM, previous_deadline_handler)
         if "serialized_modules" in locals():
             _clear_serialization_policy(serialized_modules)
-        _audit_block(database, capability, type(exc).__name__)
+        try:
+            _audit_block(database, capability, type(exc).__name__)
+        except DatabaseError as audit_exc:
+            raise ReferenceModalError(
+                "reference provider state could not be durably audit-blocked"
+            ) from audit_exc
         raise ReferenceModalError("reference provider state requires audit") from exc
     return result
 
@@ -545,8 +742,11 @@ def _persist_prepared(
 
 
 def validate_remote_result(
-    value: object, capability: ReferenceModalCapability
-) -> dict[str, object]:
+    value: object,
+    capability: ReferenceModalCapability,
+    *,
+    provider_image_identity: str,
+) -> ValidatedRemoteResult:
     if (
         not isinstance(value, Mapping)
         or set(value)
@@ -558,9 +758,41 @@ def validate_remote_result(
     receipt = _decode_b64(value["receipt_b64"], "receipt")
     request = validate_bootstrap_request_bytes(capability.bootstrap_request_bytes)
     validated_receipt = validate_bootstrap_receipt_bytes(receipt, request=request)
+    receipt_raw = json.loads(validated_receipt.canonical_json)
+    runtime_stage = next(
+        (stage for stage in receipt_raw["stages"] if stage["stage"] == "runtime_identity"), None
+    )
+    expected_image_identity = _sha(provider_image_identity.encode())
+    if runtime_stage is None:
+        raise ReferenceModalError("provider image identity binding drift")
+    runtime_measurements = runtime_stage["measurements"]
+    if (
+        runtime_stage["status"] == "completed"
+        and runtime_measurements.get("image_identity_sha256") != expected_image_identity
+    ):
+        raise ReferenceModalError("provider image identity binding drift")
+    if runtime_stage["status"] == "failed" and (
+        runtime_measurements.get("image_identity_sha256") != "0" * 64
+        or runtime_measurements.get("runtime_identity_sha256") != "0" * 64
+    ):
+        raise ReferenceModalError("failed runtime identity sentinel drift")
+    evaluation = next(
+        (stage for stage in receipt_raw["stages"] if stage["stage"] == "evaluation"), None
+    )
+    expected_manifest_sha256 = (
+        None if evaluation is None else evaluation["measurements"]["reference_manifest_sha256"]
+    )
+    expected_manifest_bytes = (
+        0 if evaluation is None else evaluation["measurements"]["reference_manifest_bytes"]
+    )
     manifest_raw = value["manifest_b64"]
+    if (manifest_raw is None) != (expected_manifest_sha256 is None):
+        raise ReferenceModalError("provider manifest presence binding drift")
+    manifest: bytes | None = None
     if manifest_raw is not None:
         manifest = _decode_b64(manifest_raw, "manifest")
+        if len(manifest) != expected_manifest_bytes or _sha(manifest) != expected_manifest_sha256:
+            raise ReferenceModalError("provider manifest hash binding drift")
         lock = json.loads(capability.evaluation_lock_bytes)
         fixtures = {key: body for key, body in capability.fixture_bytes.items()}
         validated_lock = validate_pending_evaluation_lock(lock, fixture_bytes=fixtures)
@@ -569,7 +801,56 @@ def validate_remote_result(
             evaluation_lock_sha256=validated_lock.sha256,
             context_ladder_tokens=request.context_ladder_tokens,
         )
-    return {
-        "receipt_sha256": _sha(validated_receipt.canonical_json.encode()),
-        "status": validated_receipt.status,
-    }
+        manifest_json = json.loads(manifest)
+        if validate_execution_identity(
+            manifest_json["execution_identity"]
+        ) != validate_execution_identity(capability.execution_identity):
+            raise ReferenceModalError("provider execution identity binding drift")
+    receipt_bytes = validated_receipt.canonical_json.encode()
+    return ValidatedRemoteResult(
+        status=validated_receipt.status,
+        receipt=receipt_bytes,
+        receipt_sha256=_sha(receipt_bytes),
+        manifest=manifest,
+        manifest_sha256=None if manifest is None else _sha(manifest),
+        full_context_usefulness_proven=validated_receipt.full_context_usefulness_proven,
+    )
+
+
+def _persist_remote_evidence(
+    capability: ReferenceModalCapability, result: ValidatedRemoteResult
+) -> dict[str, object]:
+    """Persist sanitized provider evidence without overwrite or caller-selected paths."""
+    evidence_root = capability.root.resolve() / "reports/local"
+    evidence_root.mkdir(parents=True, exist_ok=True)
+    suffix = _sha(capability.reservation_id.encode())[:16]
+    artifacts: dict[str, object] = {}
+    if result.manifest is not None:
+        manifest_path = evidence_root / f"u8-reference-manifest-{suffix}.json"
+        manifest_sha256, manifest_size = _write_new_durable(manifest_path, result.manifest)
+        artifacts["manifest_path"] = manifest_path.relative_to(capability.root.resolve()).as_posix()
+        artifacts["manifest_sha256"] = manifest_sha256
+        artifacts["manifest_size_bytes"] = manifest_size
+    receipt_path = evidence_root / f"u8-bootstrap-receipt-{suffix}.json"
+    receipt_sha256, receipt_size = _write_new_durable(receipt_path, result.receipt)
+    artifacts.update(
+        {
+            "full_context_usefulness_proven": result.full_context_usefulness_proven,
+            "receipt_path": receipt_path.relative_to(capability.root.resolve()).as_posix(),
+            "receipt_sha256": receipt_sha256,
+            "receipt_size_bytes": receipt_size,
+            "status": result.status,
+        }
+    )
+    return artifacts
+
+
+def _write_new_durable(path: Path, content: bytes) -> tuple[str, int]:
+    with path.open("xb") as handle:
+        handle.write(content)
+        handle.flush()
+        os.fsync(handle.fileno())
+    persisted = path.read_bytes()
+    if persisted != content:
+        raise ReferenceModalError("persisted provider evidence verification failed")
+    return _sha(persisted), len(persisted)

@@ -145,6 +145,10 @@ class ExecutionFailure(RuntimeError):
         self.code = code if _safe_code(code) else "unknown_failure"
 
 
+class ReferenceDeadlineAbort(BaseException):
+    """An absolute provider deadline that staged fail-closed handling must never swallow."""
+
+
 def _safe_code(code: object) -> bool:
     return isinstance(code, str) and FAILURE_CODE_RE.fullmatch(code) is not None
 

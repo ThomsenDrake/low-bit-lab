@@ -115,13 +115,27 @@ uv run lowbit-paid-smoke audit-prelaunch --root . `
 This transition never contacts Modal and does not invent a function-call identity; billing
 settlement binds the app ID.
 
-## Hard stop
+## Bootstrap-authorized U8 boundary
 
-U8 remains unauthorized. The sole audited `modal.App`/spawn boundary is the no-weight provider-smoke
-adapter. The standing campaign grant authorizes only that adapter within confirmed unspent lifetime
-balance. Provider authentication is not broader authority and credentials must never enter the repo.
-Unknown billing after any future submission must become `audit_blocked`; it must never release
-reusable budget. Every submitted or later state permanently consumes its execution scope.
+The separately approved bootstrap amendment permits one U8 action to establish provider image,
+usable-memory, allocator/runtime-overhead, and cold-path evidence progressively inside that same
+execution. It does not permit a retry or second action. The adapter must derive its database,
+provider environment, execution identity, evaluation lock, fixtures, request, and image recipe from
+freshly reproduced local authority. It persists `submission_pending` before provider import,
+provider image/app identity before the sole spawn, call identity immediately after spawn, and the
+validated receipt/manifest before settlement pending.
 
-The controller handoff still keeps ordinary target-bearing action authority at zero. The standing
-campaign authority is a separate, closed no-weight capability; it cannot activate a target or U8.
+The current immutable source transport is a pre-submit stop. A metadata-only HEAD request read zero
+body bytes and observed that an approved query-free source URL redirects to a final public CDN URL
+with a query string. The approved source policy rejects query strings at every redirect boundary.
+Do not reserve U8, import Modal, or transfer weights until either a compliant immutable query-free
+origin is proven or a later human-approved transport amendment changes that exact rule.
+
+The paid adapter must be invoked from the isolated WSL/Linux environment. Native Windows lacks the
+SIGALRM watchdog used to cover the complete 2,700-second provider section, including image build.
+The adapter checks this before consuming U8 authority and fails closed on unsupported hosts.
+
+Unknown billing or provider state after any future submission must become `audit_blocked`; it must
+never release reusable budget. Provider authentication is not broader authority. U9 remains
+proposal-only, and candidate conversion, training, numeric-threshold approval, and promotion remain
+unauthorized.

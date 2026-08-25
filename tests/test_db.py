@@ -71,10 +71,25 @@ def test_schema_is_idempotent_and_transitions_are_explicit(tmp_path: Path) -> No
         database.transition("run-1", "completed", ended_at="2026-08-21T00:00:01+00:00")
     database.transition("run-1", "running")
     database.add_metric("run-1", "proof", False)
+    database.add_artifact(
+        "run-1",
+        path="reports/local/proof.json",
+        sha256="b" * 64,
+        size_bytes=2,
+        kind="proof_receipt",
+    )
     database.transition("run-1", "completed", ended_at="2026-08-21T00:00:01+00:00")
     run = database.get_run("run-1")
     assert run["status"] == "completed"
     assert run["metrics"]["proof"]["value"] is False
+    assert run["artifacts"] == [
+        {
+            "path": "reports/local/proof.json",
+            "sha256": "b" * 64,
+            "size_bytes": 2,
+            "kind": "proof_receipt",
+        }
+    ]
     assert [item["to_state"] for item in run["transitions"]] == [
         "created",
         "validated",
@@ -567,12 +582,12 @@ def _record_settled_provider_smoke(
 def _downgrade_v9_to_v8(path: Path) -> None:
     with sqlite3.connect(path) as connection:
         connection.execute("DROP TABLE reference_authority_slots")
-        connection.execute("UPDATE schema_info SET version = 8 WHERE version IN (10, 11)")
+        connection.execute("UPDATE schema_info SET version = 8 WHERE version IN (10, 11, 12)")
 
 
 def _downgrade_v10_to_v9(path: Path) -> None:
     with sqlite3.connect(path) as connection:
-        connection.execute("UPDATE schema_info SET version = 9 WHERE version IN (10, 11)")
+        connection.execute("UPDATE schema_info SET version = 9 WHERE version IN (10, 11, 12)")
 
 
 def _submit(database: ResultsDatabase, reservation_id: str, *, lease: str) -> None:
@@ -619,6 +634,31 @@ def _billing_report(
         "schema_version": 1,
         "kind": "provider_billing_report_receipt",
         "provider_job_id": f"job-{reservation_id}",
+        "billing_authority_sha256": "c" * 64,
+        "authoritative_report_identity_sha256": "1" * 64,
+        "covered_through": covered_through,
+        "actual_cost_usd": actual_cost_usd,
+    }
+    report_json = json.dumps(report, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return {
+        "actual_cost_usd": actual_cost_usd,
+        "billing_authority_sha256": "c" * 64,
+        "authoritative_report_identity_sha256": "1" * 64,
+        "billing_report_json": report_json,
+        "billing_report_sha256": hashlib.sha256(report_json.encode()).hexdigest(),
+    }
+
+
+def _billing_report_for_identity(
+    provider_identity: str,
+    actual_cost_usd: str,
+    *,
+    covered_through: str = "2026-08-22T00:46:00+00:00",
+) -> dict[str, str]:
+    report = {
+        "schema_version": 1,
+        "kind": "provider_billing_report_receipt",
+        "provider_job_id": provider_identity,
         "billing_authority_sha256": "c" * 64,
         "authoritative_report_identity_sha256": "1" * 64,
         "covered_through": covered_through,
@@ -1246,6 +1286,113 @@ def test_delayed_authoritative_billing_can_settle_an_audit_blocked_run(
     assert database.get_run("run-delayed")["modal_cost_actual_usd"] == "4.00"
 
 
+@pytest.mark.parametrize("provider_state", ["submission_pending", "submitted"])
+def test_authoritative_billing_reconciles_audit_block_before_settlement(
+    tmp_path: Path, provider_state: str
+) -> None:
+    database = ResultsDatabase(tmp_path / f"audit-{provider_state}.sqlite")
+    database.initialize()
+    suffix = f"audit-{provider_state}"
+    reservation_id = f"reservation-{suffix}"
+    _reserve(database, suffix=suffix)
+    database.mark_reference_submission_pending(
+        reservation_id,
+        owner_id="owner",
+        standing_authority_sha256=REFERENCE_AUTHORITY_SHA256,
+        bootstrap_authority_sha256=REFERENCE_BOOTSTRAP_AUTHORITY_SHA256,
+        authority_root=_authority_root(database),
+        occurred_at="2026-08-22T00:00:30+00:00",
+    )
+    database.mark_reference_provider_prepared(
+        reservation_id,
+        owner_id="owner",
+        provider_image_identity=f"im-{suffix}",
+        app_identity=f"app-{suffix}",
+        occurred_at="2026-08-22T00:00:45+00:00",
+        lease_expires_at="2026-08-22T00:05:00+00:00",
+    )
+    provider_identity = f"app-{suffix}"
+    if provider_state == "submitted":
+        database.mark_reservation_submitted(
+            reservation_id,
+            owner_id="owner",
+            provider_job_id=f"job-{suffix}",
+            app_identity=f"app-{suffix}",
+            occurred_at="2026-08-22T00:01:00+00:00",
+            lease_expires_at="2026-08-22T00:10:00+00:00",
+        )
+        provider_identity = f"job-{suffix}"
+    database.mark_reference_audit_blocked(
+        reservation_id,
+        owner_id="owner",
+        reason="provider boundary uncertainty: test",
+        occurred_at="2026-08-22T00:01:30+00:00",
+    )
+    incomplete_report = _billing_report_for_identity(
+        provider_identity,
+        "0.25",
+        covered_through="2026-08-22T00:45:00+00:00",
+    )
+    with pytest.raises(DatabaseError, match="full action window"):
+        database.reconcile_reference_audit_billing(
+            reservation_id,
+            billing_report_json=incomplete_report["billing_report_json"],
+            billing_report_sha256=incomplete_report["billing_report_sha256"],
+            occurred_at="2026-08-22T00:45:00+00:00",
+        )
+    report = _billing_report_for_identity(provider_identity, "0.25")
+    database.reconcile_reference_audit_billing(
+        reservation_id,
+        billing_report_json=report["billing_report_json"],
+        billing_report_sha256=report["billing_report_sha256"],
+        occurred_at="2026-08-22T00:46:00+00:00",
+    )
+    assert database.get_reservation(reservation_id)["status"] == "audit_blocked"
+    database.settle_reservation(
+        reservation_id,
+        occurred_at="2026-08-22T01:46:00+00:00",
+        **report,
+    )
+    assert database.get_reservation(reservation_id)["status"] == "settled"
+    assert database.get_run(f"run-{suffix}")["modal_cost_actual_usd"] == "0.25"
+
+
+def test_audit_billing_reconciliation_rejects_backdated_transition(tmp_path: Path) -> None:
+    database = ResultsDatabase(tmp_path / "audit-backdated.sqlite")
+    database.initialize()
+    _reserve(database, suffix="audit-backdated")
+    database.mark_reference_submission_pending(
+        "reservation-audit-backdated",
+        owner_id="owner",
+        standing_authority_sha256=REFERENCE_AUTHORITY_SHA256,
+        bootstrap_authority_sha256=REFERENCE_BOOTSTRAP_AUTHORITY_SHA256,
+        authority_root=_authority_root(database),
+        occurred_at="2026-08-22T00:00:30+00:00",
+    )
+    database.mark_reference_provider_prepared(
+        "reservation-audit-backdated",
+        owner_id="owner",
+        provider_image_identity="im-audit-backdated",
+        app_identity="app-audit-backdated",
+        occurred_at="2026-08-22T00:00:45+00:00",
+        lease_expires_at="2026-08-22T00:05:00+00:00",
+    )
+    database.mark_reference_audit_blocked(
+        "reservation-audit-backdated",
+        owner_id="owner",
+        reason="provider boundary uncertainty: test",
+        occurred_at="2026-08-22T01:00:00+00:00",
+    )
+    report = _billing_report_for_identity("app-audit-backdated", "0.25")
+    with pytest.raises(DatabaseError, match="backdated"):
+        database.reconcile_reference_audit_billing(
+            "reservation-audit-backdated",
+            billing_report_json=report["billing_report_json"],
+            billing_report_sha256=report["billing_report_sha256"],
+            occurred_at="2026-08-22T00:50:00+00:00",
+        )
+
+
 def test_legacy_submitted_or_later_reservation_retains_the_full_cap(tmp_path: Path) -> None:
     path = tmp_path / "legacy.sqlite"
     _downgrade_populated_database_to_v4(path)
@@ -1710,16 +1857,9 @@ def test_v8_migration_consumes_slot_for_zero_cost_provider_contact(
                     updated_at = ? WHERE reservation_id = ?""",
                 ("2026-08-22T00:02:00+00:00", f"reservation-{terminal_status}"),
             )
-    scope = database.get_reservation(f"reservation-{terminal_status}")[
-        "reference_execution_scope_sha256"
-    ]
     _downgrade_v9_to_v8(path)
-    database.initialize()
-    assert database.reference_u8_slot(REFERENCE_AUTHORITY_SHA256) == {
-        "state": "consumed",
-        "execution_scope_sha256": scope,
-        "consumed_at": "2026-08-22T00:01:00+00:00",
-    }
+    with pytest.raises(DatabaseError, match="contacted reference rows without image lineage"):
+        database.initialize()
 
 
 def test_v8_migration_fails_closed_for_multiple_provider_contacts(tmp_path: Path) -> None:

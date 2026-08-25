@@ -20,6 +20,7 @@ from lowbit_lab.reference_execution import (
     ExecutionDependencies,
     FetchResponse,
     LoadObservation,
+    ReferenceDeadlineAbort,
     ReferenceExecution,
     RuntimeObservation,
 )
@@ -412,6 +413,14 @@ def test_load_failure_and_unknown_exception_are_sanitized() -> None:
     assert _failure(receipt) == ("evaluation", "unknown_failure")
     assert "sensitive" not in canonical_json(receipt)
     assert receipt["stages"][-1]["measurements"]["reference_manifest_sha256"] is None
+
+
+def test_absolute_deadline_abort_is_never_converted_to_a_receipt() -> None:
+    dependencies, _, _, _, _ = _dependencies(
+        loader=FakeLoader(raises=ReferenceDeadlineAbort("deadline"))
+    )
+    with pytest.raises(ReferenceDeadlineAbort):
+        ReferenceExecution(_request(), dependencies, deadline_started_monotonic=0).run()
 
 
 def test_malformed_runtime_metrics_fail_without_becoming_evidence() -> None:
