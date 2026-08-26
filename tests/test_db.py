@@ -404,6 +404,7 @@ def _reserve(
     settled_smoke_actual_usd: str | None = "0.00270969",
     standing_authority_sha256: str = REFERENCE_AUTHORITY_SHA256,
     bootstrap_authority_sha256: str = REFERENCE_BOOTSTRAP_AUTHORITY_SHA256,
+    standing_setup: bool = False,
 ) -> None:
     if settled_smoke_actual_usd is not None:
         with database.connect_readonly() as connection:
@@ -505,23 +506,24 @@ def _reserve(
         config_json = json.dumps(raw, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
         config_sha256 = hashlib.sha256(config_json.encode()).hexdigest()
     approval = hashlib.sha256(f"approval-{suffix}".encode()).hexdigest()
-    database.register_reference_challenge(
-        challenge_sha256=challenge,
-        packet_sha256="c" * 64,
-        created_at="2026-08-22T00:00:00+00:00",
-    )
-    if attach_approval:
-        database.attach_reference_approval(
+    if not standing_setup:
+        database.register_reference_challenge(
             challenge_sha256=challenge,
-            approval_digest=approval,
-            expires_at="2026-08-22T01:00:00+00:00",
+            packet_sha256="c" * 64,
+            created_at="2026-08-22T00:00:00+00:00",
         )
-    database.create_attempt(
-        attempt_id=f"attempt-{suffix}",
-        config_path="configs/local/reference.yaml",
-        raw_config_sha256="a" * 64,
-        started_at="2026-08-22T00:00:00+00:00",
-    )
+        if attach_approval:
+            database.attach_reference_approval(
+                challenge_sha256=challenge,
+                approval_digest=approval,
+                expires_at="2026-08-22T01:00:00+00:00",
+            )
+        database.create_attempt(
+            attempt_id=f"attempt-{suffix}",
+            config_path="configs/local/reference.yaml",
+            raw_config_sha256="a" * 64,
+            started_at="2026-08-22T00:00:00+00:00",
+        )
     database.reserve_reference_run(
         reservation_id=f"reservation-{suffix}",
         attempt_id=f"attempt-{suffix}",
@@ -550,6 +552,10 @@ def _reserve(
         standing_authority_sha256=standing_authority_sha256,
         bootstrap_authority_sha256=bootstrap_authority_sha256,
         authority_root=_authority_root(database),
+        standing_packet_sha256="c" * 64 if standing_setup else None,
+        approval_expires_at="2026-08-22T01:00:00+00:00" if standing_setup else None,
+        attempt_config_path="configs/local/reference.yaml" if standing_setup else None,
+        attempt_raw_config_sha256="a" * 64 if standing_setup else None,
     )
 
 
@@ -577,6 +583,23 @@ def _record_settled_provider_smoke(
                 "2026-08-25T01:00:00+00:00",
             ),
         )
+
+
+def test_standing_reference_setup_rolls_back_with_failed_reservation(tmp_path: Path) -> None:
+    database = ResultsDatabase(tmp_path / "results.sqlite")
+    database.initialize()
+    _reserve(database, suffix="active")
+
+    with pytest.raises(DatabaseError, match="exceeds phase cap"):
+        _reserve(database, suffix="rolled-back", standing_setup=True)
+
+    with database.connect_readonly() as connection:
+        assert connection.execute(
+            "SELECT 1 FROM attempts WHERE attempt_id = 'attempt-rolled-back'"
+        ).fetchone() is None
+        assert connection.execute(
+            "SELECT count(*) FROM reference_approval_challenges"
+        ).fetchone()[0] == 1
 
 
 def _downgrade_v9_to_v8(path: Path) -> None:

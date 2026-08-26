@@ -48,3 +48,4 @@ REFERENCE_SIGNED_REDIRECT_POLICY = (
     ("huggingface.co", "/api/resolve-cache/models/"),
     ("us.aws.cdn.hf.co", "/xet-bridge-us/"),
 )
+REFERENCE_IMMUTABLE_ORIGIN_HOSTS = ("huggingface.co",)
