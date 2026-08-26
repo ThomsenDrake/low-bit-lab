@@ -266,6 +266,12 @@ target-neutral code set, erase all unreviewed exception text and chains, and inc
 structural position when it helps diagnosis. This preserves enough signal to distinguish network,
 DNS, redirect, peer, URL-policy, and status failures without retaining sensitive request material.
 
+Independent config consumers must advance closed schema versions and field sets together. A newer
+validator can prove a config that a stale database challenge parser rejects only at the final atomic
+boundary. Define shared closed field sets once, keep a populated production-shaped reservation
+fixture at the atomic consumer, and reproduce the exact production transaction against a disposable
+database copy before paid use.
+
 ## Why This Matters
 
 These invariants make silent policy drift, config mutation, preflight failure loss, and concurrent overspend observable or impossible. They also let later agents resume from durable state without inheriting hidden judgment from an earlier session.
