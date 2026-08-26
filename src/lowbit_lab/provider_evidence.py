@@ -531,6 +531,7 @@ def validate_provider_capability_receipt(
         "receipt_sha256": expected_sha256,
         "remote_contact_performed": False,
         "image_identity_available_before_spawn": True,
+        "sdk_version": value["sdk"]["version"],
         "billing_attribution_granularity": value["billing"]["granularity"],
         "billing_completeness_delay_seconds": value["billing"]["completeness_delay_seconds"],
     }

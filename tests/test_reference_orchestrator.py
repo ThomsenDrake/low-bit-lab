@@ -35,6 +35,77 @@ def _capability(root: Path) -> ReferenceModalCapability:
     )
 
 
+def test_bootstrap_request_consumes_flat_validated_sdk_summary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    image_path = tmp_path / orchestrator.IMAGE_LOCK_PATH
+    provider_path = tmp_path / orchestrator.PROVIDER_CAPABILITY_PATH
+    evaluation_path = tmp_path / "eval/local/lock.json"
+    fixture_root = tmp_path / "eval/local/fixtures"
+    for path in (image_path, provider_path, evaluation_path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{}", encoding="utf-8")
+    fixture_root.mkdir(parents=True)
+    evaluation_path.write_text('{"fixtures":[]}', encoding="utf-8")
+    config = SimpleNamespace(
+        authority_files={
+            "runtime_lock_path": "runtime.json",
+            "evaluation_lock_path": "eval/local/lock.json",
+            "evaluation_fixture_root": "eval/local/fixtures",
+        },
+        gates={"memory_fit_evidence_path": "memory.json"},
+        inputs={
+            "control_plane_sha256": "1" * 64,
+            "weight_inventory_sha256": "2" * 64,
+            "reviewed_commit_sha256": "3" * 40,
+            "runtime_receipt_sha256": "4" * 64,
+            "source_revision": "5" * 40,
+            "weight_inventory_tensor_bytes": 1,
+            "evaluation_max_context_tokens": 262144,
+        },
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "validate_image_lock_bytes",
+        lambda _content: SimpleNamespace(recipe_sha256="6" * 64, sha256="7" * 64),
+    )
+    monkeypatch.setattr(
+        orchestrator, "load_runtime_lock", lambda *_a, **_k: SimpleNamespace(sha256="8" * 64)
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "validate_pending_evaluation_lock",
+        lambda *_a, **_k: SimpleNamespace(sha256="9" * 64),
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "validate_provider_capability_receipt",
+        lambda *_a, **_k: {"sdk_version": "validated-sdk"},
+    )
+    monkeypatch.setattr(
+        orchestrator, "_read_json", lambda *_a, **_k: {"known_required_lower_bound_bytes": 1}
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "_source_artifacts",
+        lambda *_a, **_k: [
+            {"url": "https://huggingface.co/public/revision/file", "sha256": "a" * 64}
+        ],
+    )
+    monkeypatch.setattr(orchestrator, "validate_bootstrap_request_bytes", lambda _value: None)
+
+    request = json.loads(orchestrator.build_bootstrap_request(tmp_path, config))
+
+    assert request["provider_capability"]["sdk_version"] == "validated-sdk"
+
+    def reject_receipt(*_args: object, **_kwargs: object) -> object:
+        raise RuntimeError("receipt drift")
+
+    monkeypatch.setattr(orchestrator, "validate_provider_capability_receipt", reject_receipt)
+    with pytest.raises(RuntimeError, match="receipt drift"):
+        orchestrator.build_bootstrap_request(tmp_path, config)
+
+
 def test_source_artifacts_use_query_free_origins_and_complete_inventory(tmp_path: Path) -> None:
     identifier = "public-owner/public-model"
     revision = "1" * 40

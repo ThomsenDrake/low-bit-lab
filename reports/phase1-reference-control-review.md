@@ -155,3 +155,22 @@ and the closed remote capability bind the validated canonical representation.
 Independent simplify review found no unnecessary work or reusable exact-contract helper. Quality
 review found one ambiguous local hash name; local variables now explicitly distinguish file-byte
 and canonical identities while retaining the approved serialized schema keys.
+
+## 2026-08-26 provider SDK lineage review
+
+Merged-main preparation then found that the validated provider-capability summary omitted the SDK
+version required by the bootstrap request. The receipt validator already reproduced and validated
+that field, but the consumer incorrectly assumed the original nested receipt shape.
+
+- Reproducibility and lineage: the closed validator projection now carries the already-validated SDK
+  version; request construction performs no independent receipt or SDK read.
+- Modal safety and containment: provider inspection remains offline and local. No reservation,
+  provider contact, or artifact transfer is added.
+- Local RTX 5080 compatibility: no runtime, CUDA, hardware, or memory behavior changes.
+- Security and private-data handling: the projection adds one public package-version string and does
+  not broaden the receipt, target, credential, or signed-query surface.
+- Research-loop support: deterministic bootstrap request construction can proceed while configured
+  context remains 262,144 tokens and proven-useful context remains unknown.
+
+Simplify review found the narrow projection to be the smallest safe change. Independent review and
+the exact-result test verify the consumer receives only validated summary data.

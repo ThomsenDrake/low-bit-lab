@@ -435,7 +435,7 @@ def build_bootstrap_request(root: Path, config: ReferenceJobConfig) -> bytes:
             "proven": True,
             "receipt_sha256": provider_sha,
             "remote_contact_performed": False,
-            "sdk_version": provider["sdk"]["version"],
+            "sdk_version": provider["sdk_version"],
         },
         "readiness": {
             "deterministic": "bootstrap_ready",
