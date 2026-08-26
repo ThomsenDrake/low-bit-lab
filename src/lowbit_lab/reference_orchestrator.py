@@ -38,6 +38,7 @@ from lowbit_lab.modal_job import (
     load_reference_job_config,
     plan_reference_bootstrap_preview,
 )
+from lowbit_lab.provenance import parse_weight_inventory
 from lowbit_lab.provider_evidence import (
     DEFAULT_BILLING_AUTHORITY,
     DEFAULT_BILLING_RECEIPT,
@@ -59,7 +60,11 @@ from lowbit_lab.reference_bootstrap import (
 from lowbit_lab.reference_contract import REFERENCE_RESOURCES
 from lowbit_lab.reference_modal_adapter import ReferenceModalCapability
 from lowbit_lab.reference_transport import observe_topology
-from lowbit_lab.runtime import load_runtime_lock, runtime_metadata
+from lowbit_lab.runtime import (
+    load_runtime_lock,
+    runtime_metadata,
+    verify_current_installed_environment,
+)
 
 CONFIG_PATH = Path("configs/local/reference.yaml")
 REQUEST_PATH = Path("reports/local/u8-bootstrap-request.json")
@@ -110,6 +115,40 @@ def _write_atomic(path: Path, content: bytes) -> None:
         raise ReferenceOrchestratorError("persisted orchestration evidence drift")
 
 
+def _manifest_identity(provenance: Mapping[str, object]) -> str:
+    identity_manifest = deepcopy(dict(provenance))
+    declared = identity_manifest.pop("manifest_sha256", None)
+    files = identity_manifest.get("files")
+    if not isinstance(files, list):
+        raise ReferenceOrchestratorError("provenance manifest identity is incomplete")
+    for item in files:
+        if not isinstance(item, dict) or not isinstance(item.get("local_content"), dict):
+            raise ReferenceOrchestratorError("provenance manifest identity is incomplete")
+        item["local_content"].pop("reused", None)
+    reproduced = _sha(
+        json.dumps(identity_manifest, sort_keys=True, separators=(",", ":")).encode()
+    )
+    if declared != reproduced:
+        raise ReferenceOrchestratorError("provenance manifest identity drift")
+    return reproduced
+
+
+def _validate_frozen_inputs(
+    frozen: Mapping[str, object],
+    inventory: object,
+    evaluation: object,
+    runtime: Mapping[str, object],
+) -> None:
+    if (
+        inventory.source_revision != frozen["source_revision"]
+        or inventory.index_tensor_bytes != frozen["weight_inventory_tensor_bytes"]
+        or evaluation.sha256 != frozen["evaluation_lock_sha256"]
+        or evaluation.context.configured_tokens != frozen["evaluation_max_context_tokens"]
+        or runtime["receipt_sha256"] != frozen["runtime_receipt_sha256"]
+    ):
+        raise ReferenceOrchestratorError("frozen source, evaluation, or runtime identity drift")
+
+
 def refresh_local_config(root: Path) -> ReferenceJobConfig:
     """Bind ignored target configuration to the current clean reviewed tree."""
     root = root.resolve()
@@ -117,17 +156,77 @@ def refresh_local_config(root: Path) -> ReferenceJobConfig:
     if runtime["git_dirty"] or runtime["git_commit"] == "uncommitted":
         raise ReferenceOrchestratorError("reviewed tree must be clean and committed")
     path = root / CONFIG_PATH
-    load_reference_job_config(path, root=root)
+    current = load_reference_job_config(path, root=root)
     try:
         raw = yaml.safe_load(path.read_text(encoding="utf-8"))
     except (OSError, yaml.YAMLError) as exc:
         raise ReferenceOrchestratorError("reference config is unavailable") from exc
     if not isinstance(raw, dict) or not isinstance(raw.get("inputs"), dict):
         raise ReferenceOrchestratorError("reference config schema drift")
+    provenance = _read_json(
+        root / str(current.authority_files["provenance_manifest_path"]), "provenance manifest"
+    )
+    provenance_sha = _manifest_identity(provenance)
+    files = provenance.get("files")
+    if not isinstance(files, list):
+        raise ReferenceOrchestratorError("provenance manifest is incomplete")
+    by_name = {item.get("path"): item for item in files if isinstance(item, Mapping)}
+    try:
+        index_entry = by_name["model.safetensors.index.json"]
+        tokenizer_entry = by_name["tokenizer.json"]
+        index_bytes = (root / index_entry["local_content"]["cache_path"]).read_bytes()
+        tokenizer_sha = str(tokenizer_entry["local_content"]["sha256"])
+    except (KeyError, OSError, TypeError) as exc:
+        raise ReferenceOrchestratorError("provenance cache binding is incomplete") from exc
+    runtime_lock = load_runtime_lock(
+        root / str(current.authority_files["runtime_lock_path"]), root=root
+    )
+    evaluation_raw = _read_json(
+        root / str(current.authority_files["evaluation_lock_path"]), "evaluation lock"
+    )
+    fixture_root = root / str(current.authority_files["evaluation_fixture_root"])
+    fixture_bytes = {
+        str(item["fixture_id"]): (fixture_root / f"{item['fixture_id']}.json").read_bytes()
+        for item in evaluation_raw["fixtures"]
+    }
+    evaluation = validate_pending_evaluation_lock(
+        evaluation_raw, fixture_bytes=fixture_bytes
+    )
+    source_metadata = _read_json(
+        root / str(current.authority_files["source_shard_metadata_path"]),
+        "source shard metadata",
+    )
+    inventory_raw = _read_json(
+        root / str(current.authority_files["weight_inventory_path"]), "weight inventory"
+    )
+    inventory = parse_weight_inventory(
+        inventory_raw,
+        source_index_bytes=index_bytes,
+        source_shards={
+            name: (int(item["size_bytes"]), str(item["lfs_sha256"]))
+            for name, item in source_metadata.items()
+            if isinstance(item, Mapping)
+        },
+        expected_bindings={
+            "provenance_manifest_sha256": provenance_sha,
+            "tokenizer_sha256": tokenizer_sha,
+            "runtime_lock_sha256": runtime_lock.sha256,
+            "evaluation_lock_sha256": evaluation.sha256,
+            "source_index_sha256": _sha(index_bytes),
+        },
+    )
+    receipt_path = root / str(current.authority_files["runtime_receipt_path"])
+    receipt = _read_json(receipt_path, "runtime receipt")
+    verified_runtime = verify_current_installed_environment(
+        receipt, root=root, lock=runtime_lock
+    )
+    _validate_frozen_inputs(current.inputs, inventory, evaluation, verified_runtime)
     commit = str(runtime["git_commit"])
     raw["experiment_id"] = f"phase1-u8-{commit[:12]}"
     raw["inputs"]["reviewed_commit_sha256"] = commit
     raw["inputs"]["control_plane_sha256"] = runtime["control_plane_sha256"]
+    raw["inputs"]["weight_inventory_sha256"] = inventory.sha256
+    raw["inputs"]["provenance_manifest_sha256"] = provenance_sha
     raw["approval_artifact_path"] = None
     encoded = yaml.safe_dump(raw, sort_keys=False, allow_unicode=False).encode("utf-8")
     _write_atomic(path, encoded)
@@ -145,18 +244,8 @@ def _source_artifacts(root: Path, config: ReferenceJobConfig) -> list[dict[str, 
     shards = inventory.get("shards")
     if not isinstance(files, list) or not isinstance(shards, list) or not shards:
         raise ReferenceOrchestratorError("source artifact inventory is incomplete")
-    identity_manifest = deepcopy(dict(provenance))
-    declared_manifest_sha = identity_manifest.pop("manifest_sha256", None)
-    identity_files = identity_manifest.get("files")
-    if not isinstance(identity_files, list):
-        raise ReferenceOrchestratorError("provenance manifest identity is incomplete")
-    for item in identity_files:
-        if not isinstance(item, dict) or not isinstance(item.get("local_content"), dict):
-            raise ReferenceOrchestratorError("provenance manifest identity is incomplete")
-        item["local_content"].pop("reused", None)
-    reproduced_manifest_sha = _sha(
-        json.dumps(identity_manifest, sort_keys=True, separators=(",", ":")).encode()
-    )
+    reproduced_manifest_sha = _manifest_identity(provenance)
+    declared_manifest_sha = provenance.get("manifest_sha256")
     repository = provenance.get("repository")
     source = inventory.get("source")
     if not isinstance(repository, Mapping) or not isinstance(source, Mapping):

@@ -33,6 +33,12 @@ attempt creation, approval consumption, and cost reservation now share one immed
 so a pre-reservation crash or failed gate cannot strand partial approval state. The CLI also reports
 known pre-Modal failures as `false` and reserves `unknown` for durable submission-boundary ambiguity.
 
+Merged-main preparation then exposed a stale derived provenance digest in the ignored config. The
+refresh path now reproduces provenance, inventory, runtime, and evaluation authority, but permits
+only derived provenance/inventory hashes and current commit/control-plane identity to advance. It
+rejects any change to the approved source revision, tensor total, evaluation lock, configured
+context, or installed-runtime receipt.
+
 Date: 2026-08-26
 
 Scope: signed-CDN amendment implementation against merged parent `a96d5949f2826438b0f219b1dd8633c8bd42f8c1`
