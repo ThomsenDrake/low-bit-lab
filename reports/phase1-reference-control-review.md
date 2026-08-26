@@ -109,3 +109,26 @@ python -m pytest tests/test_reference_modal_adapter.py tests/test_modal_job.py -
 python -m pytest -q
 python -m ruff check .
 ```
+
+## 2026-08-26 runtime-receipt stabilization review
+
+The merged-main U8 preparer exposed probe-created bytecode drift and a raw-versus-canonical receipt
+digest mismatch. The repair preserves the approved complete-tree receipt: 909 post-receipt files
+were mechanically proven to be `.pyc` files below `__pycache__` and moved to ignored quarantine;
+nothing was deleted or overwritten.
+
+- Reproducibility: all native and WSL inventory/framework probe command forms now share explicit
+  `-I -B -c` flags. Semantic receipt verification and exact persisted-byte hashing use one snapshot.
+- Modal safety: the repair performs no provider import, reservation, contact, body transfer, or
+  weight transfer. Existing one-shot and USD limits are unchanged.
+- Local RTX 5080: the locked Python, distributions, CUDA build, driver observation, device
+  capability, and GPU memory remain unchanged and the original tree receipt reproduces.
+- Security/privacy: quarantine stays ignored; no paths, cache contents, target details, or local
+  hardware evidence enter tracked artifacts.
+- Research loop: merged-main preparation can now bind the exact approved runtime receipt without
+  converting generated cache drift into a new experiment identity.
+
+Independent review found and fixed three issues: environment-only bytecode suppression was ignored
+under isolated Python, receipt parsing and hashing initially used two snapshots, and the downstream
+preview gate compared a canonical digest with an exact-byte digest. Focused tests cover the native
+and WSL command shapes and noncanonical-but-valid persisted receipt bytes.

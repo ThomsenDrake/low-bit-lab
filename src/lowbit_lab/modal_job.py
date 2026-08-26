@@ -76,6 +76,7 @@ from lowbit_lab.reference_gates import (
     verify_provider_observation_trust_override,
 )
 from lowbit_lab.runtime import (
+    RuntimeLock,
     hardware_metadata,
     load_runtime_lock,
     runtime_metadata,
@@ -929,6 +930,15 @@ def plan_reference_bootstrap_preview(
     }
 
 
+def _verify_runtime_receipt_bytes(
+    path: Path, *, root: Path, runtime_lock: RuntimeLock, expected_sha256: str
+) -> bool:
+    receipt_bytes = path.read_bytes()
+    receipt = json.loads(receipt_bytes.decode("utf-8"))
+    verify_current_installed_environment(receipt, root=root, lock=runtime_lock)
+    return hashlib.sha256(receipt_bytes).hexdigest() == expected_sha256
+
+
 def _verify_reference_authorities(config: ReferenceJobConfig, *, root: Path) -> bool:
     if any(value is None for value in config.authority_files.values()):
         return False
@@ -980,9 +990,12 @@ def _verify_reference_authorities(config: ReferenceJobConfig, *, root: Path) -> 
             or inventory.source_revision != config.inputs["source_revision"]
         ):
             return False
-        receipt = json.loads(paths["runtime_receipt_path"].read_text(encoding="utf-8"))
-        verified = verify_current_installed_environment(receipt, root=root, lock=runtime_lock)
-        return verified["receipt_sha256"] == config.inputs["runtime_receipt_sha256"]
+        return _verify_runtime_receipt_bytes(
+            paths["runtime_receipt_path"],
+            root=root,
+            runtime_lock=runtime_lock,
+            expected_sha256=str(config.inputs["runtime_receipt_sha256"]),
+        )
     except (KeyError, OSError, TypeError, ValueError, StopIteration):
         return False
 

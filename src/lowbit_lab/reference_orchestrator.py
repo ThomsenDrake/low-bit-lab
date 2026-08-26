@@ -96,14 +96,19 @@ def _sha(content: bytes) -> str:
     return hashlib.sha256(content).hexdigest()
 
 
-def _read_json(path: Path, label: str) -> Mapping[str, object]:
+def _read_json_bytes(path: Path, label: str) -> tuple[Mapping[str, object], bytes]:
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
+        content = path.read_bytes()
+        value = json.loads(content.decode("utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise ReferenceOrchestratorError(f"{label} is unavailable") from exc
     if not isinstance(value, Mapping):
         raise ReferenceOrchestratorError(f"{label} schema drift")
-    return value
+    return value, content
+
+
+def _read_json(path: Path, label: str) -> Mapping[str, object]:
+    return _read_json_bytes(path, label)[0]
 
 
 def _write_atomic(path: Path, content: bytes) -> None:
@@ -137,14 +142,14 @@ def _validate_frozen_inputs(
     frozen: Mapping[str, object],
     inventory: object,
     evaluation: object,
-    runtime: Mapping[str, object],
+    runtime_receipt_sha256: str,
 ) -> None:
     if (
         inventory.source_revision != frozen["source_revision"]
         or inventory.index_tensor_bytes != frozen["weight_inventory_tensor_bytes"]
         or evaluation.sha256 != frozen["evaluation_lock_sha256"]
         or evaluation.context.configured_tokens != frozen["evaluation_max_context_tokens"]
-        or runtime["receipt_sha256"] != frozen["runtime_receipt_sha256"]
+        or runtime_receipt_sha256 != frozen["runtime_receipt_sha256"]
     ):
         raise ReferenceOrchestratorError("frozen source, evaluation, or runtime identity drift")
 
@@ -216,11 +221,9 @@ def refresh_local_config(root: Path) -> ReferenceJobConfig:
         },
     )
     receipt_path = root / str(current.authority_files["runtime_receipt_path"])
-    receipt = _read_json(receipt_path, "runtime receipt")
-    verified_runtime = verify_current_installed_environment(
-        receipt, root=root, lock=runtime_lock
-    )
-    _validate_frozen_inputs(current.inputs, inventory, evaluation, verified_runtime)
+    receipt, receipt_bytes = _read_json_bytes(receipt_path, "runtime receipt")
+    verify_current_installed_environment(receipt, root=root, lock=runtime_lock)
+    _validate_frozen_inputs(current.inputs, inventory, evaluation, _sha(receipt_bytes))
     commit = str(runtime["git_commit"])
     raw["experiment_id"] = f"phase1-u8-{commit[:12]}"
     raw["inputs"]["reviewed_commit_sha256"] = commit
