@@ -107,6 +107,7 @@ def test_receipt_reproduces_from_settled_itemized_evidence(capability) -> None:
         "receipt_sha256": digest,
         "remote_contact_performed": False,
         "image_identity_available_before_spawn": True,
+        "sdk_version": "1.5.3",
         "billing_attribution_granularity": "dedicated_app_environment_hour_resource",
         "billing_completeness_delay_seconds": 3600,
     }

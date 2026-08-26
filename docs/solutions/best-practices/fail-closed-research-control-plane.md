@@ -237,6 +237,11 @@ dependent-evidence binding. A canonical semantic digest cannot substitute for a 
 when the approved lineage names the exact stored artifact, and a second file read creates a
 time-of-check/time-of-use gap.
 
+Closed validator summaries must expose every downstream lineage field the consumer is allowed to
+use. If a validator reproduces a complete receipt but omits an approved field from its result,
+extend the narrow validated projection; do not make the consumer reread the receipt, call the SDK
+again, or assume the validator returned the original nested schema.
+
 ## Why This Matters
 
 These invariants make silent policy drift, config mutation, preflight failure loss, and concurrent overspend observable or impossible. They also let later agents resume from durable state without inheriting hidden judgment from an earlier session.
