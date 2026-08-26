@@ -35,6 +35,17 @@ _FIELDS = {
     "request_sha256",
     "schema_version",
 }
+_FAILURE_CODES = frozenset(
+    {
+        "network_failure",
+        "peer_address_drift",
+        "redirect_drift",
+        "resolution_failed",
+        "unsafe_address",
+        "unsafe_url",
+        "unexpected_http_status",
+    }
+)
 
 
 class ReferenceTransportError(RuntimeError):
@@ -71,7 +82,7 @@ class HeadOnlyFetcher:
         finally:
             connection.close()
         if failed or result is None:
-            raise ReferenceTransportError("topology observation failed")
+            raise ReferenceTransportError("network_failure")
         return result
 
 
@@ -83,18 +94,21 @@ def observe_topology(
     """Perform one direct HEAD-only observation and persist no URL or query material."""
     if any(os.environ.get(name) for name in PROXY_KEYS):
         raise ReferenceTransportError("ambient proxy prevents topology observation")
+    request_invalid = False
     try:
         request_bytes = request_path.read_bytes()
         request = validate_bootstrap_request_bytes(request_bytes)
         raw = json.loads(request.canonical_json)
         origins = tuple(str(item["url"]) for item in raw["source_artifacts"])
         approved = frozenset(raw["approved_https_hosts"])
-    except Exception as exc:
-        raise ReferenceTransportError("bootstrap request is invalid") from exc
+    except Exception:
+        request_invalid = True
+    if request_invalid:
+        raise ReferenceTransportError("bootstrap request is invalid")
     fetcher = HeadOnlyFetcher()
     resolver = PublicResolver()
-    observation_failed = False
-    for origin in origins:
+    for ordinal, origin in enumerate(origins):
+        failure: tuple[int, str] | None = None
         try:
             open_validated_url(
                 origin,
@@ -102,11 +116,15 @@ def observe_topology(
                 resolver=resolver,
                 fetcher=fetcher,
             )
-        except Exception:
-            observation_failed = True
-            break
-    if observation_failed:
-        raise ReferenceTransportError("topology observation failed")
+        except Exception as exc:
+            code = str(exc)
+            if code not in _FAILURE_CODES:
+                code = "unknown_failure"
+            failure = (ordinal, code)
+        if failure is not None:
+            raise ReferenceTransportError(
+                f"topology observation failed at artifact {failure[0]}: {failure[1]}"
+            )
     if not fetcher.signed_query_redirect_observed:
         raise ReferenceTransportError("signed query redirect was not observed")
     evidence: dict[str, object] = {

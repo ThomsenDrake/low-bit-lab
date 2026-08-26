@@ -224,3 +224,14 @@ identity.
 Independent report-only review found no actionable projection, simplicity, platform, privacy, or
 budget issues. End-to-end timing review found and fixed the stale-topology window; focused tests now
 assert the final observation occurs after preflight and before database initialization.
+
+The first post-fix final topology refresh stopped before reservation but erased its own sanitized
+failure class. A follow-up keeps the observer fail-closed while exposing only a frozen transport code
+and numeric artifact ordinal. Raw connection exceptions, URLs, hosts, paths, signed queries, headers,
+addresses, and response data remain unavailable; unknown exception text collapses to
+`unknown_failure` with no exception chain.
+
+Independent privacy review caught that `raise ... from None` suppresses display but retains the raw
+exception in `__context__`. Both bootstrap and artifact-walk sanitizers now leave the handler before
+raising; tests require `__cause__` and `__context__` to be absent and scan formatted tracebacks for
+runtime-assembled query sentinels.

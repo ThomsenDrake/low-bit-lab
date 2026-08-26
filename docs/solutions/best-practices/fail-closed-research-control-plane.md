@@ -261,6 +261,11 @@ runtime-tree verification can expire before reservation or submission. Validate 
 as part of deterministic preflight, then repeat the bounded metadata-only observation immediately
 before the first mutable budget or provider boundary.
 
+Privacy-safe errors should be closed, not uniformly opaque. Map known failure classes to a frozen
+target-neutral code set, erase all unreviewed exception text and chains, and include only bounded
+structural position when it helps diagnosis. This preserves enough signal to distinguish network,
+DNS, redirect, peer, URL-policy, and status failures without retaining sensitive request material.
+
 ## Why This Matters
 
 These invariants make silent policy drift, config mutation, preflight failure loss, and concurrent overspend observable or impossible. They also let later agents resume from durable state without inheriting hidden judgment from an earlier session.

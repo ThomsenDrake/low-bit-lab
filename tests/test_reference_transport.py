@@ -123,6 +123,7 @@ def test_head_failure_traceback_does_not_retain_signed_query(monkeypatch) -> Non
     )
     assert sentinel not in rendered
     assert raised.value.__cause__ is None
+    assert str(raised.value) == "network_failure"
 
 
 def test_observer_checks_every_artifact_without_persisting_urls(
@@ -162,3 +163,87 @@ def test_observer_checks_every_artifact_without_persisting_urls(
     assert evidence["artifacts_observed"] == 2
     persisted = output.read_text(encoding="utf-8")
     assert all(origin not in persisted for origin in origins)
+
+
+@pytest.mark.parametrize(
+    ("raised", "expected"),
+    [
+        (RuntimeError("unexpected_http_status"), "unexpected_http_status"),
+        (RuntimeError("private.example?sig=secret"), "unknown_failure"),
+    ],
+)
+def test_observer_exposes_only_closed_failure_codes(
+    tmp_path: Path, monkeypatch, raised: Exception, expected: str
+) -> None:
+    raw = {
+        "approved_https_hosts": ["artifacts.example"],
+        "source_artifacts": [{"url": "https://artifacts.example/one"}],
+    }
+    request_path = tmp_path / "request.json"
+    request_bytes = json.dumps(raw, sort_keys=True, separators=(",", ":")).encode()
+    request_path.write_bytes(request_bytes)
+    monkeypatch.setattr(
+        reference_transport,
+        "validate_bootstrap_request_bytes",
+        lambda value: SimpleNamespace(
+            canonical_json=value.decode(), source_artifacts=tuple(raw["source_artifacts"])
+        ),
+    )
+    for name in reference_transport.PROXY_KEYS:
+        monkeypatch.delenv(name, raising=False)
+
+    def fail(*_args: object, **_kwargs: object) -> None:
+        raise raised
+
+    monkeypatch.setattr(
+        reference_transport,
+        "open_validated_url",
+        fail,
+    )
+
+    with pytest.raises(
+        ReferenceTransportError,
+        match=rf"^topology observation failed at artifact 0: {expected}$",
+    ) as caught:
+        reference_transport.observe_topology(
+            request_path, output_path=tmp_path / "topology.json"
+        )
+
+    assert "private.example" not in str(caught.value)
+    assert "secret" not in str(caught.value)
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    rendered = "".join(
+        traceback.format_exception(type(caught.value), caught.value, caught.value.__traceback__)
+    )
+    assert "private.example" not in rendered
+    assert "secret" not in rendered
+
+
+def test_invalid_bootstrap_does_not_retain_validator_exception(
+    tmp_path: Path, monkeypatch
+) -> None:
+    sentinel = "signed" + "-bootstrap-query-secret"
+    request_path = tmp_path / "request.json"
+    request_path.write_bytes(b"request")
+
+    def reject_request(_value: bytes) -> None:
+        raise RuntimeError(sentinel)
+
+    monkeypatch.setattr(
+        reference_transport,
+        "validate_bootstrap_request_bytes",
+        reject_request,
+    )
+    for name in reference_transport.PROXY_KEYS:
+        monkeypatch.delenv(name, raising=False)
+
+    with pytest.raises(ReferenceTransportError, match="bootstrap request is invalid") as caught:
+        reference_transport.observe_topology(request_path)
+
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    rendered = "".join(
+        traceback.format_exception(type(caught.value), caught.value, caught.value.__traceback__)
+    )
+    assert sentinel not in rendered
