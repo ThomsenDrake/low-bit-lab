@@ -27,6 +27,25 @@ from lowbit_lab.db import ResultsDatabase, confine_results_db
 from lowbit_lab.evaluation_lock import validate_pending_evaluation_lock
 from lowbit_lab.jsonio import emit
 from lowbit_lab.provenance import parse_weight_inventory
+from lowbit_lab.provider_evidence import (
+    ProviderEvidenceError,
+    validate_provider_capability_receipt,
+)
+from lowbit_lab.publication import PublicationError, load_manifest, scan_publication
+from lowbit_lab.reference_authority import (
+    AUTHORITY_PATH,
+    BOOTSTRAP_AUTHORITY_PATH,
+    ReferenceAuthorityError,
+    validate_reference_authority,
+    validate_reference_bootstrap_authority,
+)
+from lowbit_lab.reference_bootstrap import (
+    EMPIRICAL_FACTS,
+    ReferenceBootstrapError,
+    validate_bootstrap_request_bytes,
+    validate_image_lock_bytes,
+    validate_request_image_lock,
+)
 from lowbit_lab.reference_contract import (
     APPROVED_PROVIDER_AMENDMENT_PATH,
     APPROVED_PROVIDER_AMENDMENT_SHA256,
@@ -807,6 +826,105 @@ def plan_reference_preview(config: ReferenceJobConfig, *, root: Path) -> dict[st
         "config_sha256": config.sha256,
         "reference_execution_scope_sha256": config.reference_execution_scope_sha256,
         "provider_constraint_authority": provider_constraint_authority,
+        "blockers": blockers,
+    }
+
+
+def plan_reference_bootstrap_preview(
+    config: ReferenceJobConfig,
+    *,
+    root: Path,
+    request_path: Path,
+    request_sha256: str,
+    image_lock_path: Path,
+    image_lock_sha256: str,
+    provider_capability_path: Path,
+    provider_capability_sha256: str,
+    billing_authority_path: Path,
+    billing_receipt_path: Path,
+    billing_report_path: Path,
+    publication_manifest_path: Path,
+    authority_path: Path = AUTHORITY_PATH,
+    bootstrap_authority_path: Path = BOOTSTRAP_AUTHORITY_PATH,
+) -> dict[str, object]:
+    """Evaluate every deterministic gate while leaving empirical facts pending."""
+    root = root.resolve()
+    base = plan_reference_preview(config, root=root)
+    empirical_only = {
+        "cold_path_time_budget_unproven",
+        "execution_approval_missing",
+        "memory_fit_unproven",
+    }
+    blockers = [item for item in base["blockers"] if item not in empirical_only]
+    request = None
+    image_lock = None
+    try:
+        request_bytes = (root / request_path).read_bytes()
+        if hashlib.sha256(request_bytes).hexdigest() != request_sha256:
+            raise ReferenceBootstrapError("bootstrap request SHA-256 mismatch")
+        request = validate_bootstrap_request_bytes(request_bytes)
+    except (OSError, ReferenceBootstrapError):
+        blockers.append("bootstrap_request_unverified")
+    try:
+        image_bytes = (root / image_lock_path).read_bytes()
+        if hashlib.sha256(image_bytes).hexdigest() != image_lock_sha256:
+            raise ReferenceBootstrapError("image lock SHA-256 mismatch")
+        image_lock = validate_image_lock_bytes(image_bytes)
+        if request is not None:
+            validate_request_image_lock(request, image_lock)
+    except (OSError, ReferenceBootstrapError):
+        blockers.append("image_lock_unverified")
+    try:
+        validate_reference_authority(root, authority_path)
+        validate_reference_bootstrap_authority(root, bootstrap_authority_path)
+    except ReferenceAuthorityError:
+        blockers.append("bootstrap_authority_unverified")
+    if not _verify_reference_authorities(config, root=root):
+        blockers.append("authority_artifacts_unverified")
+    if request is not None and image_lock is not None:
+        raw_request = json.loads(request.canonical_json)
+        capability = raw_request["provider_capability"]
+        try:
+            validate_provider_capability_receipt(
+                root / provider_capability_path,
+                expected_sha256=provider_capability_sha256,
+                image_recipe_sha256=image_lock.recipe_sha256,
+                billing_authority_path=root / billing_authority_path,
+                billing_receipt_path=root / billing_receipt_path,
+                billing_report_path=root / billing_report_path,
+            )
+            if capability["receipt_sha256"] != provider_capability_sha256:
+                raise ProviderEvidenceError("provider capability request binding drift")
+        except ProviderEvidenceError:
+            blockers.append("provider_capability_unverified")
+    else:
+        blockers.append("provider_capability_unverified")
+    try:
+        manifest = load_manifest(root, publication_manifest_path)
+        publication = scan_publication(
+            root,
+            public_remote=manifest.public_remote,
+            protected_values=manifest.private_values,
+        )
+        if not publication["ok"]:
+            blockers.append("publication_scan_failed")
+    except PublicationError:
+        blockers.append("publication_scan_failed")
+    blockers = sorted(set(blockers))
+    return {
+        "schema_version": 1,
+        "kind": "modal_reference_bootstrap_preview",
+        "submit": False,
+        "actual_cost_usd": "0",
+        "weights_transferred": False,
+        "bootstrap_ready": not blockers,
+        "deterministic_state": "bootstrap_ready" if not blockers else "stopped",
+        "empirical": {fact: "pending" for fact in EMPIRICAL_FACTS},
+        "configured_context_tokens": 262144,
+        "proven_useful_context_tokens": None,
+        "request_sha256": request.sha256 if request is not None else None,
+        "image_lock_sha256": image_lock.sha256 if image_lock is not None else None,
+        "provider_capability_sha256": provider_capability_sha256,
         "blockers": blockers,
     }
 

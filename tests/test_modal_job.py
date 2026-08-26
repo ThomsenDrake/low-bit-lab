@@ -5,6 +5,7 @@ import sqlite3
 import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import yaml
@@ -14,6 +15,7 @@ from lowbit_lab.modal_job import (
     ReferenceJobError,
     load_reference_job_config,
     main,
+    plan_reference_bootstrap_preview,
     plan_reference_dry_run,
     plan_reference_preview,
     redact_provider_output,
@@ -672,6 +674,93 @@ def test_reference_preview_clears_each_provider_blocker_with_bound_approval(
     assert "provider_billing_scope_unproven" not in blockers
 
 
+def test_bootstrap_preview_filters_only_empirical_precontact_blockers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_reference_job_config(_config(tmp_path), root=tmp_path)
+    request_bytes = b"request"
+    image_bytes = b"image"
+    (tmp_path / "request.json").write_bytes(request_bytes)
+    (tmp_path / "image.json").write_bytes(image_bytes)
+    request = SimpleNamespace(
+        canonical_json=json.dumps(
+            {"provider_capability": {"receipt_sha256": "c" * 64}},
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        sha256="a" * 64,
+    )
+    image = SimpleNamespace(sha256="b" * 64, recipe_sha256="d" * 64)
+    base = {
+        "blockers": [
+            "memory_fit_unproven",
+            "cold_path_time_budget_unproven",
+            "execution_approval_missing",
+        ]
+    }
+    monkeypatch.setattr("lowbit_lab.modal_job.plan_reference_preview", lambda *_a, **_k: base)
+    monkeypatch.setattr(
+        "lowbit_lab.modal_job.validate_bootstrap_request_bytes", lambda _value: request
+    )
+    monkeypatch.setattr("lowbit_lab.modal_job.validate_image_lock_bytes", lambda _value: image)
+    monkeypatch.setattr("lowbit_lab.modal_job.validate_request_image_lock", lambda *_a: None)
+    monkeypatch.setattr("lowbit_lab.modal_job.validate_reference_authority", lambda *_a: "x")
+    monkeypatch.setattr(
+        "lowbit_lab.modal_job.validate_reference_bootstrap_authority", lambda *_a: "y"
+    )
+    monkeypatch.setattr(
+        "lowbit_lab.modal_job._verify_reference_authorities",
+        lambda *_a, **_k: True,
+    )
+    monkeypatch.setattr(
+        "lowbit_lab.modal_job.validate_provider_capability_receipt", lambda *_a, **_k: {}
+    )
+    monkeypatch.setattr(
+        "lowbit_lab.modal_job.load_manifest",
+        lambda *_a: SimpleNamespace(public_remote="public", private_values=()),
+    )
+    monkeypatch.setattr(
+        "lowbit_lab.modal_job.scan_publication",
+        lambda *_a, **_k: {"ok": True},
+    )
+    result = plan_reference_bootstrap_preview(
+        config,
+        root=tmp_path,
+        request_path=Path("request.json"),
+        request_sha256=hashlib.sha256(request_bytes).hexdigest(),
+        image_lock_path=Path("image.json"),
+        image_lock_sha256=hashlib.sha256(image_bytes).hexdigest(),
+        provider_capability_path=Path("capability.json"),
+        provider_capability_sha256="c" * 64,
+        billing_authority_path=Path("billing-authority.json"),
+        billing_receipt_path=Path("billing-receipt.json"),
+        billing_report_path=Path("billing-report.json"),
+        publication_manifest_path=Path("publication.yaml"),
+    )
+    assert result["bootstrap_ready"] is True
+    assert result["blockers"] == []
+    assert result["configured_context_tokens"] == 262144
+    assert result["proven_useful_context_tokens"] is None
+
+    base["blockers"] = ["review_tree_dirty", "memory_fit_unproven"]
+    stopped = plan_reference_bootstrap_preview(
+        config,
+        root=tmp_path,
+        request_path=Path("request.json"),
+        request_sha256=hashlib.sha256(request_bytes).hexdigest(),
+        image_lock_path=Path("image.json"),
+        image_lock_sha256=hashlib.sha256(image_bytes).hexdigest(),
+        provider_capability_path=Path("capability.json"),
+        provider_capability_sha256="c" * 64,
+        billing_authority_path=Path("billing-authority.json"),
+        billing_receipt_path=Path("billing-receipt.json"),
+        billing_report_path=Path("billing-report.json"),
+        publication_manifest_path=Path("publication.yaml"),
+    )
+    assert stopped["bootstrap_ready"] is False
+    assert stopped["blockers"] == ["review_tree_dirty"]
+
+
 def test_provider_output_is_bounded_and_redacted() -> None:
     output = redact_provider_output(
         "modal_token_id="
@@ -871,7 +960,11 @@ def test_u8_submission_primitives_are_absent() -> None:
     )
     for path in production_paths:
         violations = _submission_violations(path.read_text(encoding="utf-8"))
-        if path.as_posix() == "src/lowbit_lab/modal_adapter.py":
+        if path.as_posix() == "src/lowbit_lab/provider_evidence.py":
+            assert violations == ["dynamic modal import"], path
+            assert "modal.App(" not in path.read_text(encoding="utf-8")
+            assert ".spawn(" not in path.read_text(encoding="utf-8")
+        elif path.as_posix() == "src/lowbit_lab/modal_adapter.py":
             assert sorted(violations) == ["App", "modal", "spawn"], path
             source = path.read_text(encoding="utf-8")
             assert source.count("modal.App(") == 1
@@ -899,6 +992,25 @@ def test_u8_submission_primitives_are_absent() -> None:
                         node.value.id,
                         node.attr,
                     )
+        elif path.as_posix() == "src/lowbit_lab/reference_modal_adapter.py":
+            assert sorted(violations) == [
+                "App",
+                "modal",
+                "modal._serialization",
+                "modal._vendor",
+                "modal._vendor",
+                "spawn",
+            ], path
+            source = path.read_text(encoding="utf-8")
+            assert source.count("modal.App(") == 1
+            assert source.count("remote.spawn(") == 1
+            assert source.count("app.run(") == 1
+            assert source.count("image.build(") == 1
+            assert "include_source=False" in source
+            assert "retries=0" in source
+            assert "gpu=\"A100-80GB:1\"" in source
+            for forbidden in (".deploy(", "modal.Secret", "modal.Volume", "mounts=", "schedule="):
+                assert forbidden not in source, forbidden
         else:
             assert violations == [], path
 

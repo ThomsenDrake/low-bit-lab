@@ -24,3 +24,13 @@ REFERENCE_AUTHORITY_SHA256 = "8be94c8db6adae0de538ca41f43e7d250b9d4b5af4ffa6cd14
 REFERENCE_INCREMENTAL_CAP_USD = Decimal("4.00")
 REFERENCE_SETTLED_SMOKE_USD = Decimal("0.00270969")
 REFERENCE_CUMULATIVE_CAP_USD = Decimal("4.00270969")
+
+# Independently frozen bootstrap-evidence amendment. It narrows only when four
+# provider-derived facts may be observed; it does not add an action or budget.
+REFERENCE_BOOTSTRAP_STATEMENT_SHA256 = (
+    "4bba426073b4372079a800b9dcee7db38f509664be9d4fa97c904047e394ad90"
+)
+REFERENCE_BOOTSTRAP_AUTHORITY_SHA256 = (
+    "942c6d41c1c38452b5f2fb60250e50b92430bd552b39a33ab1749b1b8fcb8f23"
+)
+REFERENCE_BOOTSTRAP_MERGE_COMMIT = "af05202502a8982a340c238447874e999cdff2e4"

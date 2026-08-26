@@ -2,23 +2,42 @@
 
 Date: 2026-08-25
 
-Scope: autonomous authority, cumulative budget, conservative evidence generation, and local Modal reference preview through U12. The paid U8 adapter and execution were not reached because the evidence gates remain unproven.
+Scope: bootstrap authority and the staged U8 reference control plane through U21. U8 was not
+submitted because the immutable public source transport fails the approved redirect policy.
 
 ## Review outcomes
 
-- Reproducibility and lineage: fixed raw authority-byte drift, duplicate JSON keys, stale direct-database authority acceptance, unbound architecture metadata, and semantic-only evidence reproduction. Method and evidence artifacts now reproduce from exact hashed inputs.
-- Modal-credit safety and containment: fixed the one-shot boundary so `reserved -> submission_pending` and slot consumption occur atomically. Expired provider-contact state becomes `audit_blocked`; schema migration backfills historical contact and fails closed on ambiguity. The ledger preserves settled smoke cost USD 0.00270969 and permits at most one USD 4.00 reference reservation.
-- Local RTX compatibility: no local full-weight claim was added. Local preview remains model-free and reports hardware metadata only. The A100 reference envelope uses one GPU, a 2,700-second timeout, zero retries, and 512 GiB ephemeral disk.
-- Security and private data: authority read errors are sanitized, paths are repository-confined, publication scanning remains clean, and target-specific evidence stays ignored-local.
-- Research loop support: configured 262,144-token context remains distinct from proven usefulness. Hybrid memory accounting includes full-attention KV plus linear-attention recurrent and convolution state, but lacks authorized runtime-overhead, allocator-reserve, and usable-memory bounds. Cold-path stage bounds and a resolved image identity are also absent, so U8 remains unreachable.
+- Reproducibility and lineage: the adapter now rejects caller-selected database paths, provider
+  environments, execution identities, evaluation locks, request bytes, and image-lock bytes. It
+  derives them from freshly reproduced config, provider-capability, and repository evidence.
+- Modal-credit safety and containment: one slot is consumed before provider import; one spawn is
+  statically enforced; provider image/app identity precedes spawn; call identity follows it; all
+  post-boundary ambiguity retains the reservation. Audit-block persistence failure is no longer
+  swallowed. The cumulative cap remains USD 4.00270969, including settled smoke cost USD
+  0.00270969 and at most USD 4.00 incremental U8 authority.
+- Local RTX 5080 compatibility: local control-plane tests pass in the isolated environment, but no
+  local full-weight fit or kernel claim is made. The provider envelope remains one A100-80GB, one
+  container, 2,700 seconds maximum, zero configured/application retries, and no fallback.
+- Security and private data: source inclusion, secrets, mounts, volumes, schedules, user payloads,
+  and local weight transfer are structurally absent. The serialized function bytes are hash-bound,
+  and serialization policy is cleared on all exits. Target-specific artifacts remain ignored-local.
+- Research loop support: the six locked evaluation families and full context ladder feed one staged
+  receipt. The local validator binds receipt-to-manifest bytes and persists sanitized evidence
+  before settlement pending. Configured context is 262,144 tokens; proven-useful context remains
+  unset until a successful empirical run.
 
 ## Verification
 
-- Full tests: 410 passed, 2 skipped.
+- Full tests: 509 passed, 2 skipped.
 - Ruff: passed.
-- Publication/privacy scan: 321 tracked sources, no findings.
-- Local Modal dry run: completed with actual cost USD 0 and no weight transfer; submission remained false.
+- Focused paid-boundary tests: 118 passed.
+- Modal SDK inspection and fake-provider flow: passed without provider contact.
+- U8 actual spend: USD 0. Total settled lab Modal spend remains USD 0.00270969.
 
 ## Terminal blocker
 
-The known batch-one 262,144-token memory floor is 75,163,362,784 bytes before runtime overhead and allocator reserve. No independently authorized finite receipts exist for the remaining memory or cold-path terms, and no resolved provider image identity exists. The control plane therefore emits `proven: false` and stops before provider import, reservation consumption, or U8 execution.
+A metadata-only HEAD request read zero body bytes and observed an approved query-free immutable
+source URL redirecting to a public CDN URL with a query string. The U19 policy rejects query and
+fragment components at every redirect boundary. U8 therefore stops before reservation consumption,
+provider import, or weight transfer. Proceed only with a compliant immutable query-free origin or a
+later human-approved transport amendment; do not weaken the policy locally.

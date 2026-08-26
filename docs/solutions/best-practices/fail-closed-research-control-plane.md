@@ -145,6 +145,41 @@ historical digest does not prove the plan is still present. For prelaunch provid
 stopped app identity and zero task/container evidence separately; do not relabel an app ID as a
 function-call ID merely to satisfy settlement plumbing.
 
+A serialized-by-value provider function is part of the paid contract, not a packaging shortcut.
+Hash the exact bytes used by provider hydration, keep source inclusion disabled, and clear any
+process-global serialization policy on every success and failure exit. Derive execution identity,
+provider environment, database location, evaluation lock, and fixture bindings from freshly
+reproduced authority artifacts; a closed caller object is still caller input and cannot become a
+second lineage authority.
+
+Persist sanitized remote evidence before advancing to settlement pending. The local validator must
+bind the returned manifest's exact length and digest to the validated stage receipt, write the
+manifest and receipt without overwriting prior evidence, and return their durable identities. If
+evidence persistence or the audit-block transition fails, surface that failure explicitly while the
+one-shot reservation remains consumed. Never discard the only evidence and preserve only its hash.
+
+An absolute paid-action deadline must cross provider lifecycle boundaries. Provider function
+timeouts may exclude scheduling and cannot retroactively account for image preparation. Carry the
+submission timestamp into the remote contract, bound the local result wait to remaining time, and
+arm watchdogs around both the complete local provider section (including image preparation) and the
+in-function execution. If the local host cannot enforce the watchdog primitive, reject the paid
+action before consuming one-shot authority; for this lab the paid adapter therefore runs from
+WSL/Linux, not native Windows. Use an uncaught deadline-abort type so generic stage failure handling
+cannot turn expiry into an ordinary receipt. Treat uninterruptible native work and provider-managed
+rescheduling as residual risk rather than proof that the deadline is a provider-enforced cost cap.
+
+Audit-blocked provider contact still needs a closed path to authoritative settlement. Bind billing
+evidence to the durable provider/app identity and billing authority, require monotonic timestamps,
+and require coverage through the latest durable provider boundary plus the full maximum action
+window before starting the billing-completeness delay. This prevents an ambiguous still-running job
+from being settled early while preserving one-shot consumption.
+
+Immutable public hosting can conflict with a strict redirect policy. A query-free origin URL may
+redirect to a signed CDN URL with a query string even for anonymous public files. A metadata-only
+HEAD result proves the transport shape, not file integrity or permission to transfer bytes. When
+the approved policy rejects queries at every redirect boundary, stop before provider submission;
+do not special-case the host or silently weaken the rule inside the one-shot execution.
+
 ## Why This Matters
 
 These invariants make silent policy drift, config mutation, preflight failure loss, and concurrent overspend observable or impossible. They also let later agents resume from durable state without inheriting hidden judgment from an earlier session.
@@ -171,6 +206,8 @@ These invariants make silent policy drift, config mutation, preflight failure lo
   and the exact local cap before the audited adapter can be imported.
 - `src/lowbit_lab/modal_adapter.py` persists provider-call identity immediately after spawn and
   accepts no model input or remote payload.
+- `src/lowbit_lab/reference_modal_adapter.py` derives the one-shot provider contract from fresh
+  local evidence, persists sanitized receipt/manifest bytes, and audit-blocks ambiguity.
 
 ## Related
 

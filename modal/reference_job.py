@@ -1,4 +1,4 @@
-"""Declarative Modal reference specification; deliberately has no submit entrypoint."""
+"""Declarative, audited resource envelope for the sole reference adapter."""
 
 from __future__ import annotations
 
@@ -20,8 +20,11 @@ REFERENCE_FUNCTION_SPEC: dict[str, Any] = {
     "mounts": [],
     "volumes": [],
     "secrets": [],
+    "include_source": False,
+    "serialized_function": True,
+    "single_use_containers": True,
     "cloud_upload": False,
-    "submission_supported": False,
+    "submission_supported": True,
 }
 
 
