@@ -45,6 +45,31 @@ request-bound count and booleans such as zero body bytes and signed-redirect obs
 URLs, redirect headers, or query material. A local HEAD result is a freshness guard, not proof of a
 remote worker's regional GET route.
 
+Do not let a new orchestration CLI become a second lineage authority. A request producer may
+assemble a closed artifact list for operator ergonomics, but the paid consumer must independently
+reproduce those exact bytes from the hash-verified inventory and provenance chain immediately
+before consuming authority. Schema-valid URLs, sizes, and digests are still caller claims until
+that producer/consumer equality check passes.
+
+Separate zero-spend preparation from execution in the command surface. Preparation may refresh
+ignored canonical evidence, but it must not initialize the paid database, reserve budget, construct
+a provider client, contact the provider, or perform a body transfer. An offline import may still be
+needed to reproduce an audited SDK fingerprint. Execution should require an exact fresh request digest,
+an interruptible local watchdog, and a fresh route observation before reservation. If an execute
+command fails after it could have crossed a provider boundary, report contact as unknown rather
+than emitting a comforting false value.
+
+Bind immutable origins to the provenance identity, not merely to a caller-produced URL. Recompute
+the manifest identity, match repository and revision against the validated weight inventory, and
+reconstruct the only accepted query-free origin path from those values. A request-level host list
+must not be able to broaden the frozen origin policy.
+
+Standing-authority approval derivation and reservation setup must share the reservation transaction.
+If challenge registration, approval attachment, or attempt creation commits separately, a crash can
+strand a valid one-shot action without spending or contacting the provider. Insert those records in
+the same immediate transaction that either consumes the approval into a reservation or rolls every
+setup record back.
+
 Scan Git path names as well as blob and commit content before publication, because a private
 identifier can leak through either surface. Persist only bounded, sanitized HTTP facts; raw
 server-controlled headers do not belong in durable evidence.

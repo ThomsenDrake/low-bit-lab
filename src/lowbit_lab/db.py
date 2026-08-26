@@ -2801,6 +2801,10 @@ class ResultsDatabase:
         standing_authority_sha256: str,
         bootstrap_authority_sha256: str,
         authority_root: Path,
+        standing_packet_sha256: str | None = None,
+        approval_expires_at: str | None = None,
+        attempt_config_path: str | None = None,
+        attempt_raw_config_sha256: str | None = None,
         authority_path: Path = AUTHORITY_PATH,
         bootstrap_authority_path: Path = BOOTSTRAP_AUTHORITY_PATH,
     ) -> None:
@@ -2839,6 +2843,26 @@ class ResultsDatabase:
             raise DatabaseError("reference bootstrap authority digest does not match its files")
         if not owner_id or not idempotency_key:
             raise DatabaseError("reference reservation requires owner and idempotency key")
+        standing_setup = (
+            standing_packet_sha256,
+            approval_expires_at,
+            attempt_config_path,
+            attempt_raw_config_sha256,
+        )
+        if any(value is not None for value in standing_setup) and not all(
+            value is not None for value in standing_setup
+        ):
+            raise DatabaseError("standing reference approval setup is incomplete")
+        if standing_packet_sha256 is not None:
+            _database_sha256(standing_packet_sha256, "standing_packet_sha256")
+            _database_sha256(attempt_raw_config_sha256, "attempt_raw_config_sha256")
+            if (
+                not isinstance(attempt_config_path, str)
+                or Path(attempt_config_path).is_absolute()
+                or ".." in Path(attempt_config_path).parts
+                or not Path(attempt_config_path).as_posix().startswith("configs/local/")
+            ):
+                raise DatabaseError("standing reference attempt path is invalid")
         _database_sha256(challenge_sha256, "challenge_sha256")
         _database_sha256(approval_digest, "approval_digest")
         expected_challenge, parsed_config = _reference_challenge(config_json, config_sha256)
@@ -2884,6 +2908,35 @@ class ResultsDatabase:
             raise DatabaseError("reference reservation lease must expire after it starts")
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            if standing_packet_sha256 is not None:
+                approval_expiry = _database_timestamp(
+                    approval_expires_at, "approval_expires_at"
+                )
+                if approval_expiry <= start_time or initial_lease_expiry > approval_expiry:
+                    raise DatabaseError("standing reference approval expiry is invalid")
+                connection.execute(
+                    """INSERT INTO reference_approval_challenges(
+                        challenge_sha256, packet_sha256, approval_digest, expires_at, created_at
+                    ) VALUES (?, ?, ?, ?, ?)""",
+                    (
+                        challenge_sha256,
+                        standing_packet_sha256,
+                        approval_digest,
+                        approval_expires_at,
+                        started_at,
+                    ),
+                )
+                connection.execute(
+                    """INSERT INTO attempts(
+                        attempt_id, config_path, raw_config_sha256, status, started_at
+                    ) VALUES (?, ?, ?, 'received', ?)""",
+                    (
+                        attempt_id,
+                        attempt_config_path,
+                        attempt_raw_config_sha256,
+                        started_at,
+                    ),
+                )
             approval = connection.execute(
                 """SELECT approval_digest, expires_at, consumed_at
                 FROM reference_approval_challenges WHERE challenge_sha256 = ?""",

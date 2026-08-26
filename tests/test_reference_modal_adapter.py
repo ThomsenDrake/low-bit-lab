@@ -426,7 +426,7 @@ def test_fake_modal_persists_image_then_call_identity_and_uses_one_spawn(
     monkeypatch.setattr(adapter, "ResultsDatabase", FakeDatabase)
     monkeypatch.setattr(
         adapter,
-        "_validate_fresh_deterministic_gates",
+        "validate_reference_preflight",
         lambda capability: adapter.FreshDeterministicEvidence(
             provider_environment="low-bit-lab",
             execution_identity={},
@@ -518,7 +518,7 @@ def test_fresh_preview_failure_prevents_the_database_boundary_and_modal_import(
     monkeypatch.setattr(adapter, "ResultsDatabase", FakeDatabase)
     monkeypatch.setattr(
         adapter,
-        "_validate_fresh_deterministic_gates",
+        "validate_reference_preflight",
         lambda capability: (_ for _ in ()).throw(ReferenceModalError("dirty tree")),
     )
     capability = adapter.ReferenceModalCapability(
@@ -569,7 +569,7 @@ def test_missing_reservation_is_recorded_as_a_failed_preflight(
     monkeypatch.setattr(adapter, "_local_deadline_signal", lambda: FakeDeadlineSignal())
     monkeypatch.setattr(
         adapter,
-        "_validate_fresh_deterministic_gates",
+        "validate_reference_preflight",
         lambda capability: adapter.FreshDeterministicEvidence(
             provider_environment="low-bit-lab",
             execution_identity={},
@@ -635,7 +635,7 @@ def test_watchdog_install_failure_after_boundary_is_audit_blocked(
     monkeypatch.setattr(adapter, "_local_deadline_signal", lambda: FailingSignal())
     monkeypatch.setattr(
         adapter,
-        "_validate_fresh_deterministic_gates",
+        "validate_reference_preflight",
         lambda capability: adapter.FreshDeterministicEvidence(
             provider_environment="low-bit-lab",
             execution_identity={},
@@ -705,7 +705,7 @@ def test_audit_block_persistence_failure_is_fatal(
     monkeypatch.setattr(adapter, "_local_deadline_signal", lambda: FakeDeadlineSignal())
     monkeypatch.setattr(
         adapter,
-        "_validate_fresh_deterministic_gates",
+        "validate_reference_preflight",
         lambda capability: adapter.FreshDeterministicEvidence(
             provider_environment="low-bit-lab",
             execution_identity={},

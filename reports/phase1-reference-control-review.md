@@ -1,5 +1,38 @@
 # Phase 1 Signed-CDN Transport Review
 
+## U8 orchestration addendum
+
+- **Reproducibility and lineage:** the ignored request is regenerated from the validated inventory,
+  provenance manifest, evaluation lock, runtime lock and receipt, image recipe, provider capability,
+  and current clean commit. The paid adapter independently reproduces the request and requires byte
+  equality before consuming U8. No target-specific value is added to tracked files.
+- **Modal-credit safety and containment:** `prepare` cannot initialize the results database,
+  construct a provider client, or contact Modal; it imports the pinned local SDK only to reproduce
+  its audited fingerprint. `execute` requires the exact fresh request digest, WSL/Linux watchdog support, a
+  fresh HEAD-only topology receipt, deterministic adapter preflight, and an atomic USD 4.00
+  reservation. The existing adapter remains the only U8 spawn path, with one GPU/container/spawn,
+  2,700 seconds, and zero retries. Ambiguous execute failures report provider contact as unknown.
+- **Local RTX compatibility:** orchestration makes no local inference or kernel-support claim. It
+  uses the repository-isolated WSL runtime only as a control environment and changes no driver, OS,
+  firmware, BIOS, or global setting.
+- **Security and private data:** request and topology evidence remain ignored. Origins are immutable
+  and query-free; signed redirect values remain transient. CLI output contains only hashes, context
+  state, and sanitized status. Publication scanning remains mandatory before merge.
+- **Research-loop support:** the command closes the missing transition from merged deterministic
+  evidence to the already-audited one-shot adapter. Configured context remains 262,144 tokens;
+  proven-useful context remains unknown until remote evaluation evidence succeeds.
+
+Clear finding fixed: the first producer validated source entries, but the paid consumer did not
+independently reconstruct them. The adapter now reproduces the complete request from local authority
+and rejects byte drift. No promotion threshold or public zero-spend default changed.
+
+Independent review found and fixed two additional high-confidence issues. Immutable origins are now
+reconstructed from a recomputed provenance-manifest identity whose repository and revision must
+match the validated weight inventory; request data cannot add a new origin host. Standing approval,
+attempt creation, approval consumption, and cost reservation now share one immediate transaction,
+so a pre-reservation crash or failed gate cannot strand partial approval state. The CLI also reports
+known pre-Modal failures as `false` and reserves `unknown` for durable submission-boundary ambiguity.
+
 Date: 2026-08-26
 
 Scope: signed-CDN amendment implementation against merged parent `a96d5949f2826438b0f219b1dd8633c8bd42f8c1`

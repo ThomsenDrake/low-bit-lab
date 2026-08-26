@@ -1,6 +1,7 @@
 # Reference approval runbook
 
-This runbook prepares a reviewable Phase 1 reference packet. It cannot submit a remote job.
+This runbook prepares a reviewable Phase 1 reference packet. Public defaults cannot submit a remote
+job; the final section describes the separately authorized, mechanically gated one-shot boundary.
 
 ## Safe preview
 
@@ -132,12 +133,28 @@ HTTPS, host, canonical path, DNS results, and connected peer at every hop; sends
 redirects is the hard maximum. Every artifact remains unusable until its declared byte length and
 SHA-256 match.
 
-Immediately before the paid boundary, regenerate the merged-main request and perform the local
-HEAD-only topology observation from WSL with ambient proxy variables unset:
+From a clean merged-main checkout, regenerate the ignored request without initializing the paid
+database, reserving budget, constructing a provider client, contacting a provider, or transferring
+artifact bodies. It does import the pinned local SDK to reproduce its audited source fingerprint:
 
 ```bash
-python -m lowbit_lab.reference_transport <ignored-bootstrap-request.json>
+uv run lowbit-reference-u8 --root . prepare
 ```
+
+The JSON output reports the request digest, execution-scope digest, configured context, and the
+still-null proven-useful context. The one paid command must run from the repository-isolated WSL
+environment and confirm that exact freshly regenerated request digest:
+
+```bash
+uv run --extra remote lowbit-reference-u8 --root . execute \
+  --confirm-request-sha256 <exact-prepare-request-sha256>
+```
+
+`execute` regenerates the request again, requires digest equality, performs the HEAD-only topology
+observation with ambient proxies absent, reproduces every deterministic gate, and only then creates
+the USD 4.00 local reservation. It is not a general execution command: the closed standing
+authority, one-shot slot, cumulative ledger, fixed resource envelope, and exact local lineage are
+all required. Any failure after potential provider contact reports the contact state as unknown.
 
 The resulting ignored evidence must be less than 15 minutes old, bind the exact request and
 transport authority hashes, record zero body bytes, and explicitly state that it does not prove the

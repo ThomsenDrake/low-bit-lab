@@ -124,12 +124,13 @@ class ValidatedRemoteResult:
     full_context_usefulness_proven: bool
 
 
-def _validate_fresh_deterministic_gates(
+def validate_reference_preflight(
     capability: ReferenceModalCapability,
 ) -> FreshDeterministicEvidence:
     """Recompute decision-bearing local evidence; no caller boolean is authority."""
     from lowbit_lab.modal_job import load_reference_job_config, plan_reference_bootstrap_preview
     from lowbit_lab.reference_authority import validate_reference_signed_cdn_authority
+    from lowbit_lab.reference_orchestrator import validate_reproduced_request
     from lowbit_lab.runtime import runtime_metadata
 
     root = capability.root.resolve()
@@ -154,6 +155,7 @@ def _validate_fresh_deterministic_gates(
             request_bytes=capability.bootstrap_request_bytes,
         )
         config = load_reference_job_config(root / capability.config_path, root=root)
+        validate_reproduced_request(root, config, capability.bootstrap_request_bytes)
         request = validate_bootstrap_request_bytes(capability.bootstrap_request_bytes)
         request_raw = json.loads(request.canonical_json)
         image = validate_image_lock(capability.image_lock)
@@ -569,7 +571,7 @@ def submit_reference(capability: ReferenceModalCapability) -> dict[str, object]:
     )
     # Validate every deterministic byte before consuming the sole action.
     try:
-        fresh = _validate_fresh_deterministic_gates(capability)
+        fresh = validate_reference_preflight(capability)
         deadline_signal = _local_deadline_signal()
         build_remote_contract(
             capability,
