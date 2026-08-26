@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -10,6 +11,8 @@ import pytest
 
 from lowbit_lab.runtime import (
     RuntimeContractError,
+    _tree_receipt,
+    _windows_extended_path_text,
     build_installed_environment_receipt,
     decide_baseline_runtime,
     hardware_metadata,
@@ -503,6 +506,52 @@ def test_installed_receipt_binds_executable_packages_cuda_and_lock(tmp_path: Pat
         )["verified"]
         is True
     )
+
+
+def test_windows_extended_path_text_handles_drive_unc_and_existing_prefix() -> None:
+    assert _windows_extended_path_text("C:\\runtime\\file") == "\\\\?\\C:\\runtime\\file"
+    assert _windows_extended_path_text("\\\\server\\share\\file") == (
+        "\\\\?\\UNC\\server\\share\\file"
+    )
+    assert _windows_extended_path_text("\\\\?\\C:\\runtime\\file") == (
+        "\\\\?\\C:\\runtime\\file"
+    )
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows extended-length path behavior")
+def test_tree_receipt_hashes_regular_file_beyond_legacy_windows_limit(tmp_path: Path) -> None:
+    package_root = tmp_path / "site-packages"
+    deep = package_root.joinpath(*(["nested-segment"] * 20))
+    long_file = Path(_windows_extended_path_text(str((deep / "LICENSE.txt").absolute())))
+    long_file.parent.mkdir(parents=True)
+    long_file.write_bytes(b"complete tree")
+    assert len(str((deep / "LICENSE.txt").absolute())) > 260
+
+    receipt = _tree_receipt(tmp_path, package_root)
+
+    assert receipt["file_count"] == 1
+    assert receipt["size_bytes"] == len(b"complete tree")
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows junction behavior")
+def test_tree_receipt_rejects_windows_junction_escape(tmp_path: Path) -> None:
+    package_root = tmp_path / "site-packages"
+    outside = tmp_path / "outside"
+    package_root.mkdir()
+    outside.mkdir()
+    (outside / "escaped.py").write_text("escaped = True\n", encoding="utf-8")
+    junction = package_root / "junction"
+    process = subprocess.run(
+        ["cmd.exe", "/d", "/c", "mklink", "/J", str(junction), str(outside)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if process.returncode != 0:
+        pytest.skip("junction creation is not available")
+
+    with pytest.raises(RuntimeContractError, match="reparse point|package tree path escape"):
+        _tree_receipt(tmp_path, package_root)
 
 
 def test_installed_receipt_rejects_a_forged_executable_digest(tmp_path: Path) -> None:
