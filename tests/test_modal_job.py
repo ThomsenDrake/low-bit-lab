@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import pytest
 import yaml
 
+import lowbit_lab.modal_job as modal_job
 from lowbit_lab import reference_gates
 from lowbit_lab.modal_job import (
     ReferenceJobError,
@@ -32,6 +33,35 @@ from lowbit_lab.reference_gates import A100_80GB_BYTES, MEMORY_FORMULA, TIME_FOR
 ORIGINAL_PLAN_PATH = "docs/plans/local/2026-08-21-2358-feat-full-weight-baseline-plan.md"
 AMENDMENT_PATH = "docs/plans/local/2026-08-22-1126-feat-provider-constraint-amendment-plan.md"
 TRUST_OVERRIDE_PLAN_PATH = "docs/plans/local/2026-08-23-provider-observation-trust-override-plan.md"
+
+
+def test_runtime_authority_binds_verified_exact_receipt_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    receipt_bytes = b'{\n  "schema_version": 1\n}\n'
+    receipt_path = tmp_path / "receipt.json"
+    receipt_path.write_bytes(receipt_bytes)
+    observed: list[object] = []
+    monkeypatch.setattr(
+        modal_job,
+        "verify_current_installed_environment",
+        lambda receipt, root, lock: observed.append(receipt) or {"verified": True},
+    )
+    expected = hashlib.sha256(receipt_bytes).hexdigest()
+
+    assert modal_job._verify_runtime_receipt_bytes(
+        receipt_path,
+        root=tmp_path,
+        runtime_lock=SimpleNamespace(),
+        expected_sha256=expected,
+    )
+    assert observed == [{"schema_version": 1}]
+    assert not modal_job._verify_runtime_receipt_bytes(
+        receipt_path,
+        root=tmp_path,
+        runtime_lock=SimpleNamespace(),
+        expected_sha256="0" * 64,
+    )
 
 
 def _budget(path: Path, plan_sha256: str) -> None:

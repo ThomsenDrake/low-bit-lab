@@ -140,14 +140,16 @@ def test_refresh_local_config_reproduces_stale_authority_hashes(
 ) -> None:
     config_path = tmp_path / orchestrator.CONFIG_PATH
     config_path.parent.mkdir(parents=True)
+    receipt_bytes = b'{"receipt":"exact bytes"}\n'
+    receipt_sha256 = orchestrator._sha(receipt_bytes)
     config_path.write_text(
-        """inputs:
+        f"""inputs:
   reviewed_commit_sha256: stale
   source_revision: "5555555555555555555555555555555555555555"
   weight_inventory_tensor_bytes: 55
   evaluation_lock_sha256: "4444444444444444444444444444444444444444444444444444444444444444"
   evaluation_max_context_tokens: 262144
-  runtime_receipt_sha256: "7777777777777777777777777777777777777777777777777777777777777777"
+  runtime_receipt_sha256: "{receipt_sha256}"
 """,
         encoding="utf-8",
     )
@@ -157,13 +159,15 @@ def test_refresh_local_config_reproduces_stale_authority_hashes(
     fixture_root = tmp_path / "eval/fixtures"
     fixture_root.mkdir(parents=True)
     (fixture_root / "fixture.json").write_bytes(b"fixture")
+    receipt_path = tmp_path / "artifacts/receipt.json"
+    receipt_path.write_bytes(receipt_bytes)
     current = SimpleNamespace(
         inputs={
             "source_revision": "5" * 40,
             "weight_inventory_tensor_bytes": 55,
             "evaluation_lock_sha256": "4" * 64,
             "evaluation_max_context_tokens": 262144,
-            "runtime_receipt_sha256": "7" * 64,
+            "runtime_receipt_sha256": receipt_sha256,
         },
         authority_files={
             "provenance_manifest_path": "artifacts/provenance.json",
@@ -229,7 +233,7 @@ def test_refresh_local_config_reproduces_stale_authority_hashes(
     monkeypatch.setattr(
         orchestrator,
         "verify_current_installed_environment",
-        lambda receipt, root, lock: {"receipt_sha256": "7" * 64},
+        lambda receipt, root, lock: {"verified": True},
     )
 
     orchestrator.refresh_local_config(tmp_path)
@@ -242,7 +246,7 @@ def test_refresh_local_config_reproduces_stale_authority_hashes(
         "weight_inventory_tensor_bytes": 55,
         "evaluation_lock_sha256": "4" * 64,
         "evaluation_max_context_tokens": 262144,
-        "runtime_receipt_sha256": "7" * 64,
+        "runtime_receipt_sha256": receipt_sha256,
         "control_plane_sha256": "2" * 64,
         "weight_inventory_sha256": "6" * 64,
         "provenance_manifest_sha256": provenance["manifest_sha256"],
@@ -267,7 +271,7 @@ def test_refresh_local_config_rejects_frozen_evaluation_drift(
     )
     with pytest.raises(orchestrator.ReferenceOrchestratorError, match="identity drift"):
         orchestrator._validate_frozen_inputs(
-            frozen, inventory, changed, {"receipt_sha256": "3" * 64}
+            frozen, inventory, changed, "3" * 64
         )
 
 

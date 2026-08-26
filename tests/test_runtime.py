@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -21,7 +22,11 @@ from lowbit_lab.runtime import (
 )
 from lowbit_lab.runtime_probe import (
     ENVIRONMENT_INVENTORY_SCRIPT,
+    PROBE_PYTHON_FLAGS,
     PROBE_SCRIPT,
+    WSL_PROBE_ENV,
+    _isolated_python_command,
+    _wsl_isolated_python_command,
     run_environment_inventory_probe,
     run_wsl_cuda_probe,
 )
@@ -285,6 +290,22 @@ def test_embedded_probe_script_compiles() -> None:
     compile(ENVIRONMENT_INVENTORY_SCRIPT, "<environment-inventory>", "exec")
 
 
+def test_probe_environments_disable_bytecode_writes_on_native_and_wsl() -> None:
+    assert PROBE_PYTHON_FLAGS == ("-I", "-B", "-c")
+    process = subprocess.run(
+        [sys.executable, *PROBE_PYTHON_FLAGS, "import sys; print(sys.dont_write_bytecode)"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert process.stdout.strip() == "True"
+    native = _isolated_python_command("python", "probe", "root")
+    wsl = _wsl_isolated_python_command("/repo/python", "probe", "/repo")
+    assert native == ["python", "-I", "-B", "-c", "probe", "root"]
+    assert wsl[6 : 6 + len(WSL_PROBE_ENV)] == list(WSL_PROBE_ENV)
+    assert wsl[-6:] == ["/repo/python", "-I", "-B", "-c", "probe", "/repo"]
+
+
 def test_environment_inventory_probe_uses_selected_isolated_python(tmp_path: Path) -> None:
     python = tmp_path / "artifacts/local/runtime/env/bin/python"
     python.parent.mkdir(parents=True)
@@ -294,8 +315,12 @@ def test_environment_inventory_probe_uses_selected_isolated_python(tmp_path: Pat
     def runner(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
         command = args[0]
         assert command[0] == str(python.resolve())
-        assert command[1:3] == ["-I", "-c"]
-        assert kwargs["env"] == {"PATH": "", "PYTHONNOUSERSITE": "1", "PYTHONHASHSEED": "0"}
+        assert command[1:4] == ["-I", "-B", "-c"]
+        assert kwargs["env"] == {
+            "PATH": "",
+            "PYTHONNOUSERSITE": "1",
+            "PYTHONHASHSEED": "0",
+        }
         return subprocess.CompletedProcess(command, 0, json.dumps(payload), "private stderr")
 
     assert (
@@ -309,6 +334,7 @@ def test_probe_success_is_framework_only_and_sanitized(tmp_path: Path) -> None:
     python.write_bytes(b"")
 
     def runner(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        assert args[0][1:4] == ["-I", "-B", "-c"]
         return subprocess.CompletedProcess(
             args[0], 0, json.dumps(_probe_payload()), "secret stderr"
         )

@@ -225,6 +225,18 @@ If authority is later amended, freeze the exact host/path boundary in both revie
 bind the amendment into the request and paid gate, and test full traceback output with a
 runtime-assembled query sentinel before enabling the one-shot execution.
 
+An evidence probe must not mutate the bytes it attests. CPython isolated mode implies `-E`, so a
+`PYTHONDONTWRITEBYTECODE` environment entry is ignored; use the explicit `-B` interpreter flag on
+every native and WSL probe command. If generated cache files already caused drift, quarantine only
+files mechanically proven to be post-receipt `.pyc` entries below `__pycache__`, retain them for
+recovery, and require the original complete tree receipt to reproduce twice.
+
+Keep semantic validation and persisted-byte lineage distinct but race-free. Read an authority
+artifact once, parse and semantically verify that snapshot, then hash the same bytes for config and
+dependent-evidence binding. A canonical semantic digest cannot substitute for a raw-byte digest
+when the approved lineage names the exact stored artifact, and a second file read creates a
+time-of-check/time-of-use gap.
+
 ## Why This Matters
 
 These invariants make silent policy drift, config mutation, preflight failure loss, and concurrent overspend observable or impossible. They also let later agents resume from durable state without inheriting hidden judgment from an earlier session.
@@ -244,6 +256,8 @@ These invariants make silent policy drift, config mutation, preflight failure lo
 - `src/lowbit_lab/controller.py` enforces the closed zero-spend action allowlist and immutable cycle fencing.
 - `src/lowbit_lab/handoff.py` emits a complete readiness packet without synthesizing paid authority.
 - `src/lowbit_lab/runtime.py` records dirty state plus a deterministic control-plane digest.
+- `src/lowbit_lab/runtime_probe.py` uses explicit isolated, no-bytecode probe commands so runtime
+  verification is observational with respect to the receipt tree.
 - `src/lowbit_lab/activation.py` binds decision artifacts and reruns all bounded gates.
 - `src/lowbit_lab/publication.py` scans Git paths and contents before public publication.
 - `src/lowbit_lab/reference_gates.py` verifies method-bound memory and timing evidence without enabling submission.

@@ -38,6 +38,36 @@ OBSERVED_CHECK_KEYS = {
     "deterministic_operation": {"state"},
     "synchronization": {"state"},
 }
+PROBE_ENVIRONMENT_VALUES = {
+    "PYTHONNOUSERSITE": "1",
+    "PYTHONHASHSEED": "0",
+}
+ISOLATED_PROBE_ENV = {"PATH": "", **PROBE_ENVIRONMENT_VALUES}
+WSL_PROBE_ENV = (
+    "PATH=/usr/bin:/bin",
+    *(f"{name}={value}" for name, value in PROBE_ENVIRONMENT_VALUES.items()),
+)
+PROBE_PYTHON_FLAGS = ("-I", "-B", "-c")
+
+
+def _isolated_python_command(executable: str, script: str, *arguments: str) -> list[str]:
+    return [executable, *PROBE_PYTHON_FLAGS, script, *arguments]
+
+
+def _wsl_isolated_python_command(executable: str, script: str, *arguments: str) -> list[str]:
+    return [
+        "wsl.exe",
+        "-d",
+        "Ubuntu",
+        "--",
+        "env",
+        "-i",
+        *WSL_PROBE_ENV,
+        executable,
+        *PROBE_PYTHON_FLAGS,
+        script,
+        *arguments,
+    ]
 ENVIRONMENT_INVENTORY_SCRIPT = r"""
 import importlib.metadata
 import hashlib
@@ -229,25 +259,11 @@ def run_wsl_cuda_probe(
     if runner is subprocess.run and getuid is not None and getuid() == 0:
         raise RuntimeContractError("runtime probe refuses root execution")
     started = time.monotonic()
-    command = [str(executable), "-I", "-c", PROBE_SCRIPT]
-    process_environment = {"PATH": "", "PYTHONNOUSERSITE": "1", "PYTHONHASHSEED": "0"}
+    command = _isolated_python_command(str(executable), PROBE_SCRIPT)
+    process_environment = ISOLATED_PROBE_ENV
     if os.name == "nt" and runner is subprocess.run:
         assert converted is not None
-        command = [
-            "wsl.exe",
-            "-d",
-            "Ubuntu",
-            "--",
-            "env",
-            "-i",
-            "PATH=/usr/bin:/bin",
-            "PYTHONNOUSERSITE=1",
-            "PYTHONHASHSEED=0",
-            converted,
-            "-I",
-            "-c",
-            PROBE_SCRIPT,
-        ]
+        command = _wsl_isolated_python_command(converted, PROBE_SCRIPT)
         process_environment = None
     try:
         process = runner(
@@ -451,34 +467,17 @@ def run_environment_inventory_probe(
             or "\n" in converted_root
         ):
             raise RuntimeContractError("inventory WSL path is invalid")
-        command = [
-            "wsl.exe",
-            "-d",
-            "Ubuntu",
-            "--",
-            "env",
-            "-i",
-            "PATH=/usr/bin:/bin",
-            "PYTHONNOUSERSITE=1",
-            "PYTHONHASHSEED=0",
-            converted,
-            "-I",
-            "-c",
-            ENVIRONMENT_INVENTORY_SCRIPT,
-            converted_root,
-        ]
+        command = _wsl_isolated_python_command(
+            converted, ENVIRONMENT_INVENTORY_SCRIPT, converted_root
+        )
         environment = None
     else:
         if not executable.is_file():
             raise RuntimeContractError("inventory Python is missing")
-        command = [
-            str(executable),
-            "-I",
-            "-c",
-            ENVIRONMENT_INVENTORY_SCRIPT,
-            str(resolved_root),
-        ]
-        environment = {"PATH": "", "PYTHONNOUSERSITE": "1", "PYTHONHASHSEED": "0"}
+        command = _isolated_python_command(
+            str(executable), ENVIRONMENT_INVENTORY_SCRIPT, str(resolved_root)
+        )
+        environment = ISOLATED_PROBE_ENV
     try:
         process = runner(
             command,
