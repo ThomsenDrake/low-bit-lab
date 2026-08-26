@@ -41,6 +41,120 @@ def test_evaluation_lock_transport_canonicalizes_persisted_json() -> None:
         adapter._canonical_evaluation_lock_bytes(b"not-json")
 
 
+def test_fresh_preflight_consumes_flat_validated_provider_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import lowbit_lab.modal_job as modal_job
+    import lowbit_lab.reference_authority as reference_authority
+    import lowbit_lab.reference_orchestrator as orchestrator
+    import lowbit_lab.runtime as runtime
+
+    request_path = Path("reports/local/request.json")
+    image_path = Path("configs/modal/image.json")
+    provider_path = Path("reports/local/provider.json")
+    evaluation_path = Path("eval/local/evaluation.json")
+    for path, content in (
+        (request_path, b"request"),
+        (image_path, b"{}"),
+        (provider_path, b"provider"),
+        (evaluation_path, b'{"fixtures":[]}\n'),
+    ):
+        target = tmp_path / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(content)
+
+    canonical_evaluation = b'{"fixtures":[]}'
+    resources = {"gpu_type": "A100-80GB"}
+    identity = {
+        "weight_inventory_sha256": "1" * 64,
+        "provenance_manifest_sha256": "2" * 64,
+        "runtime_receipt_sha256": "3" * 64,
+        "reviewed_commit_sha256": "4" * 40,
+        "resource_spec_sha256": adapter._sha(adapter._canonical_json(resources)),
+    }
+    request_raw = {
+        "lineage": {
+            "reviewed_commit": "4" * 40,
+            "control_plane_sha256": "6" * 64,
+            "evaluation_lock_sha256": adapter._sha(canonical_evaluation),
+        },
+        "provider_capability": {"receipt_sha256": "7" * 64},
+    }
+    request = SimpleNamespace(
+        canonical_json=json.dumps(request_raw),
+        sha256=adapter._sha(b"request"),
+        image_lock_sha256=adapter._sha(b"{}"),
+    )
+    config = SimpleNamespace(
+        sha256="8" * 64,
+        reference_execution_scope_sha256="9" * 64,
+        authority_files={"evaluation_lock_path": evaluation_path.as_posix()},
+        inputs={
+            **identity,
+            "evaluation_lock_sha256": adapter._sha(b'{"fixtures":[]}\n'),
+        },
+        resources=resources,
+    )
+    capability = adapter.ReferenceModalCapability(
+        db_path=tmp_path / "results/local/reference.sqlite",
+        root=tmp_path,
+        config_path=Path("configs/local/reference.yaml"),
+        request_path=request_path,
+        image_lock_path=image_path,
+        provider_capability_path=provider_path,
+        billing_authority_path=Path("reports/local/billing-authority.json"),
+        billing_receipt_path=Path("reports/local/billing-receipt.json"),
+        billing_report_path=Path("reports/local/billing-report.json"),
+        publication_manifest_path=Path("reports/publication.json"),
+        reservation_id="",
+        owner_id="",
+        authority_root=tmp_path,
+        provider_environment="validated-environment",
+        bootstrap_request_bytes=b"request",
+        evaluation_lock_bytes=canonical_evaluation,
+        fixture_bytes={},
+        execution_identity=identity,
+        image_lock={},
+    )
+    preview = {
+        "bootstrap_ready": True,
+        "submit": False,
+        "actual_cost_usd": "0",
+        "weights_transferred": False,
+        "request_sha256": request.sha256,
+        "image_lock_sha256": request.image_lock_sha256,
+        "configured_context_tokens": 262144,
+        "proven_useful_context_tokens": None,
+        "empirical": {"memory": "pending", "timing": "pending"},
+    }
+    monkeypatch.setattr(
+        reference_authority, "validate_reference_signed_cdn_authority", lambda _r: None
+    )
+    monkeypatch.setattr(adapter, "validate_topology_evidence", lambda *_a, **_k: None)
+    monkeypatch.setattr(modal_job, "load_reference_job_config", lambda *_a, **_k: config)
+    monkeypatch.setattr(modal_job, "plan_reference_bootstrap_preview", lambda *_a, **_k: preview)
+    monkeypatch.setattr(orchestrator, "validate_reproduced_request", lambda *_a, **_k: None)
+    monkeypatch.setattr(runtime, "runtime_metadata", lambda _r: {
+        "git_dirty": False,
+        "git_commit": "4" * 40,
+        "control_plane_sha256": "6" * 64,
+    })
+    monkeypatch.setattr(adapter, "validate_bootstrap_request_bytes", lambda _b: request)
+    monkeypatch.setattr(
+        adapter,
+        "validate_provider_capability_receipt",
+        lambda *_a, **_k: {"provider_environment": "validated-environment"},
+    )
+    monkeypatch.setattr(
+        adapter, "validate_image_lock", lambda _v: SimpleNamespace(recipe_sha256="a" * 64)
+    )
+    monkeypatch.setattr(adapter, "validate_execution_identity", lambda value: dict(value))
+
+    evidence = adapter.validate_reference_preflight(capability)
+
+    assert evidence.provider_environment == "validated-environment"
+
+
 def test_remote_result_binds_manifest_bytes_to_the_validated_receipt(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -240,7 +240,9 @@ time-of-check/time-of-use gap.
 Closed validator summaries must expose every downstream lineage field the consumer is allowed to
 use. If a validator reproduces a complete receipt but omits an approved field from its result,
 extend the narrow validated projection; do not make the consumer reread the receipt, call the SDK
-again, or assume the validator returned the original nested schema.
+again, or assume the validator returned the original nested schema. Exercise each paid-boundary
+consumer against the exact closed projection; testing only the validator can leave a stale nested
+lookup undiscovered until the final preflight.
 
 Cross-platform tree receipts must separate logical relative-path identity from platform-specific
 filesystem I/O. On Windows, enumerate, inspect, resolve, stat, and hash through extended-length
@@ -253,6 +255,11 @@ long enough to reject symlinks and reparse points in its existing parent chain, 
 resolve it for confinement. Publish a new artifact with an atomic create-if-absent operation; reserve
 atomic replacement for an explicit flag, and report whether an artifact actually existed before it
 was replaced.
+
+Freshness must be measured at the boundary it protects. A route receipt that is fresh before a slow
+runtime-tree verification can expire before reservation or submission. Validate an initial receipt
+as part of deterministic preflight, then repeat the bounded metadata-only observation immediately
+before the first mutable budget or provider boundary.
 
 ## Why This Matters
 

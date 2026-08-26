@@ -360,9 +360,7 @@ def test_capability_canonicalizes_verified_local_evaluation_lock(tmp_path: Path)
     image_path.parent.mkdir(parents=True, exist_ok=True)
     provider_path.parent.mkdir(parents=True, exist_ok=True)
     image_path.write_text("{}", encoding="utf-8")
-    provider_path.write_text(
-        json.dumps({"billing": {"environment_identity": "environment"}}), encoding="utf-8"
-    )
+    provider_path.write_text("{}", encoding="utf-8")
     config = SimpleNamespace(
         authority_files={
             "evaluation_lock_path": "eval/local/lock.json",
@@ -377,10 +375,31 @@ def test_capability_canonicalizes_verified_local_evaluation_lock(tmp_path: Path)
         resources={"gpu_type": "A100-80GB"},
     )
 
-    capability = orchestrator._capability(tmp_path, config, b"request")
+    request = json.dumps(
+        {
+            "image_lock": {"recipe_sha256": "5" * 64},
+            "provider_capability": {"receipt_sha256": "6" * 64},
+        }
+    ).encode()
+    observed: dict[str, object] = {}
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        def validate_provider(*_args: object, **kwargs: object) -> dict[str, object]:
+            observed.update(kwargs)
+            return {"provider_environment": "validated-environment"}
+
+        monkeypatch.setattr(
+            orchestrator,
+            "validate_provider_capability_receipt",
+            validate_provider,
+        )
+        capability = orchestrator._capability(tmp_path, config, request)
 
     assert capability.evaluation_lock_bytes == orchestrator.canonical_bytes(evaluation)
     assert capability.evaluation_lock_bytes != evaluation_path.read_bytes()
+    assert capability.provider_environment == "validated-environment"
+    assert observed["expected_sha256"] == "6" * 64
+    assert observed["image_recipe_sha256"] == "5" * 64
 
 
 def test_prepare_writes_only_ignored_request_and_does_not_touch_database(
@@ -509,9 +528,12 @@ def test_execute_reserves_once_then_hands_closed_capability_to_adapter(
     )
 
     assert result == {"status": "settlement_pending"}
-    assert calls.count("topology") == 1
+    assert calls.count("topology") == 2
     assert calls.count("preflight") == 1
     assert ("reserve", "4.00") in calls
+    final_topology = len(calls) - 1 - calls[::-1].index("topology")
+    database_open = calls.index(("db", tmp_path / orchestrator.DATABASE_PATH))
+    assert calls.index("preflight") < final_topology < database_open
     submitted = next(item[1] for item in calls if isinstance(item, tuple) and item[0] == "submit")
     assert submitted.reservation_id
     assert submitted.owner_id
