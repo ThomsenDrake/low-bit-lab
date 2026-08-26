@@ -193,7 +193,7 @@ def validate_reference_preflight(
                 "resource_spec_sha256": _sha(_canonical_json(config.resources)),
             }
         )
-        provider_environment = str(provider_receipt["billing"]["environment_identity"])
+        provider_environment = str(provider_receipt["provider_environment"])
         evaluation_lock_path = root / str(config.authority_files["evaluation_lock_path"])
         capability_identity = validate_execution_identity(capability.execution_identity)
         request_file_bytes = (root / capability.request_path).read_bytes()

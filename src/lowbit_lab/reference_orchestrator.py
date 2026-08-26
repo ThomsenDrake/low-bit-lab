@@ -491,7 +491,16 @@ def _capability(root: Path, config: ReferenceJobConfig, request: bytes) -> Refer
         for item in evaluation["fixtures"]
     }
     image = json.loads((root / IMAGE_LOCK_PATH).read_text(encoding="utf-8"))
-    provider = _read_json(root / PROVIDER_CAPABILITY_PATH, "provider capability")
+    request_value = json.loads(request)
+    provider_path = root / PROVIDER_CAPABILITY_PATH
+    provider = validate_provider_capability_receipt(
+        provider_path,
+        expected_sha256=str(request_value["provider_capability"]["receipt_sha256"]),
+        image_recipe_sha256=str(request_value["image_lock"]["recipe_sha256"]),
+        billing_authority_path=root / DEFAULT_BILLING_AUTHORITY,
+        billing_receipt_path=root / DEFAULT_BILLING_RECEIPT,
+        billing_report_path=root / DEFAULT_BILLING_REPORT,
+    )
     identity = {
         "weight_inventory_sha256": str(config.inputs["weight_inventory_sha256"]),
         "provenance_manifest_sha256": str(config.inputs["provenance_manifest_sha256"]),
@@ -513,7 +522,7 @@ def _capability(root: Path, config: ReferenceJobConfig, request: bytes) -> Refer
         reservation_id="",
         owner_id="",
         authority_root=root,
-        provider_environment=str(provider["billing"]["environment_identity"]),
+        provider_environment=str(provider["provider_environment"]),
         bootstrap_request_bytes=request,
         evaluation_lock_bytes=evaluation_lock_canonical_bytes,
         fixture_bytes=fixtures,
@@ -572,6 +581,9 @@ def execute(root: Path, *, confirm_request_sha256: str) -> Mapping[str, object]:
     )
 
     validate_reference_preflight(unreserved)
+    # Runtime lineage reproduction can exceed the topology receipt's freshness window on DrvFS.
+    # Re-observe after that slow gate so reservation never relies on a stale route receipt.
+    observe_topology(root / REQUEST_PATH)
     database = ResultsDatabase(confine_results_db(root, DATABASE_PATH))
     database.initialize()
     now = datetime.now(UTC)

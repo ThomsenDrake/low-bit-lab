@@ -199,3 +199,28 @@ the receipt digest, confines every path, writes a fully flushed temporary file, 
 by default. Review found and fixed an output-alias bug plus a create-versus-overwrite race: existing
 parent aliases now fail closed, new publication uses atomic create-if-absent, and explicit replacement
 alone uses atomic replacement.
+
+## 2026-08-26 provider-environment preflight review
+
+The first merged-main U8 execute attempt stopped before reservation or provider contact because the
+provider-capability validator returned a closed summary while fresh preflight still indexed the raw
+nested billing schema. The validator had already reproduced and verified the required environment
+identity.
+
+- Reproducibility and lineage: the closed validated projection now includes the provider environment;
+  capability construction binds its validation to the receipt and image-recipe hashes in the
+  reproduced bootstrap request, and fresh preflight consumes the same flat contract.
+- Modal safety and containment: the failed attempt created no reservation and made no provider call.
+  A second metadata-only topology observation now occurs after slow runtime hashing and before the
+  database is opened, preventing the 15-minute route receipt from expiring before reservation.
+- Local RTX 5080 compatibility: no CUDA, GPU, driver, allocator, or runtime selection changes were
+  made. The additional route observation is platform-neutral and the paid watchdog remains WSL-only.
+- Security and private-data handling: no raw billing object, signed redirect value, target identity,
+  credential, or machine path is added to tracked output. Publication scanning remains clean.
+- Research-loop support: the deterministic U8 gate can reach the reservation boundary without
+  weakening source, evaluation, memory, timing, or budget checks. Configured context remains 262,144
+  tokens; proven-useful context remains unknown.
+
+Independent report-only review found no actionable projection, simplicity, platform, privacy, or
+budget issues. End-to-end timing review found and fixed the stale-topology window; focused tests now
+assert the final observation occurs after preflight and before database initialization.
