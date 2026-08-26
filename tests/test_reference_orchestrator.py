@@ -142,12 +142,14 @@ def test_refresh_local_config_reproduces_stale_authority_hashes(
     config_path.parent.mkdir(parents=True)
     receipt_bytes = b'{"receipt":"exact bytes"}\n'
     receipt_sha256 = orchestrator._sha(receipt_bytes)
+    evaluation_bytes = b'{\n  "fixtures": [{"fixture_id": "fixture"}]\n}\n'
+    evaluation_sha256 = orchestrator._sha(evaluation_bytes)
     config_path.write_text(
         f"""inputs:
   reviewed_commit_sha256: stale
   source_revision: "5555555555555555555555555555555555555555"
   weight_inventory_tensor_bytes: 55
-  evaluation_lock_sha256: "4444444444444444444444444444444444444444444444444444444444444444"
+  evaluation_lock_sha256: "{evaluation_sha256}"
   evaluation_max_context_tokens: 262144
   runtime_receipt_sha256: "{receipt_sha256}"
 """,
@@ -159,13 +161,14 @@ def test_refresh_local_config_reproduces_stale_authority_hashes(
     fixture_root = tmp_path / "eval/fixtures"
     fixture_root.mkdir(parents=True)
     (fixture_root / "fixture.json").write_bytes(b"fixture")
+    (tmp_path / "eval/lock.json").write_bytes(evaluation_bytes)
     receipt_path = tmp_path / "artifacts/receipt.json"
     receipt_path.write_bytes(receipt_bytes)
     current = SimpleNamespace(
         inputs={
             "source_revision": "5" * 40,
             "weight_inventory_tensor_bytes": 55,
-            "evaluation_lock_sha256": "4" * 64,
+            "evaluation_lock_sha256": evaluation_sha256,
             "evaluation_max_context_tokens": 262144,
             "runtime_receipt_sha256": receipt_sha256,
         },
@@ -244,7 +247,7 @@ def test_refresh_local_config_reproduces_stale_authority_hashes(
         "reviewed_commit_sha256": "1" * 40,
         "source_revision": "5" * 40,
         "weight_inventory_tensor_bytes": 55,
-        "evaluation_lock_sha256": "4" * 64,
+        "evaluation_lock_sha256": evaluation_sha256,
         "evaluation_max_context_tokens": 262144,
         "runtime_receipt_sha256": receipt_sha256,
         "control_plane_sha256": "2" * 64,
@@ -266,13 +269,47 @@ def test_refresh_local_config_rejects_frozen_evaluation_drift(
         "runtime_receipt_sha256": "3" * 64,
     }
     inventory = SimpleNamespace(source_revision="1" * 40, index_tensor_bytes=55)
-    changed = SimpleNamespace(
-        sha256="f" * 64, context=SimpleNamespace(configured_tokens=262144)
-    )
+    changed = SimpleNamespace(sha256="2" * 64, context=SimpleNamespace(configured_tokens=262144))
     with pytest.raises(orchestrator.ReferenceOrchestratorError, match="identity drift"):
         orchestrator._validate_frozen_inputs(
-            frozen, inventory, changed, "3" * 64
+            frozen, inventory, changed, "f" * 64, "3" * 64
         )
+
+
+def test_capability_canonicalizes_verified_local_evaluation_lock(tmp_path: Path) -> None:
+    evaluation = {"fixtures": [{"fixture_id": "fixture"}]}
+    evaluation_path = tmp_path / "eval/local/lock.json"
+    fixture_root = tmp_path / "eval/local/fixtures"
+    evaluation_path.parent.mkdir(parents=True)
+    fixture_root.mkdir(parents=True)
+    evaluation_path.write_text(json.dumps(evaluation, indent=2) + "\n", encoding="utf-8")
+    (fixture_root / "fixture.json").write_bytes(b"fixture")
+    image_path = tmp_path / orchestrator.IMAGE_LOCK_PATH
+    provider_path = tmp_path / orchestrator.PROVIDER_CAPABILITY_PATH
+    image_path.parent.mkdir(parents=True, exist_ok=True)
+    provider_path.parent.mkdir(parents=True, exist_ok=True)
+    image_path.write_text("{}", encoding="utf-8")
+    provider_path.write_text(
+        json.dumps({"billing": {"environment_identity": "environment"}}), encoding="utf-8"
+    )
+    config = SimpleNamespace(
+        authority_files={
+            "evaluation_lock_path": "eval/local/lock.json",
+            "evaluation_fixture_root": "eval/local/fixtures",
+        },
+        inputs={
+            "weight_inventory_sha256": "1" * 64,
+            "provenance_manifest_sha256": "2" * 64,
+            "runtime_receipt_sha256": "3" * 64,
+            "reviewed_commit_sha256": "4" * 40,
+        },
+        resources={"gpu_type": "A100-80GB"},
+    )
+
+    capability = orchestrator._capability(tmp_path, config, b"request")
+
+    assert capability.evaluation_lock_bytes == orchestrator.canonical_bytes(evaluation)
+    assert capability.evaluation_lock_bytes != evaluation_path.read_bytes()
 
 
 def test_prepare_writes_only_ignored_request_and_does_not_touch_database(

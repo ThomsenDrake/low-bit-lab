@@ -34,6 +34,13 @@ def test_remote_contract_rejects_unbound_or_noncanonical_input() -> None:
         adapter.validate_remote_contract_bytes(b"not-json")
 
 
+def test_evaluation_lock_transport_canonicalizes_persisted_json() -> None:
+    persisted = b'{\n  "fixtures": []\n}\n'
+    assert adapter._canonical_evaluation_lock_bytes(persisted) == b'{"fixtures":[]}'
+    with pytest.raises(ReferenceModalError, match="evaluation lock bytes drift"):
+        adapter._canonical_evaluation_lock_bytes(b"not-json")
+
+
 def test_remote_result_binds_manifest_bytes_to_the_validated_receipt(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

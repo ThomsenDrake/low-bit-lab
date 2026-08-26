@@ -142,12 +142,14 @@ def _validate_frozen_inputs(
     frozen: Mapping[str, object],
     inventory: object,
     evaluation: object,
+    evaluation_lock_file_sha256: str,
     runtime_receipt_sha256: str,
 ) -> None:
     if (
         inventory.source_revision != frozen["source_revision"]
         or inventory.index_tensor_bytes != frozen["weight_inventory_tensor_bytes"]
-        or evaluation.sha256 != frozen["evaluation_lock_sha256"]
+        # The config key binds exact persisted bytes, not canonical semantics.
+        or evaluation_lock_file_sha256 != frozen["evaluation_lock_sha256"]
         or evaluation.context.configured_tokens != frozen["evaluation_max_context_tokens"]
         or runtime_receipt_sha256 != frozen["runtime_receipt_sha256"]
     ):
@@ -186,7 +188,7 @@ def refresh_local_config(root: Path) -> ReferenceJobConfig:
     runtime_lock = load_runtime_lock(
         root / str(current.authority_files["runtime_lock_path"]), root=root
     )
-    evaluation_raw = _read_json(
+    evaluation_raw, evaluation_bytes = _read_json_bytes(
         root / str(current.authority_files["evaluation_lock_path"]), "evaluation lock"
     )
     fixture_root = root / str(current.authority_files["evaluation_fixture_root"])
@@ -197,6 +199,7 @@ def refresh_local_config(root: Path) -> ReferenceJobConfig:
     evaluation = validate_pending_evaluation_lock(
         evaluation_raw, fixture_bytes=fixture_bytes
     )
+    evaluation_lock_canonical_sha256 = evaluation.sha256
     source_metadata = _read_json(
         root / str(current.authority_files["source_shard_metadata_path"]),
         "source shard metadata",
@@ -216,14 +219,21 @@ def refresh_local_config(root: Path) -> ReferenceJobConfig:
             "provenance_manifest_sha256": provenance_sha,
             "tokenizer_sha256": tokenizer_sha,
             "runtime_lock_sha256": runtime_lock.sha256,
-            "evaluation_lock_sha256": evaluation.sha256,
+            # Inventory provenance binds the validated canonical lock identity.
+            "evaluation_lock_sha256": evaluation_lock_canonical_sha256,
             "source_index_sha256": _sha(index_bytes),
         },
     )
     receipt_path = root / str(current.authority_files["runtime_receipt_path"])
     receipt, receipt_bytes = _read_json_bytes(receipt_path, "runtime receipt")
     verify_current_installed_environment(receipt, root=root, lock=runtime_lock)
-    _validate_frozen_inputs(current.inputs, inventory, evaluation, _sha(receipt_bytes))
+    _validate_frozen_inputs(
+        current.inputs,
+        inventory,
+        evaluation,
+        _sha(evaluation_bytes),
+        _sha(receipt_bytes),
+    )
     commit = str(runtime["git_commit"])
     raw["experiment_id"] = f"phase1-u8-{commit[:12]}"
     raw["inputs"]["reviewed_commit_sha256"] = commit
@@ -352,6 +362,7 @@ def build_bootstrap_request(root: Path, config: ReferenceJobConfig) -> bytes:
         for item in evaluation_raw["fixtures"]
     }
     evaluation = validate_pending_evaluation_lock(evaluation_raw, fixture_bytes=fixture_bytes)
+    evaluation_lock_canonical_sha256 = evaluation.sha256
     provider_path = root / PROVIDER_CAPABILITY_PATH
     provider_sha = _sha(provider_path.read_bytes())
     provider = validate_provider_capability_receipt(
@@ -410,7 +421,8 @@ def build_bootstrap_request(root: Path, config: ReferenceJobConfig) -> bytes:
         "known_memory_lower_bound_bytes": memory.get("known_required_lower_bound_bytes"),
         "lineage": {
             "control_plane_sha256": config.inputs["control_plane_sha256"],
-            "evaluation_lock_sha256": evaluation.sha256,
+            # The wire lineage key binds canonical evaluation-lock bytes.
+            "evaluation_lock_sha256": evaluation_lock_canonical_sha256,
             "inventory_sha256": config.inputs["weight_inventory_sha256"],
             "reviewed_commit": config.inputs["reviewed_commit_sha256"],
             "runtime_lock_sha256": runtime_lock.sha256,
@@ -470,8 +482,9 @@ def validate_reproduced_request(
 
 def _capability(root: Path, config: ReferenceJobConfig, request: bytes) -> ReferenceModalCapability:
     evaluation_path = Path(str(config.authority_files["evaluation_lock_path"]))
-    evaluation_bytes = (root / evaluation_path).read_bytes()
-    evaluation = json.loads(evaluation_bytes)
+    evaluation_lock_file_bytes = (root / evaluation_path).read_bytes()
+    evaluation = json.loads(evaluation_lock_file_bytes)
+    evaluation_lock_canonical_bytes = canonical_bytes(evaluation)
     fixture_root = root / str(config.authority_files["evaluation_fixture_root"])
     fixtures = {
         str(item["fixture_id"]): (fixture_root / f"{item['fixture_id']}.json").read_bytes()
@@ -502,7 +515,7 @@ def _capability(root: Path, config: ReferenceJobConfig, request: bytes) -> Refer
         authority_root=root,
         provider_environment=str(provider["billing"]["environment_identity"]),
         bootstrap_request_bytes=request,
-        evaluation_lock_bytes=evaluation_bytes,
+        evaluation_lock_bytes=evaluation_lock_canonical_bytes,
         fixture_bytes=fixtures,
         execution_identity=identity,
         image_lock=image,

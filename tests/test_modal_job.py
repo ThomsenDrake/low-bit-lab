@@ -64,6 +64,19 @@ def test_runtime_authority_binds_verified_exact_receipt_bytes(
     )
 
 
+def test_evaluation_authority_binds_noncanonical_persisted_bytes(tmp_path: Path) -> None:
+    content = b'{\n  "schema_version": 1\n}\n'
+    path = tmp_path / "evaluation.json"
+    path.write_bytes(content)
+    digest = hashlib.sha256(content).hexdigest()
+
+    raw = modal_job._load_bound_evaluation_lock(path, expected_file_sha256=digest)
+
+    assert raw == {"schema_version": 1}
+    with pytest.raises(ReferenceJobError, match="evaluation lock bytes drift"):
+        modal_job._load_bound_evaluation_lock(path, expected_file_sha256="0" * 64)
+
+
 def _budget(path: Path, plan_sha256: str) -> None:
     path.write_text(
         json.dumps(

@@ -939,6 +939,19 @@ def _verify_runtime_receipt_bytes(
     return hashlib.sha256(receipt_bytes).hexdigest() == expected_sha256
 
 
+def _load_bound_evaluation_lock(
+    path: Path, *, expected_file_sha256: str
+) -> dict[str, Any]:
+    content = path.read_bytes()
+    raw = json.loads(content.decode("utf-8"))
+    if (
+        not isinstance(raw, dict)
+        or hashlib.sha256(content).hexdigest() != expected_file_sha256
+    ):
+        raise ReferenceJobError("evaluation lock bytes drift")
+    return raw
+
+
 def _verify_reference_authorities(config: ReferenceJobConfig, *, root: Path) -> bool:
     if any(value is None for value in config.authority_files.values()):
         return False
@@ -962,7 +975,12 @@ def _verify_reference_authorities(config: ReferenceJobConfig, *, root: Path) -> 
         }
         inventory_raw = json.loads(paths["weight_inventory_path"].read_text(encoding="utf-8"))
         runtime_lock = load_runtime_lock(paths["runtime_lock_path"], root=root)
-        evaluation_raw = json.loads(paths["evaluation_lock_path"].read_text(encoding="utf-8"))
+        evaluation_raw = _load_bound_evaluation_lock(
+            paths["evaluation_lock_path"],
+            # The config key binds exact persisted bytes; semantic provenance below
+            # binds the canonical identity returned by validation.
+            expected_file_sha256=str(config.inputs["evaluation_lock_sha256"]),
+        )
         fixture_root = paths["evaluation_fixture_root"]
         fixture_bytes = {
             fixture["fixture_id"]: (fixture_root / f"{fixture['fixture_id']}.json").read_bytes()
@@ -971,11 +989,12 @@ def _verify_reference_authorities(config: ReferenceJobConfig, *, root: Path) -> 
         evaluation_lock = validate_pending_evaluation_lock(
             evaluation_raw, fixture_bytes=fixture_bytes
         )
+        evaluation_lock_canonical_sha256 = evaluation_lock.sha256
         expected_bindings = {
             "provenance_manifest_sha256": config.inputs["provenance_manifest_sha256"],
             "tokenizer_sha256": tokenizer_entry["local_content"]["sha256"],
             "runtime_lock_sha256": runtime_lock.sha256,
-            "evaluation_lock_sha256": evaluation_lock.sha256,
+            "evaluation_lock_sha256": evaluation_lock_canonical_sha256,
             "source_index_sha256": hashlib.sha256(index_bytes).hexdigest(),
         }
         inventory = parse_weight_inventory(
