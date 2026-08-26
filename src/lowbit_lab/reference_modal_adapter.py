@@ -198,6 +198,9 @@ def validate_reference_preflight(
         capability_identity = validate_execution_identity(capability.execution_identity)
         request_file_bytes = (root / capability.request_path).read_bytes()
         evaluation_lock_file_bytes = evaluation_lock_path.read_bytes()
+        canonical_evaluation_lock_bytes = _canonical_evaluation_lock_bytes(
+            evaluation_lock_file_bytes
+        )
         image_lock_file_bytes = (root / capability.image_lock_path).read_bytes()
         reference_scope = config.reference_execution_scope_sha256
         if reference_scope is None:
@@ -224,7 +227,9 @@ def validate_reference_preflight(
         or capability.provider_environment != provider_environment
         or capability_identity != expected_identity
         or request_file_bytes != capability.bootstrap_request_bytes
-        or evaluation_lock_file_bytes != capability.evaluation_lock_bytes
+        # Config binds exact local bytes; request lineage binds canonical bytes.
+        or _sha(evaluation_lock_file_bytes) != config.inputs["evaluation_lock_sha256"]
+        or canonical_evaluation_lock_bytes != capability.evaluation_lock_bytes
         or _sha(capability.evaluation_lock_bytes)
         != request_raw["lineage"]["evaluation_lock_sha256"]
         or image_lock_file_bytes != _canonical_json(capability.image_lock)
@@ -244,6 +249,14 @@ def _canonical_json(value: object) -> bytes:
 
 def _sha(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
+
+
+def _canonical_evaluation_lock_bytes(content: bytes) -> bytes:
+    try:
+        raw = json.loads(content.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise ReferenceModalError("evaluation lock bytes drift") from exc
+    return _canonical_json(raw)
 
 
 def _optional_local_sha(root: Path, path: Path) -> str | None:

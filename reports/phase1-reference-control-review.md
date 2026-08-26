@@ -132,3 +132,26 @@ Independent review found and fixed three issues: environment-only bytecode suppr
 under isolated Python, receipt parsing and hashing initially used two snapshots, and the downstream
 preview gate compared a canonical digest with an exact-byte digest. Focused tests cover the native
 and WSL command shapes and noncanonical-but-valid persisted receipt bytes.
+
+## 2026-08-26 evaluation-lock lineage review
+
+The merged-main preparer next exposed a second persisted-versus-canonical identity boundary. The
+ignored config intentionally binds the exact evaluation-lock file bytes, while inventory provenance
+and the closed remote capability bind the validated canonical representation.
+
+- Reproducibility and lineage: each exact-file/canonical comparison derives both identities from one
+  snapshot. Subsequent paid-boundary reproduction intentionally rereads and revalidates current
+  authority, binding exact-file SHA-256 to config and canonical SHA-256 to inventory and remote
+  request lineage.
+- Modal safety and containment: canonicalization occurs before provider contact; no reservation,
+  SDK execution primitive, or artifact transfer is part of this repair.
+- Local RTX 5080 compatibility: runtime, CUDA, hardware, and memory gates are untouched.
+- Security and private-data handling: only the approved ignored evaluation lock is read. Canonical
+  bytes enter the already closed capability; target data remains untracked and no signed URL is
+  logged or persisted.
+- Research-loop support: the configured 262,144-token envelope is preserved. Proven-useful context
+  remains unknown pending empirical U8 evidence.
+
+Independent simplify review found no unnecessary work or reusable exact-contract helper. Quality
+review found one ambiguous local hash name; local variables now explicitly distinguish file-byte
+and canonical identities while retaining the approved serialized schema keys.
