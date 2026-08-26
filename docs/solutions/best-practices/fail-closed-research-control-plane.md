@@ -70,6 +70,11 @@ strand a valid one-shot action without spending or contacting the provider. Inse
 the same immediate transaction that either consumes the approval into a reservation or rolls every
 setup record back.
 
+Merged-main regeneration may legitimately change derived provenance or inventory digests, but it
+must not silently adopt a new semantic experiment. Preserve the previously approved source revision,
+tensor total, evaluation-lock identity and configured context, and installed-runtime receipt as
+equality gates. Refresh only derived lineage after those frozen identities reproduce exactly.
+
 Scan Git path names as well as blob and commit content before publication, because a private
 identifier can leak through either surface. Persist only bounded, sanitized HTTP facts; raw
 server-controlled headers do not belong in durable evidence.

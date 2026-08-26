@@ -5,6 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import yaml
 
 import lowbit_lab.reference_orchestrator as orchestrator
 from lowbit_lab.reference_modal_adapter import ReferenceModalCapability
@@ -132,6 +133,142 @@ def test_source_artifacts_reject_mutable_origin_host(tmp_path: Path) -> None:
 
     with pytest.raises(orchestrator.ReferenceOrchestratorError, match="origin"):
         orchestrator._source_artifacts(tmp_path, config)
+
+
+def test_refresh_local_config_reproduces_stale_authority_hashes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = tmp_path / orchestrator.CONFIG_PATH
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text(
+        """inputs:
+  reviewed_commit_sha256: stale
+  source_revision: "5555555555555555555555555555555555555555"
+  weight_inventory_tensor_bytes: 55
+  evaluation_lock_sha256: "4444444444444444444444444444444444444444444444444444444444444444"
+  evaluation_max_context_tokens: 262144
+  runtime_receipt_sha256: "7777777777777777777777777777777777777777777777777777777777777777"
+""",
+        encoding="utf-8",
+    )
+    cache = tmp_path / "artifacts/index.json"
+    cache.parent.mkdir(parents=True)
+    cache.write_bytes(b"index")
+    fixture_root = tmp_path / "eval/fixtures"
+    fixture_root.mkdir(parents=True)
+    (fixture_root / "fixture.json").write_bytes(b"fixture")
+    current = SimpleNamespace(
+        inputs={
+            "source_revision": "5" * 40,
+            "weight_inventory_tensor_bytes": 55,
+            "evaluation_lock_sha256": "4" * 64,
+            "evaluation_max_context_tokens": 262144,
+            "runtime_receipt_sha256": "7" * 64,
+        },
+        authority_files={
+            "provenance_manifest_path": "artifacts/provenance.json",
+            "runtime_lock_path": "configs/runtime.json",
+            "evaluation_lock_path": "eval/lock.json",
+            "evaluation_fixture_root": "eval/fixtures",
+            "source_shard_metadata_path": "artifacts/shards.json",
+            "weight_inventory_path": "artifacts/inventory.json",
+            "runtime_receipt_path": "artifacts/receipt.json",
+        }
+    )
+    provenance = {
+        "files": [
+            {
+                "path": "model.safetensors.index.json",
+                "local_content": {"cache_path": "artifacts/index.json"},
+            },
+            {"path": "tokenizer.json", "local_content": {"sha256": "b" * 64}},
+        ]
+    }
+    provenance["manifest_sha256"] = orchestrator._sha(
+        json.dumps(provenance, sort_keys=True, separators=(",", ":")).encode()
+    )
+    evidence = {
+        "provenance.json": provenance,
+        "lock.json": {"fixtures": [{"fixture_id": "fixture"}]},
+        "shards.json": {"shard": {"size_bytes": 1, "lfs_sha256": "c" * 64}},
+        "inventory.json": {},
+        "receipt.json": {},
+    }
+    monkeypatch.setattr(orchestrator, "load_reference_job_config", lambda path, root: current)
+    monkeypatch.setattr(
+        orchestrator,
+        "runtime_metadata",
+        lambda root: {
+            "git_dirty": False,
+            "git_commit": "1" * 40,
+            "control_plane_sha256": "2" * 64,
+        },
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "_read_json",
+        lambda path, label: evidence[path.name],
+    )
+    monkeypatch.setattr(
+        orchestrator, "load_runtime_lock", lambda path, root: SimpleNamespace(sha256="3" * 64)
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "validate_pending_evaluation_lock",
+        lambda raw, fixture_bytes: SimpleNamespace(
+            sha256="4" * 64, context=SimpleNamespace(configured_tokens=262144)
+        ),
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "parse_weight_inventory",
+        lambda *args, **kwargs: SimpleNamespace(
+            source_revision="5" * 40, sha256="6" * 64, index_tensor_bytes=55
+        ),
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "verify_current_installed_environment",
+        lambda receipt, root, lock: {"receipt_sha256": "7" * 64},
+    )
+
+    orchestrator.refresh_local_config(tmp_path)
+
+    refreshed = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert refreshed["experiment_id"] == "phase1-u8-111111111111"
+    assert refreshed["inputs"] == {
+        "reviewed_commit_sha256": "1" * 40,
+        "source_revision": "5" * 40,
+        "weight_inventory_tensor_bytes": 55,
+        "evaluation_lock_sha256": "4" * 64,
+        "evaluation_max_context_tokens": 262144,
+        "runtime_receipt_sha256": "7" * 64,
+        "control_plane_sha256": "2" * 64,
+        "weight_inventory_sha256": "6" * 64,
+        "provenance_manifest_sha256": provenance["manifest_sha256"],
+    }
+    assert refreshed["approval_artifact_path"] is None
+
+
+def test_refresh_local_config_rejects_frozen_evaluation_drift(
+    tmp_path: Path,
+) -> None:
+    del tmp_path
+    frozen = {
+        "source_revision": "1" * 40,
+        "weight_inventory_tensor_bytes": 55,
+        "evaluation_lock_sha256": "2" * 64,
+        "evaluation_max_context_tokens": 262144,
+        "runtime_receipt_sha256": "3" * 64,
+    }
+    inventory = SimpleNamespace(source_revision="1" * 40, index_tensor_bytes=55)
+    changed = SimpleNamespace(
+        sha256="f" * 64, context=SimpleNamespace(configured_tokens=262144)
+    )
+    with pytest.raises(orchestrator.ReferenceOrchestratorError, match="identity drift"):
+        orchestrator._validate_frozen_inputs(
+            frozen, inventory, changed, {"receipt_sha256": "3" * 64}
+        )
 
 
 def test_prepare_writes_only_ignored_request_and_does_not_touch_database(
