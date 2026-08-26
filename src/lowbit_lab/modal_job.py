@@ -6,6 +6,7 @@ import json
 import re
 import sys
 import uuid
+from collections.abc import Set
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -55,6 +56,8 @@ from lowbit_lab.reference_contract import (
     ORIGINAL_APPROVED_PLAN_PATH,
     ORIGINAL_APPROVED_PLAN_SHA256,
     PROVIDER_APPROVAL_OBSERVATION_MAX_AGE_SECONDS,
+    REFERENCE_CONFIG_SCHEMA_VERSION,
+    REFERENCE_GATE_FIELDS,
     REFERENCE_RESOURCES,
     reference_execution_scope_sha256,
 )
@@ -143,7 +146,7 @@ class ReferenceJobConfig:
         )
 
 
-def _closed(value: Any, fields: set[str], label: str) -> dict[str, Any]:
+def _closed(value: Any, fields: Set[str], label: str) -> dict[str, Any]:
     if not isinstance(value, dict) or set(value) != fields:
         raise ReferenceJobError(f"{label} schema is closed")
     return value
@@ -213,7 +216,10 @@ def load_reference_job_config(path: Path, *, root: Path) -> ReferenceJobConfig:
         raise ReferenceJobError(f"cannot read reference config: {exc}") from exc
     _reject_credential_fields(raw)
     top = _closed(raw, REFERENCE_FIELDS, "reference config")
-    if top["schema_version"] != 5 or top["kind"] != "modal_reference_preview":
+    if (
+        top["schema_version"] != REFERENCE_CONFIG_SCHEMA_VERSION
+        or top["kind"] != "modal_reference_preview"
+    ):
         raise ReferenceJobError("unsupported reference config")
     if not isinstance(top["experiment_id"], str) or not top["experiment_id"]:
         raise ReferenceJobError("reference experiment_id is required")
@@ -387,24 +393,7 @@ def load_reference_job_config(path: Path, *, root: Path) -> ReferenceJobConfig:
         raise ReferenceJobError("human_approval_statement_sha256 must be lowercase SHA-256")
     gates = _closed(
         top["gates"],
-        {
-            "formula_authority_path",
-            "formula_approval_path",
-            "formula_approval_sha256",
-            "memory_fit_evidence_path",
-            "memory_fit_evidence_sha256",
-            "cold_path_time_evidence_path",
-            "cold_path_time_evidence_sha256",
-            "memory_method_path",
-            "memory_method_sha256",
-            "cold_path_method_path",
-            "cold_path_method_sha256",
-            "architecture_metadata_path",
-            "architecture_metadata_sha256",
-            "image_build_identity_path",
-            "image_build_identity_sha256",
-            "bound_receipt_root",
-        },
+        REFERENCE_GATE_FIELDS,
         "reference gates",
     )
     for path_name, digest_name in (

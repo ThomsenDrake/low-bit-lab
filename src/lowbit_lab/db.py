@@ -36,6 +36,8 @@ from lowbit_lab.reference_contract import (
     APPROVED_TRUST_OVERRIDE_STATEMENT_SHA256,
     ORIGINAL_APPROVED_PLAN_PATH,
     ORIGINAL_APPROVED_PLAN_SHA256,
+    REFERENCE_CONFIG_SCHEMA_VERSION,
+    REFERENCE_GATE_FIELDS,
     REFERENCE_RESOURCES,
     reference_execution_scope_sha256,
 )
@@ -641,19 +643,10 @@ def _reference_challenge(config_json: str, config_sha256: str) -> tuple[str, dic
         "authoritative_report_identity_sha256",
         "billing_completeness_delay_seconds",
     }
-    gate_fields = {
-        "formula_authority_path",
-        "formula_approval_path",
-        "formula_approval_sha256",
-        "memory_fit_evidence_path",
-        "memory_fit_evidence_sha256",
-        "cold_path_time_evidence_path",
-        "cold_path_time_evidence_sha256",
-    }
     if (
         not isinstance(raw, dict)
         or set(raw) != top_fields
-        or raw.get("schema_version") != 4
+        or raw.get("schema_version") != REFERENCE_CONFIG_SCHEMA_VERSION
         or raw.get("kind") != "modal_reference_preview"
         or not isinstance(raw.get("inputs"), dict)
         or set(raw["inputs"]) != input_fields
@@ -663,7 +656,7 @@ def _reference_challenge(config_json: str, config_sha256: str) -> tuple[str, dic
         or not isinstance(raw.get("provider"), dict)
         or set(raw["provider"]) != provider_fields
         or not isinstance(raw.get("gates"), dict)
-        or set(raw["gates"]) != gate_fields
+        or set(raw["gates"]) != REFERENCE_GATE_FIELDS
     ):
         raise DatabaseError("reference config schema is invalid")
     provider = raw["provider"]

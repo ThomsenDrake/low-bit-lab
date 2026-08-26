@@ -27,6 +27,8 @@ from lowbit_lab.reference_contract import (
     APPROVED_TRUST_OVERRIDE_STATEMENT_SHA256,
     ORIGINAL_APPROVED_PLAN_PATH,
     ORIGINAL_APPROVED_PLAN_SHA256,
+    REFERENCE_CONFIG_SCHEMA_VERSION,
+    REFERENCE_GATE_FIELDS,
     reference_execution_scope_sha256,
 )
 
@@ -420,13 +422,13 @@ def _reserve(
         "provenance_manifest_sha256": "2" * 64,
         "runtime_receipt_sha256": "3" * 64,
         "evaluation_lock_sha256": "4" * 64,
-        "evaluation_max_context_tokens": 32768,
+        "evaluation_max_context_tokens": 262144,
         "formula_authority_sha256": "5" * 64,
         "reviewed_commit_sha256": "6" * 40,
         "control_plane_sha256": "7" * 64,
     }
     raw = {
-        "schema_version": 4,
+        "schema_version": REFERENCE_CONFIG_SCHEMA_VERSION,
         "kind": "modal_reference_preview",
         "experiment_id": f"reference-{suffix}",
         "original_approved_plan_path": ORIGINAL_APPROVED_PLAN_PATH,
@@ -480,16 +482,26 @@ def _reserve(
             "billing_completeness_delay_seconds": 3600,
         },
         "gates": {
-            "formula_authority_path": None,
+            "architecture_metadata_path": "reports/local/architecture-metadata.json",
+            "architecture_metadata_sha256": "d" * 64,
+            "bound_receipt_root": "reports/local/reference-bound-receipts",
+            "cold_path_method_path": "reports/local/cold-path-method.json",
+            "cold_path_method_sha256": "e" * 64,
+            "formula_authority_path": "reports/local/formula-authority.json",
             "formula_approval_path": "reports/local/formula-approval.json",
             "formula_approval_sha256": "8" * 64,
-            "memory_fit_evidence_path": None,
-            "memory_fit_evidence_sha256": None,
-            "cold_path_time_evidence_path": None,
-            "cold_path_time_evidence_sha256": None,
+            "image_build_identity_path": "reports/local/image-build-identity.json",
+            "image_build_identity_sha256": "f" * 64,
+            "memory_fit_evidence_path": "reports/local/memory-fit-evidence.json",
+            "memory_fit_evidence_sha256": "0" * 64,
+            "memory_method_path": "reports/local/memory-method.json",
+            "memory_method_sha256": "1" * 64,
+            "cold_path_time_evidence_path": "reports/local/cold-path-evidence.json",
+            "cold_path_time_evidence_sha256": "2" * 64,
         },
         "approval_artifact_path": None,
     }
+    assert set(raw["gates"]) == REFERENCE_GATE_FIELDS
     if mutate_config is not None:
         mutate_config(raw)
     config_json = json.dumps(raw, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
@@ -962,6 +974,12 @@ def _set_provider_field(raw: dict[str, object], field: str, value: object) -> No
     provider[field] = value
 
 
+def _remove_gate_field(raw: dict[str, object], field: str) -> None:
+    gates = raw["gates"]
+    assert isinstance(gates, dict)
+    gates.pop(field)
+
+
 @pytest.mark.parametrize(
     ("mutation", "message"),
     [
@@ -1008,6 +1026,7 @@ def _set_provider_field(raw: dict[str, object], field: str, value: object) -> No
             lambda raw: raw["inputs"].__setitem__("weight_inventory_sha256", 1),
             "scope authority",
         ),
+        (lambda raw: _remove_gate_field(raw, "bound_receipt_root"), "schema"),
         (
             lambda raw: _set_provider_field(raw, "billing_authority_path", "C:/private"),
             "authority",

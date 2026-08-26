@@ -27,6 +27,7 @@ APPROVED_TRUST_OVERRIDE_STATEMENT_SHA256 = (
     "4c34af650985ed9846d6fdfbba0547fa257c41d079cb0cc15c79d1bebe56effb"
 )
 PROVIDER_APPROVAL_OBSERVATION_MAX_AGE_SECONDS = 15 * 60
+REFERENCE_CONFIG_SCHEMA_VERSION = 5
 
 REFERENCE_RESOURCES: dict[str, object] = {
     "gpu_type": "A100-80GB",
@@ -38,6 +39,27 @@ REFERENCE_RESOURCES: dict[str, object] = {
     "startup_timeout_seconds": None,
     "retries": 0,
 }
+
+REFERENCE_GATE_FIELDS = frozenset(
+    {
+        "architecture_metadata_path",
+        "architecture_metadata_sha256",
+        "bound_receipt_root",
+        "cold_path_method_path",
+        "cold_path_method_sha256",
+        "cold_path_time_evidence_path",
+        "cold_path_time_evidence_sha256",
+        "formula_approval_path",
+        "formula_approval_sha256",
+        "formula_authority_path",
+        "image_build_identity_path",
+        "image_build_identity_sha256",
+        "memory_fit_evidence_path",
+        "memory_fit_evidence_sha256",
+        "memory_method_path",
+        "memory_method_sha256",
+    }
+)
 
 
 def reference_execution_scope_sha256(

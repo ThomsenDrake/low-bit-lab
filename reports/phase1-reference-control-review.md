@@ -235,3 +235,13 @@ Independent privacy review caught that `raise ... from None` suppresses display 
 exception in `__context__`. Both bootstrap and artifact-walk sanitizers now leave the handler before
 raising; tests require `__cause__` and `__context__` to be absent and scan formatted tracebacks for
 runtime-assembled query sentinels.
+
+The next fresh execute attempt passed both runtime scans and the final 26-artifact topology refresh,
+then rolled back before reservation because the database challenge parser still required reference
+config schema v4 and its seven-field gate object. The validated production config is schema v5 with
+nine additional method, architecture, image-build, and receipt-root bindings. The database now
+requires exactly schema v5 and the complete 16-field gate object. Its canonical reservation fixture
+matches that schema and the configured 262,144-token envelope, populates every evidence binding,
+rejects a missing new field, and the production transaction reproduces against a disposable database
+copy with provider calls stubbed. The loader and database consume one frozen gate-field contract so
+that set cannot drift independently. The authoritative ledger remains empty.
