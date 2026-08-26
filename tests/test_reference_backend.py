@@ -8,9 +8,11 @@ from pathlib import Path
 
 import pytest
 
+import lowbit_lab.reference_backend as reference_backend
 from lowbit_lab.constants import EVALUATION_FAMILIES
 from lowbit_lab.evaluation_lock import validate_pending_evaluation_lock
 from lowbit_lab.reference_backend import (
+    DirectHTTPSFetcher,
     ProductionReferenceBackend,
     build_execution_dependencies,
 )
@@ -27,6 +29,54 @@ METRICS = {
     "memory": ["peak_vram_bytes"],
     "soak": ["failure_free_rate", "runtime_errors", "completed_minutes"],
 }
+
+
+def test_direct_fetcher_transmits_validated_query_without_extra_headers(monkeypatch) -> None:
+    calls: list[tuple[str, str, dict[str, str]]] = []
+
+    class Socket:
+        def getpeername(self):
+            return ("8.8.8.8", 443)
+
+    class Response:
+        status = 302
+
+        @staticmethod
+        def getheader(name: str):
+            return {"Content-Length": "0", "Location": "/next"}.get(name)
+
+    class Connection:
+        def __init__(self, host: str, address: str) -> None:
+            del host, address
+            self.sock = Socket()
+
+        def request(self, method: str, selector: str, *, headers: dict[str, str]) -> None:
+            calls.append((method, selector, headers))
+
+        @staticmethod
+        def getresponse():
+            return Response()
+
+        @staticmethod
+        def close() -> None:
+            return None
+
+    monkeypatch.setattr(reference_backend, "PinnedHTTPSConnection", Connection)
+    fetcher = DirectHTTPSFetcher()
+    response = fetcher.open(
+        "https://us.aws.cdn.hf.co/xet-bridge-us/file?sig=transient",
+        resolved_addresses=("8.8.8.8",),
+        proxies_disabled=True,
+    )
+
+    assert response.status == 302
+    assert calls == [
+        (
+            "GET",
+            "/xet-bridge-us/file?sig=transient",
+            {"Accept-Encoding": "identity"},
+        )
+    ]
 
 
 def _execution_identity() -> dict[str, str]:

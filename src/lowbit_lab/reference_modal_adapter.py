@@ -41,6 +41,7 @@ from lowbit_lab.reference_harness import (
     validate_execution_identity,
     validate_reference_manifest_bytes,
 )
+from lowbit_lab.reference_transport import TOPOLOGY_EVIDENCE_PATH, validate_topology_evidence
 
 
 class ReferenceModalError(RuntimeError):
@@ -128,6 +129,7 @@ def _validate_fresh_deterministic_gates(
 ) -> FreshDeterministicEvidence:
     """Recompute decision-bearing local evidence; no caller boolean is authority."""
     from lowbit_lab.modal_job import load_reference_job_config, plan_reference_bootstrap_preview
+    from lowbit_lab.reference_authority import validate_reference_signed_cdn_authority
     from lowbit_lab.runtime import runtime_metadata
 
     root = capability.root.resolve()
@@ -146,6 +148,11 @@ def _validate_fresh_deterministic_gates(
     ):
         raise ReferenceModalError("fresh deterministic artifact path is not repository-relative")
     try:
+        validate_reference_signed_cdn_authority(root)
+        validate_topology_evidence(
+            root / TOPOLOGY_EVIDENCE_PATH,
+            request_bytes=capability.bootstrap_request_bytes,
+        )
         config = load_reference_job_config(root / capability.config_path, root=root)
         request = validate_bootstrap_request_bytes(capability.bootstrap_request_bytes)
         request_raw = json.loads(request.canonical_json)

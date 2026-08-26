@@ -25,6 +25,8 @@ from lowbit_lab.constants import (
     REFERENCE_CUMULATIVE_CAP_USD,
     REFERENCE_INCREMENTAL_CAP_USD,
     REFERENCE_SETTLED_SMOKE_USD,
+    REFERENCE_SIGNED_CDN_AUTHORITY_SHA256,
+    REFERENCE_SIGNED_CDN_MERGE_COMMIT,
 )
 from lowbit_lab.reference_contract import REFERENCE_RESOURCES
 
@@ -508,13 +510,21 @@ def _validate_request_mapping(raw: object) -> BootstrapRequest:
 
     authority = _closed(
         request["authority"],
-        {"bootstrap_sha256", "merge_commit", "parent_sha256"},
+        {
+            "bootstrap_sha256",
+            "merge_commit",
+            "parent_sha256",
+            "signed_cdn_merge_commit",
+            "signed_cdn_sha256",
+        },
         "bootstrap authority binding",
     )
     if authority != {
         "bootstrap_sha256": REFERENCE_BOOTSTRAP_AUTHORITY_SHA256,
         "merge_commit": REFERENCE_BOOTSTRAP_MERGE_COMMIT,
         "parent_sha256": REFERENCE_AUTHORITY_SHA256,
+        "signed_cdn_merge_commit": REFERENCE_SIGNED_CDN_MERGE_COMMIT,
+        "signed_cdn_sha256": REFERENCE_SIGNED_CDN_AUTHORITY_SHA256,
     }:
         raise ReferenceBootstrapError("bootstrap authority binding drift")
 

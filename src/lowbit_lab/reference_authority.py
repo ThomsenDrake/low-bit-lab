@@ -15,8 +15,12 @@ from lowbit_lab.constants import (
     REFERENCE_BOOTSTRAP_STATEMENT_SHA256,
     REFERENCE_CUMULATIVE_CAP_USD,
     REFERENCE_INCREMENTAL_CAP_USD,
+    REFERENCE_SIGNED_CDN_AUTHORITY_SHA256,
+    REFERENCE_SIGNED_CDN_MERGE_COMMIT,
+    REFERENCE_SIGNED_CDN_STATEMENT_SHA256,
+    REFERENCE_SIGNED_REDIRECT_POLICY,
 )
-from lowbit_lab.handoff import sha256_json
+from lowbit_lab.handoff import canonical_json, sha256_json
 
 ACTION_CLASSES = (
     "zero_spend_prepare",
@@ -29,6 +33,8 @@ STATEMENT_PATH = Path("configs/local/reference-authority-statement.txt")
 AUTHORITY_PATH = Path("configs/local/reference-campaign-authority.json")
 BOOTSTRAP_STATEMENT_PATH = Path("configs/local/reference-bootstrap-statement.txt")
 BOOTSTRAP_AUTHORITY_PATH = Path("configs/local/reference-bootstrap-authority.json")
+SIGNED_CDN_STATEMENT_PATH = Path("configs/local/reference-signed-cdn-statement.txt")
+SIGNED_CDN_AUTHORITY_PATH = Path("configs/local/reference-signed-cdn-authority.json")
 CONTROLLING_PLANS = {
     "original_reference_baseline": (
         Path("docs/plans/local/2026-08-21-2358-feat-full-weight-baseline-plan.md"),
@@ -138,6 +144,28 @@ def _expected_bootstrap_authority() -> dict[str, Any]:
     }
 
 
+def _expected_signed_cdn_authority() -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "kind": "reference_signed_cdn_transport_amendment",
+        "statement_sha256": REFERENCE_SIGNED_CDN_STATEMENT_SHA256,
+        "parent_bootstrap_authority_sha256": REFERENCE_BOOTSTRAP_AUTHORITY_SHA256,
+        "parent_merge_commit": REFERENCE_SIGNED_CDN_MERGE_COMMIT,
+        "action_class": BOOTSTRAP_ACTION_CLASS,
+        "signed_redirect_policy": [
+            {"host": host, "path_prefix": path_prefix}
+            for host, path_prefix in REFERENCE_SIGNED_REDIRECT_POLICY
+        ],
+        "max_redirects": 5,
+        "query_free_origins_required": True,
+        "transient_query_only": True,
+        "no_query_logging_persistence_return_or_reuse": True,
+        "caller_headers_or_credentials_authorized": False,
+        "retries_authorized": False,
+        "additional_provider_actions_authorized": False,
+    }
+
+
 def _read(path: Path, label: str) -> bytes:
     try:
         return path.read_bytes()
@@ -211,9 +239,7 @@ def validate_reference_authority(root: Path, authority_path: Path = AUTHORITY_PA
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ReferenceAuthorityError("reference authority is not valid UTF-8 JSON") from exc
     expected = _expected_authority()
-    canonical_bytes = (
-        json.dumps(expected, sort_keys=True, separators=(",", ":"), ensure_ascii=True) + "\n"
-    ).encode("utf-8")
+    canonical_bytes = (canonical_json(expected) + "\n").encode("utf-8")
     if authority_bytes != canonical_bytes:
         raise ReferenceAuthorityError("reference authority raw bytes are not canonical")
     if authority != expected or sha256_json(authority) != REFERENCE_AUTHORITY_SHA256:
@@ -297,3 +323,52 @@ def authorize_reference_bootstrap_action(
         raise ReferenceAuthorityError("reference bootstrap action class is not authorized")
     authority_sha256 = validate_reference_bootstrap_authority(root, authority_path)
     return sha256_json({"authority_sha256": authority_sha256, "action_class": action_class})
+
+
+def validate_reference_signed_cdn_authority(
+    root: Path,
+    authority_path: Path = SIGNED_CDN_AUTHORITY_PATH,
+) -> str:
+    """Validate the signed-CDN amendment without broadening its parent."""
+    validate_reference_bootstrap_authority(root, BOOTSTRAP_AUTHORITY_PATH)
+    root = root.resolve(strict=True)
+    expected_path = _confined_path(root, SIGNED_CDN_AUTHORITY_PATH, "signed CDN authority")
+    resolved_path = (
+        authority_path.resolve()
+        if authority_path.is_absolute()
+        else (root / authority_path).resolve()
+    )
+    if resolved_path != expected_path:
+        raise ReferenceAuthorityError("signed CDN authority path is fixed")
+
+    statement = _read(
+        _confined_path(root, SIGNED_CDN_STATEMENT_PATH, "signed CDN authority statement"),
+        "signed CDN authority statement",
+    )
+    if (
+        statement.startswith(b"\xef\xbb\xbf")
+        or hashlib.sha256(statement).hexdigest() != REFERENCE_SIGNED_CDN_STATEMENT_SHA256
+    ):
+        raise ReferenceAuthorityError("signed CDN authority statement bytes have drifted")
+    try:
+        statement.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as exc:
+        raise ReferenceAuthorityError("signed CDN authority statement is not UTF-8") from exc
+
+    authority_bytes = _read(resolved_path, "signed CDN authority")
+    try:
+        authority = json.loads(
+            authority_bytes.decode("utf-8", errors="strict"),
+            object_pairs_hook=_reject_duplicate_keys,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ReferenceAuthorityError("signed CDN authority is not valid UTF-8 JSON") from exc
+    expected = _expected_signed_cdn_authority()
+    canonical_bytes = (
+        json.dumps(expected, sort_keys=True, separators=(",", ":"), ensure_ascii=True) + "\n"
+    ).encode("utf-8")
+    if authority_bytes != canonical_bytes:
+        raise ReferenceAuthorityError("signed CDN authority raw bytes are not canonical")
+    if authority != expected or sha256_json(authority) != REFERENCE_SIGNED_CDN_AUTHORITY_SHA256:
+        raise ReferenceAuthorityError("signed CDN authority boundary has drifted")
+    return REFERENCE_SIGNED_CDN_AUTHORITY_SHA256

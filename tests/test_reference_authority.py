@@ -9,11 +9,15 @@ from lowbit_lab.reference_authority import (
     BOOTSTRAP_STATEMENT_PATH,
     REFERENCE_AUTHORITY_SHA256,
     REFERENCE_BOOTSTRAP_AUTHORITY_SHA256,
+    REFERENCE_SIGNED_CDN_AUTHORITY_SHA256,
+    SIGNED_CDN_AUTHORITY_PATH,
+    SIGNED_CDN_STATEMENT_PATH,
     ReferenceAuthorityError,
     authorize_reference_action,
     authorize_reference_bootstrap_action,
     validate_reference_authority,
     validate_reference_bootstrap_authority,
+    validate_reference_signed_cdn_authority,
 )
 
 
@@ -43,6 +47,17 @@ def _copy_bootstrap_authority_inputs(root: Path) -> Path:
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination.write_bytes(source.read_bytes())
     return root / BOOTSTRAP_AUTHORITY_PATH
+
+
+def _copy_signed_cdn_authority_inputs(root: Path) -> Path:
+    _copy_bootstrap_authority_inputs(root)
+    repository = Path(__file__).resolve().parents[1]
+    for relative in (SIGNED_CDN_STATEMENT_PATH, SIGNED_CDN_AUTHORITY_PATH):
+        source = repository / relative
+        destination = root / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(source.read_bytes())
+    return root / SIGNED_CDN_AUTHORITY_PATH
 
 
 def test_exact_authority_accepts_all_closed_action_classes(tmp_path: Path) -> None:
@@ -188,3 +203,34 @@ def test_bootstrap_requires_unchanged_parent_authority(tmp_path: Path) -> None:
     parent.write_bytes(parent.read_bytes().replace(b'"u8_slots":1', b'"u8_slots":2'))
     with pytest.raises(ReferenceAuthorityError, match="reference authority"):
         validate_reference_bootstrap_authority(tmp_path, authority_path)
+
+
+def test_exact_signed_cdn_amendment_is_separate_and_narrow(tmp_path: Path) -> None:
+    authority_path = _copy_signed_cdn_authority_inputs(tmp_path)
+    assert (
+        validate_reference_signed_cdn_authority(tmp_path, authority_path)
+        == REFERENCE_SIGNED_CDN_AUTHORITY_SHA256
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("max_redirects", 6),
+        ("additional_provider_actions_authorized", True),
+        ("retries_authorized", True),
+        ("signed_redirect_policy", []),
+    ),
+)
+def test_signed_cdn_authority_drift_fails(
+    tmp_path: Path, field: str, value: object
+) -> None:
+    authority_path = _copy_signed_cdn_authority_inputs(tmp_path)
+    authority = json.loads(authority_path.read_text(encoding="utf-8"))
+    authority[field] = value
+    authority_path.write_text(
+        json.dumps(authority, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ReferenceAuthorityError, match="signed CDN authority"):
+        validate_reference_signed_cdn_authority(tmp_path, authority_path)

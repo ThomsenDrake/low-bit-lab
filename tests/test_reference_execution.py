@@ -196,7 +196,12 @@ def _request(
         }
     ]
     raw = {
-        "approved_https_hosts": ["artifacts.example", "cdn.example"],
+        "approved_https_hosts": [
+            "artifacts.example",
+            "cdn.example",
+            "huggingface.co",
+            "us.aws.cdn.hf.co",
+        ],
         "context_ladder_tokens": [65_536, 131_072, 196_608, 262_144],
         "known_memory_lower_bound_bytes": 50,
         "lineage": {"evaluation_lock_sha256": SHA_A},
@@ -314,6 +319,7 @@ def test_fake_end_to_end_visits_each_stage_once_and_returns_bounded_receipt() ->
         "https://artifacts.example:444/weights.safetensors",
         "https://artifacts.example/weights.safetensors?download=1",
         "https://artifacts.example/weights.safetensors#fragment",
+        "https://artifacts.example/weights.safetensors?sig=line\nbreak",
         "https://other.example/weights.safetensors",
     ],
 )
@@ -364,6 +370,54 @@ def test_redirect_to_unapproved_host_stops_without_second_connection() -> None:
     receipt = _run(dependencies=dependencies)
     assert _failure(receipt) == ("source_transfer", "unsafe_url")
     assert len(fetcher.calls) == 1
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        "https://huggingface.co/api/resolve-cache/models/org/rev/file?sig=value",
+        "https://us.aws.cdn.hf.co/xet-bridge-us/rev/file?sig=value",
+    ],
+)
+def test_signed_query_redirect_is_allowed_only_by_frozen_policy(target: str) -> None:
+    first = _response((), status=302, length=0, location=target)
+    dependencies, _, fetcher, _, _ = _dependencies(response=first)
+    fetcher.responses[target] = [_response()]
+    resolver = dependencies.resolver
+    assert isinstance(resolver, FakeResolver)
+    host = str(target.split("/", 3)[2])
+    resolver.addresses = {"artifacts.example": (PUBLIC_IP,), host: (PUBLIC_IP,)}
+
+    receipt = _run(dependencies=dependencies)
+
+    assert receipt["status"] == "succeeded"
+    assert len(fetcher.calls) == 2
+    assert "sig=value" not in canonical_json(receipt)
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        "https://huggingface.co/models/org/file?sig=value",
+        "https://us.aws.cdn.hf.co/xet-bridge-usa/file?sig=value",
+        "https://huggingface.co/api/resolve-cache/models/../private?sig=value",
+        "https://huggingface.co/api/resolve-cache/models/%2e%2e/private?sig=value",
+        "https://huggingface.co/api/resolve-cache/models/a%2fb?sig=value",
+        "https://huggingface.co/api/resolve-cache/models/a\\b?sig=value",
+        "https://huggingface.co/api/resolve-cache/models/a%zz?sig=value",
+    ],
+)
+def test_signed_query_redirect_path_drift_stops_before_second_fetch(target: str) -> None:
+    sentinel = "signed" + "-query-secret"
+    target = target.replace("sig=value", f"sig={sentinel}")
+    first = _response((), status=302, length=0, location=target)
+    dependencies, _, fetcher, _, _ = _dependencies(response=first)
+
+    receipt = _run(dependencies=dependencies)
+
+    assert _failure(receipt) == ("source_transfer", "unsafe_url")
+    assert len(fetcher.calls) == 1
+    assert sentinel not in canonical_json(receipt)
 
 
 def test_ambient_proxy_stops_before_resolution_or_fetch() -> None:

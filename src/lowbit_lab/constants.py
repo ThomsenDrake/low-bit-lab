@@ -34,3 +34,17 @@ REFERENCE_BOOTSTRAP_AUTHORITY_SHA256 = (
     "942c6d41c1c38452b5f2fb60250e50b92430bd552b39a33ab1749b1b8fcb8f23"
 )
 REFERENCE_BOOTSTRAP_MERGE_COMMIT = "af05202502a8982a340c238447874e999cdff2e4"
+
+# Independently frozen signed-CDN transport amendment. It changes only the
+# redirect transport boundary and adds no action, retry, or budget authority.
+REFERENCE_SIGNED_CDN_STATEMENT_SHA256 = (
+    "3843da6c982c09c0975d95060b685c6a0506ca6c4be9c4d05c2e18fd77da1223"
+)
+REFERENCE_SIGNED_CDN_AUTHORITY_SHA256 = (
+    "71aad476f7ad75df23f4b34ae9d3a7fbec121883b7e2e56b492ada124f82c890"
+)
+REFERENCE_SIGNED_CDN_MERGE_COMMIT = "a96d5949f2826438b0f219b1dd8633c8bd42f8c1"
+REFERENCE_SIGNED_REDIRECT_POLICY = (
+    ("huggingface.co", "/api/resolve-cache/models/"),
+    ("us.aws.cdn.hf.co", "/xet-bridge-us/"),
+)

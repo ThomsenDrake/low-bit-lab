@@ -29,6 +29,7 @@ lowbit-activate = "lowbit_lab.activation:main"
 lowbit-runtime-artifacts = "lowbit_lab.runtime_artifacts:main"
 lowbit-controller = "lowbit_lab.controller:main"
 lowbit-paid-smoke = "lowbit_lab.provider_smoke:main"
+lowbit-reference-transport = "lowbit_lab.reference_transport:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/lowbit_lab"]

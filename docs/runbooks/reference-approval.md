@@ -125,11 +125,25 @@ freshly reproduced local authority. It persists `submission_pending` before prov
 provider image/app identity before the sole spawn, call identity immediately after spawn, and the
 validated receipt/manifest before settlement pending.
 
-The current immutable source transport is a pre-submit stop. A metadata-only HEAD request read zero
-body bytes and observed that an approved query-free source URL redirects to a final public CDN URL
-with a query string. The approved source policy rejects query strings at every redirect boundary.
-Do not reserve U8, import Modal, or transfer weights until either a compliant immutable query-free
-origin is proven or a later human-approved transport amendment changes that exact rule.
+The signed-CDN transport amendment keeps every immutable origin query-free and permits a query only
+after a redirect to one of the exact host/path pairs frozen in code. The direct client revalidates
+HTTPS, host, canonical path, DNS results, and connected peer at every hop; sends only the fixed
+`Accept-Encoding: identity` header; and never returns or persists redirect query material. Five
+redirects is the hard maximum. Every artifact remains unusable until its declared byte length and
+SHA-256 match.
+
+Immediately before the paid boundary, regenerate the merged-main request and perform the local
+HEAD-only topology observation from WSL with ambient proxy variables unset:
+
+```bash
+python -m lowbit_lab.reference_transport <ignored-bootstrap-request.json>
+```
+
+The resulting ignored evidence must be less than 15 minutes old, bind the exact request and
+transport authority hashes, record zero body bytes, and explicitly state that it does not prove the
+Modal worker's regional route. A stale or mismatched observation stops before reservation or Modal
+import. A remote route outside the frozen policy remains an accepted fail-closed one-shot risk, not
+permission to expand the allowlist.
 
 The paid adapter must be invoked from the isolated WSL/Linux environment. Native Windows lacks the
 SIGALRM watchdog used to cover the complete 2,700-second provider section, including image build.

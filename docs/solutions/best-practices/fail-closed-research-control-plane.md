@@ -1,7 +1,7 @@
 ---
 title: Fail-closed boundaries for a research control plane
 date: 2026-08-21
-last_updated: 2026-08-25
+last_updated: 2026-08-26
 category: best-practices
 module: experiment-control-plane
 problem_type: best_practice
@@ -30,11 +30,24 @@ selection input. A retry must not reuse completed evidence unless the implementa
 full preceding evidence chain. Until that chain exists, rerunning all bounded local gates is the
 safer and simpler contract.
 
-Apply the same closed URL policy to the lock, every redirect, and the final response. Reject
-credentials, query strings, fragments, and non-default ports. Scan Git path names as well as blob
-and commit content before publication, because a private identifier can leak through either
-surface. Persist only bounded, sanitized HTTP facts; raw server-controlled headers do not belong
-in durable evidence.
+Apply one closed URL-policy implementation to the lock, every redirect, the final response, and
+metadata-only preflights. Keep immutable origins query-free. If public hosting requires signed CDN
+redirects, permit queries only for exact reviewed host/path-prefix pairs and only after a redirect;
+reject fragments, credentials, non-default ports, ambiguous path encodings, non-global addresses,
+and connected-peer drift. The GET and HEAD clients should share the redirect/DNS/peer walker so a
+green preflight cannot silently enforce a weaker policy than paid execution.
+
+Treat signed query values like ephemeral bearer material. Construct `path?query` only at the direct
+request boundary, send no ambient proxy, cookie, authorization, or caller headers, and convert
+transport errors to fixed codes without retaining the underlying exception chain. Observe every
+artifact in a multi-artifact inventory rather than sampling the first one. Persist only a fresh,
+request-bound count and booleans such as zero body bytes and signed-redirect observed; never persist
+URLs, redirect headers, or query material. A local HEAD result is a freshness guard, not proof of a
+remote worker's regional GET route.
+
+Scan Git path names as well as blob and commit content before publication, because a private
+identifier can leak through either surface. Persist only bounded, sanitized HTTP facts; raw
+server-controlled headers do not belong in durable evidence.
 
 Framework readiness should verify the exact Python and direct framework versions from the runtime
 lock. It still does not prove model inference or kernel compatibility. A scheduled controller needs
@@ -177,8 +190,10 @@ from being settled early while preserving one-shot consumption.
 Immutable public hosting can conflict with a strict redirect policy. A query-free origin URL may
 redirect to a signed CDN URL with a query string even for anonymous public files. A metadata-only
 HEAD result proves the transport shape, not file integrity or permission to transfer bytes. When
-the approved policy rejects queries at every redirect boundary, stop before provider submission;
-do not special-case the host or silently weaken the rule inside the one-shot execution.
+the approved policy rejects queries at every redirect boundary, stop before provider submission.
+If authority is later amended, freeze the exact host/path boundary in both reviewed plan and code,
+bind the amendment into the request and paid gate, and test full traceback output with a
+runtime-assembled query sentinel before enabling the one-shot execution.
 
 ## Why This Matters
 

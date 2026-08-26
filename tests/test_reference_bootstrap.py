@@ -8,6 +8,8 @@ from lowbit_lab.constants import (
     REFERENCE_AUTHORITY_SHA256,
     REFERENCE_BOOTSTRAP_AUTHORITY_SHA256,
     REFERENCE_BOOTSTRAP_MERGE_COMMIT,
+    REFERENCE_SIGNED_CDN_AUTHORITY_SHA256,
+    REFERENCE_SIGNED_CDN_MERGE_COMMIT,
 )
 from lowbit_lab.reference_bootstrap import (
     EMPIRICAL_FACTS,
@@ -100,6 +102,8 @@ def _request() -> dict[str, object]:
             "bootstrap_sha256": REFERENCE_BOOTSTRAP_AUTHORITY_SHA256,
             "merge_commit": REFERENCE_BOOTSTRAP_MERGE_COMMIT,
             "parent_sha256": REFERENCE_AUTHORITY_SHA256,
+            "signed_cdn_merge_commit": REFERENCE_SIGNED_CDN_MERGE_COMMIT,
+            "signed_cdn_sha256": REFERENCE_SIGNED_CDN_AUTHORITY_SHA256,
         },
         "budget": {
             "cumulative_cap_usd": "4.00270969",

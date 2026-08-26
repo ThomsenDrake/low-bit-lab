@@ -1,43 +1,72 @@
-# Phase 1 reference control review
+# Phase 1 Signed-CDN Transport Review
 
-Date: 2026-08-25
+Date: 2026-08-26
 
-Scope: bootstrap authority and the staged U8 reference control plane through U21. U8 was not
-submitted because the immutable public source transport fails the approved redirect policy.
+Scope: signed-CDN amendment implementation against merged parent `a96d5949f2826438b0f219b1dd8633c8bd42f8c1`
 
-## Review outcomes
+Mode: report-only review followed by mechanical high-confidence fixes
 
-- Reproducibility and lineage: the adapter now rejects caller-selected database paths, provider
-  environments, execution identities, evaluation locks, request bytes, and image-lock bytes. It
-  derives them from freshly reproduced config, provider-capability, and repository evidence.
-- Modal-credit safety and containment: one slot is consumed before provider import; one spawn is
-  statically enforced; provider image/app identity precedes spawn; call identity follows it; all
-  post-boundary ambiguity retains the reservation. Audit-block persistence failure is no longer
-  swallowed. The cumulative cap remains USD 4.00270969, including settled smoke cost USD
-  0.00270969 and at most USD 4.00 incremental U8 authority.
-- Local RTX 5080 compatibility: local control-plane tests pass in the isolated environment, but no
-  local full-weight fit or kernel claim is made. The provider envelope remains one A100-80GB, one
-  container, 2,700 seconds maximum, zero configured/application retries, and no fallback.
-- Security and private data: source inclusion, secrets, mounts, volumes, schedules, user payloads,
-  and local weight transfer are structurally absent. The serialized function bytes are hash-bound,
-  and serialization policy is cleared on all exits. Target-specific artifacts remain ignored-local.
-- Research loop support: the six locked evaluation families and full context ladder feed one staged
-  receipt. The local validator binds receipt-to-manifest bytes and persists sanitized evidence
-  before settlement pending. Configured context is 262,144 tokens; proven-useful context remains
-  unset until a successful empirical run.
+## Verdict
 
-## Verification
+Ready for public review after the recorded verification commands pass. The amendment changes only
+redirect transport; it does not add an action, retry, provider resource, budget, or promotion
+authority.
 
-- Full tests: 509 passed, 2 skipped.
-- Ruff: passed.
-- Focused paid-boundary tests: 118 passed.
-- Modal SDK inspection and fake-provider flow: passed without provider contact.
-- U8 actual spend: USD 0. Total settled lab Modal spend remains USD 0.00270969.
+## Review lenses
 
-## Terminal blocker
+### Reproducibility and experiment lineage
 
-A metadata-only HEAD request read zero body bytes and observed an approved query-free immutable
-source URL redirecting to a public CDN URL with a query string. The U19 policy rejects query and
-fragment components at every redirect boundary. U8 therefore stops before reservation consumption,
-provider import, or weight transfer. Proceed only with a compliant immutable query-free origin or a
-later human-approved transport amendment; do not weaken the policy locally.
+The exact amendment statement, canonical child authority, parent authority, parent merge, bootstrap
+request, and topology observation are independently bound. The topology evidence records the exact
+request digest and the number of inventory artifacts observed. It contains no URL or query value.
+
+### Modal-credit safety and failure containment
+
+The existing one-shot, one-GPU, one-container, 2,700-second, zero-retry, USD 4.00 incremental
+boundary is unchanged. Authority and fresh topology validation occur in the deterministic paid gate.
+Any submitted or ambiguous action remains one-shot and audit-blocked pending authoritative billing.
+
+### Local RTX 5080 compatibility
+
+This amendment changes direct HTTPS transport only. It makes no local kernel, quantization, driver,
+or model-fit claim. Local hardware readiness and remote reference execution remain separate gates.
+
+### Security and private-data handling
+
+Origins remain query-free. Query-bearing redirects require an exact frozen host/path pair plus the
+request's closed host list. URL role, canonical path, DNS results, connected peer, redirect count,
+and proxy absence are fail-closed. Signed values are forwarded only in request memory and are absent
+from receipts, evidence, CLI output, and sanitized tracebacks. No credential, cookie, caller header,
+secret, mount, volume, or private payload is introduced.
+
+### Research-loop support
+
+Every immutable artifact is HEAD-observed locally, then later transferred once and held unusable
+until declared length and SHA-256 verification succeeds. The evaluation lock and 262,144-token
+configured envelope are unchanged. Proven-useful context remains unknown until empirical evaluation
+completes; the transport preflight cannot promote that state.
+
+## Findings and disposition
+
+- Fixed: the first draft duplicated redirect/DNS/peer validation between GET and HEAD paths. Both
+  now use one provider-neutral walker.
+- Fixed: failed HEAD requests could retain signed query values in chained exceptions. Failures now
+  cross the boundary as fixed messages without a cause, with a runtime-assembled sentinel test.
+- Fixed: sampling only the first inventory artifact could allow later redirect drift to consume the
+  one-shot action. The observer now covers the complete declared inventory and binds the count.
+- Fixed: connection cleanup was success-path-only in the first draft. HEAD connections now close in
+  `finally`.
+- Accepted residual: local HEAD routing can differ from remote regional GET routing. Evidence states
+  `remote_route_fidelity_proven: false`; remote enforcement remains fail-closed and one-shot.
+- Accepted residual: provider route or billing behavior can change after the freshness check. The
+  amendment does not claim a provider-enforced dollar cap or eliminate crash-rescheduling risk.
+
+## Required verification
+
+```text
+python -m pytest tests/test_reference_authority.py tests/test_reference_bootstrap.py -q
+python -m pytest tests/test_reference_execution.py tests/test_reference_backend.py tests/test_reference_transport.py -q
+python -m pytest tests/test_reference_modal_adapter.py tests/test_modal_job.py -q
+python -m pytest -q
+python -m ruff check .
+```
