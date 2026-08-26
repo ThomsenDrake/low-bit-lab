@@ -6,7 +6,7 @@
 2. Keep logical repository-relative path derivation separate from the I/O path.
 3. Add pure formatting coverage plus a Windows integration test above the legacy path limit.
 4. Run focused/full tests, lint, publication/privacy, simplification, and independent review.
-5. Merge, regenerate the ignored receipt through the existing evidence CLI, then reproduce it from
+5. Merge, regenerate the ignored receipt through the reviewed evidence CLI, then reproduce it from
    Windows and WSL before any paid action.
 
 ## Acceptance criteria

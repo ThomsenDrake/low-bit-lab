@@ -248,6 +248,12 @@ paths so files beyond the legacy 260-character limit are not silently omitted. R
 root once, reject every symlink or reparse point, and require each resolved target to remain beneath
 that root before hashing; WSL must reproduce the same complete file count, byte total, and digest.
 
+Evidence writers need the same fail-closed discipline as readers. Preserve the lexical output path
+long enough to reject symlinks and reparse points in its existing parent chain, then separately
+resolve it for confinement. Publish a new artifact with an atomic create-if-absent operation; reserve
+atomic replacement for an explicit flag, and report whether an artifact actually existed before it
+was replaced.
+
 ## Why This Matters
 
 These invariants make silent policy drift, config mutation, preflight failure loss, and concurrent overspend observable or impossible. They also let later agents resume from durable state without inheriting hidden judgment from an earlier session.

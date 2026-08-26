@@ -193,3 +193,9 @@ files; the complete tree contains 22,259.
 
 Independent review found and fixed a lexical-confinement regression and a per-file root-resolution
 cost. Windows tests cover both a file beyond 260 characters and a junction escape.
+
+The follow-up receipt CLI reuses the reviewed environment observer, emits only aggregate counts and
+the receipt digest, confines every path, writes a fully flushed temporary file, and refuses overwrite
+by default. Review found and fixed an output-alias bug plus a create-versus-overwrite race: existing
+parent aliases now fail closed, new publication uses atomic create-if-absent, and explicit replacement
+alone uses atomic replacement.
