@@ -80,7 +80,7 @@ class PublicResolver:
         return tuple(sorted(values, key=lambda address: (":" in address, address)))
 
 
-class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+class PinnedHTTPSConnection(http.client.HTTPSConnection):
     def __init__(self, host: str, address: str) -> None:
         super().__init__(host, port=443, timeout=30, context=ssl.create_default_context())
         self._address = address
@@ -99,9 +99,10 @@ class DirectHTTPSFetcher:
         if not proxies_disabled or not resolved_addresses:
             raise ExecutionFailure("network_policy_drift")
         parsed = urlsplit(url)
-        connection = _PinnedHTTPSConnection(str(parsed.hostname), resolved_addresses[0])
+        connection = PinnedHTTPSConnection(str(parsed.hostname), resolved_addresses[0])
+        selector = parsed.path + (f"?{parsed.query}" if parsed.query else "")
         try:
-            connection.request("GET", parsed.path, headers={"Accept-Encoding": "identity"})
+            connection.request("GET", selector, headers={"Accept-Encoding": "identity"})
             response = connection.getresponse()
             peer = str(connection.sock.getpeername()[0])  # type: ignore[union-attr]
             length_header = response.getheader("Content-Length")

@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from typing import Protocol
 from urllib.parse import urljoin, urlsplit
 
+from lowbit_lab.constants import REFERENCE_SIGNED_REDIRECT_POLICY
 from lowbit_lab.reference_bootstrap import (
     CONFIGURED_CONTEXT_TOKENS,
     FUTURE_STAGE_RESERVES_SECONDS,
@@ -362,33 +363,12 @@ class ReferenceExecution:
         return measurements
 
     def _open_final(self, initial_url: str) -> FetchResponse:
-        current = initial_url
-        approved = frozenset(self.raw["approved_https_hosts"])
-        for redirect_count in range(MAX_REDIRECTS + 1):
-            host = _validate_url(current, approved)
-            try:
-                resolved = tuple(self.deps.resolver.resolve(host))
-            except Exception as exc:
-                raise _StageFailure("resolution_failed") from exc
-            if not resolved or any(not _public_address(address) for address in resolved):
-                raise _StageFailure("unsafe_address")
-            response = self.deps.fetcher.open(
-                current, resolved_addresses=resolved, proxies_disabled=True
-            )
-            if not _public_address(response.peer_address) or not any(
-                _same_address(response.peer_address, address) for address in resolved
-            ):
-                raise _StageFailure("peer_address_drift")
-            if response.status in {301, 302, 303, 307, 308}:
-                if response.location is None or redirect_count == MAX_REDIRECTS:
-                    raise _StageFailure("redirect_drift")
-                current = urljoin(current, response.location)
-                _validate_url(current, approved)
-                continue
-            if response.status != 200 or response.location is not None:
-                raise _StageFailure("unexpected_http_status")
-            return response
-        raise _StageFailure("redirect_drift")
+        return open_validated_url(
+            initial_url,
+            approved_hosts=frozenset(self.raw["approved_https_hosts"]),
+            resolver=self.deps.resolver,
+            fetcher=self.deps.fetcher,
+        )
 
     def _hash_verification(self) -> Mapping[str, object]:
         self._require_seconds(sum(FUTURE_STAGE_RESERVES_SECONDS.values()))
@@ -673,8 +653,15 @@ def _same_address(left: str, right: str) -> bool:
         return False
 
 
-def _validate_url(url: object, approved_hosts: frozenset[str]) -> str:
-    if not isinstance(url, str):
+def _validate_url(
+    url: object,
+    approved_hosts: frozenset[str],
+    *,
+    redirect_target: bool = False,
+) -> str:
+    if not isinstance(url, str) or any(
+        ord(character) < 32 or ord(character) == 127 for character in url
+    ):
         raise _StageFailure("unsafe_url")
     try:
         parsed = urlsplit(url)
@@ -689,12 +676,66 @@ def _validate_url(url: object, approved_hosts: frozenset[str]) -> str:
         or parsed.username is not None
         or parsed.password is not None
         or port not in (None, 443)
-        or parsed.query
         or parsed.fragment
         or not parsed.path.startswith("/")
     ):
         raise _StageFailure("unsafe_url")
+    _validate_raw_path(parsed.path)
+    if parsed.query and (
+        not redirect_target
+        or not any(
+            host == policy_host and parsed.path.startswith(path_prefix)
+            for policy_host, path_prefix in REFERENCE_SIGNED_REDIRECT_POLICY
+        )
+    ):
+        raise _StageFailure("unsafe_url")
     return host
+
+
+def _validate_raw_path(path: str) -> None:
+    """Reject path spellings that could change meaning across URL parsers."""
+    lowered = path.lower()
+    if (
+        "\\" in path
+        or any(ord(character) < 32 or ord(character) == 127 for character in path)
+        or re.search(r"%(?![0-9a-fA-F]{2})", path)
+        or any(token in lowered for token in ("%2f", "%5c", "%2e"))
+        or any(segment in {".", ".."} for segment in path.split("/"))
+    ):
+        raise _StageFailure("unsafe_url")
+
+
+def open_validated_url(
+    initial_url: str,
+    *,
+    approved_hosts: frozenset[str],
+    resolver: Resolver,
+    fetcher: Fetcher,
+) -> FetchResponse:
+    """Open one query-free origin through the shared fail-closed redirect policy."""
+    current = initial_url
+    for redirect_count in range(MAX_REDIRECTS + 1):
+        host = _validate_url(current, approved_hosts, redirect_target=redirect_count > 0)
+        try:
+            resolved = tuple(resolver.resolve(host))
+        except Exception as exc:
+            raise _StageFailure("resolution_failed") from exc
+        if not resolved or any(not _public_address(address) for address in resolved):
+            raise _StageFailure("unsafe_address")
+        response = fetcher.open(current, resolved_addresses=resolved, proxies_disabled=True)
+        if not _public_address(response.peer_address) or not any(
+            _same_address(response.peer_address, address) for address in resolved
+        ):
+            raise _StageFailure("peer_address_drift")
+        if response.status in {301, 302, 303, 307, 308}:
+            if response.location is None or redirect_count == MAX_REDIRECTS:
+                raise _StageFailure("redirect_drift")
+            current = urljoin(current, response.location)
+            continue
+        if response.status != 200 or response.location is not None:
+            raise _StageFailure("unexpected_http_status")
+        return response
+    raise _StageFailure("redirect_drift")
 
 
 def execute_reference_request(
