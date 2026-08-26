@@ -242,6 +242,12 @@ use. If a validator reproduces a complete receipt but omits an approved field fr
 extend the narrow validated projection; do not make the consumer reread the receipt, call the SDK
 again, or assume the validator returned the original nested schema.
 
+Cross-platform tree receipts must separate logical relative-path identity from platform-specific
+filesystem I/O. On Windows, enumerate, inspect, resolve, stat, and hash through extended-length
+paths so files beyond the legacy 260-character limit are not silently omitted. Resolve the scan
+root once, reject every symlink or reparse point, and require each resolved target to remain beneath
+that root before hashing; WSL must reproduce the same complete file count, byte total, and digest.
+
 ## Why This Matters
 
 These invariants make silent policy drift, config mutation, preflight failure loss, and concurrent overspend observable or impossible. They also let later agents resume from durable state without inheriting hidden judgment from an earlier session.

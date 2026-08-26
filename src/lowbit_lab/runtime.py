@@ -8,6 +8,7 @@ import os
 import platform
 import re
 import shutil
+import stat as stat_module
 import subprocess
 import sys
 from collections.abc import Mapping
@@ -462,23 +463,31 @@ def _tree_receipt(root: Path, package_root: Path) -> dict[str, Any]:
     digest = hashlib.sha256()
     file_count = 0
     byte_count = 0
-    for path in sorted(package_root.rglob("*"), key=lambda item: item.as_posix()):
-        if path.is_symlink():
+    scan_root = _runtime_tree_io_path(package_root)
+    resolved_scan_root = scan_root.resolve()
+    for io_path in sorted(scan_root.rglob("*"), key=lambda item: item.as_posix()):
+        metadata = io_path.lstat()
+        if os.name == "nt" and (
+            getattr(metadata, "st_file_attributes", 0)
+            & stat_module.FILE_ATTRIBUTE_REPARSE_POINT
+        ):
+            raise RuntimeContractError("package tree contains a reparse point")
+        if stat_module.S_ISLNK(metadata.st_mode):
             raise RuntimeContractError("package tree contains a symbolic link")
-        if not path.is_file():
+        if not stat_module.S_ISREG(metadata.st_mode):
             continue
-        resolved = path.resolve()
-        if not resolved.is_relative_to(resolved_package_root):
+        resolved = io_path.resolve()
+        if not resolved.is_relative_to(resolved_scan_root):
             raise RuntimeContractError("package tree path escape")
-        relative = resolved.relative_to(resolved_package_root).as_posix().encode()
-        stat = resolved.stat()
+        relative_path = resolved.relative_to(resolved_scan_root)
+        relative = relative_path.as_posix().encode()
         content_digest = _sha256_file(resolved)
         digest.update(len(relative).to_bytes(4, "big"))
         digest.update(relative)
-        digest.update(stat.st_size.to_bytes(8, "big"))
+        digest.update(metadata.st_size.to_bytes(8, "big"))
         digest.update(bytes.fromhex(content_digest))
         file_count += 1
-        byte_count += stat.st_size
+        byte_count += metadata.st_size
     if file_count == 0:
         raise RuntimeContractError("package tree is empty")
     return {
@@ -487,6 +496,20 @@ def _tree_receipt(root: Path, package_root: Path) -> dict[str, Any]:
         "size_bytes": byte_count,
         "sha256": digest.hexdigest(),
     }
+
+
+def _windows_extended_path_text(value: str) -> str:
+    if value.startswith("\\\\?\\"):
+        return value
+    if value.startswith("\\\\"):
+        return "\\\\?\\UNC\\" + value[2:]
+    return "\\\\?\\" + value
+
+
+def _runtime_tree_io_path(path: Path) -> Path:
+    if os.name != "nt":
+        return path
+    return Path(_windows_extended_path_text(str(path.absolute())))
 
 
 def _normalize_distribution_name(value: Any) -> str:

@@ -174,3 +174,22 @@ that field, but the consumer incorrectly assumed the original nested receipt sha
 
 Simplify review found the narrow projection to be the smallest safe change. Independent review and
 the exact-result test verify the consumer receives only validated summary data.
+
+## 2026-08-26 cross-platform runtime-tree review
+
+Native WSL verification exposed four deeply nested public Torch license files that Windows found
+but treated as non-files beyond its legacy path limit. The earlier Windows receipt contained 22,255
+files; the complete tree contains 22,259.
+
+- Reproducibility and lineage: Windows tree traversal now uses extended-length paths for enumeration,
+  metadata, resolution, and content hashing while retaining platform-neutral relative-path identity.
+- Modal safety and containment: the fix is wholly local and precedes reservation or provider contact.
+- Local RTX 5080 compatibility: interpreter, distributions, executable digest, CUDA build, driver,
+  device capability, and memory observations already matched across Windows and WSL.
+- Security and private-data handling: all symlinks and Windows reparse points fail closed, and every
+  resolved file must remain beneath the resolved package root before its bytes are read.
+- Research-loop support: the ignored receipt will be regenerated only after merged code includes all
+  runtime files; configured 262,144 context remains distinct from unproven useful context.
+
+Independent review found and fixed a lexical-confinement regression and a per-file root-resolution
+cost. Windows tests cover both a file beyond 260 characters and a junction escape.
