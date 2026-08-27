@@ -38,6 +38,7 @@ from lowbit_lab.reference_bootstrap import (
     validate_bootstrap_request_bytes,
     validate_image_lock,
 )
+from lowbit_lab.reference_contract import REFERENCE_APP_NAME
 from lowbit_lab.reference_execution import ReferenceDeadlineAbort, ReferenceExecution
 from lowbit_lab.reference_harness import (
     ReferenceHarnessError,
@@ -580,7 +581,7 @@ def prepare_local_modal_graph(capability: ReferenceModalCapability) -> PreparedM
 
         prepared = prepare_serialized_remote_callable()
         image = _image_from_lock(modal, capability.image_lock)
-        app = modal.App("low-bit-lab-reference-u8", image=image, include_source=False)
+        app = modal.App(REFERENCE_APP_NAME, image=image, include_source=False)
         remote = app.function(
             image=image,
             gpu="A100-80GB:1",

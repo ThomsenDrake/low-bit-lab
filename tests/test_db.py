@@ -2141,6 +2141,10 @@ _ZERO_BILLING_AUTHORITY_BYTES = json.dumps(
         "attribution_method_sha256": "2" * 64,
         "authoritative_report_identity_sha256": "1" * 64,
         "billing_completeness_delay_seconds": 3600,
+        "environment_scope_sha256": "9" * 64,
+        "kind": "provider_billing_authority_contract",
+        "provider": "modal",
+        "schema_version": 2,
     },
     sort_keys=True,
     separators=(",", ":"),
@@ -2515,6 +2519,251 @@ def test_replacement_boundary_revalidates_exact_auth_receipt_bytes(tmp_path: Pat
             occurred_at="2026-08-22T02:02:00+00:00",
         )
     assert database.reference_replacement_entitlement()["state"] == "available"
+
+
+def _audit_block_replacement(database: ResultsDatabase, suffix: str) -> str:
+    original = f"{suffix}-original"
+    child = f"{suffix}-child"
+    _audit_block_preidentity(database, original)
+    entitlement_sha256 = _settle_preidentity(database, original)
+    auth_receipt = _preidentity_evidence(original)[4]
+    def bind_billing(raw: dict[str, object]) -> None:
+        provider = raw["provider"]
+        assert isinstance(provider, dict)
+        provider["billing_authority_sha256"] = hashlib.sha256(
+            _ZERO_BILLING_AUTHORITY_BYTES
+        ).hexdigest()
+
+    _reserve(
+        database,
+        suffix=child,
+        mutate_config=bind_billing,
+        replacement_entitlement_sha256=entitlement_sha256,
+        started_at="2026-08-22T02:01:00+00:00",
+        lease_expires_at="2026-08-22T02:10:00+00:00",
+        approval_expires_at="2026-08-22T03:00:00+00:00",
+    )
+    with _reconciliation_context(original):
+        database.mark_reference_replacement_submission_pending(
+            f"reservation-{child}",
+            entitlement_sha256=entitlement_sha256,
+            owner_id="owner",
+            recovery_authority_sha256=REFERENCE_RECOVERY_AUTHORITY_SHA256,
+            auth_receipt_bytes=auth_receipt,
+            auth_binding_sha256="6" * 64,
+            original_workspace_scope_sha256="8" * 64,
+            authenticated_workspace_identity_sha256="7" * 64,
+            workspace_reconciliation_authority_sha256=_test_reconciliation_sha256(original),
+            authority_root=_authority_root(database),
+            occurred_at="2026-08-22T02:02:00+00:00",
+        )
+    database.mark_reference_audit_blocked(
+        f"reservation-{child}",
+        owner_id="owner",
+        reason="provider boundary uncertainty: InvalidError",
+        occurred_at="2026-08-22T02:03:00+00:00",
+    )
+    return entitlement_sha256
+
+
+def _replacement_billing_evidence(
+    suffix: str, entitlement_sha256: str, actual: str
+) -> tuple[bytes, bytes, bytes, bytes, bytes]:
+    app_id = "ap-" + "A" * 22
+    original = f"{suffix}-original"
+    child = f"{suffix}-child"
+
+    def auth(nonce: str) -> bytes:
+        return json.dumps(
+            {
+                "authenticated_at": "2026-08-22T04:00:30+00:00",
+                "authenticated_workspace_identity_sha256": "7" * 64,
+                "binding_sha256": "6" * 64,
+                "kind": "reference_modal_workspace_auth_receipt",
+                "method_sha256": AUTH_METHOD_SHA256,
+                "original_workspace_scope_sha256": "8" * 64,
+                "provider": "modal",
+                "reconciliation_authority_sha256": _test_reconciliation_sha256(original),
+                "schema_version": 2,
+                "verification_nonce_sha256": nonce * 64,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+
+    pre, post = auth("a"), auth("b")
+    app = json.dumps(
+        {
+            "app_id": app_id,
+            "created_at": "2026-08-22T02:02:20+00:00",
+            "kind": "reference_replacement_stopped_app_evidence",
+            "schema_version": 1,
+            "state": "stopped",
+            "stopped_at": "2026-08-22T02:03:30+00:00",
+            "running_tasks": 0,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    report = json.dumps(
+        {
+            "kind": "reference_replacement_filtered_billing_report",
+            "rows": [
+                {
+                    "cost": actual,
+                    "interval_start": "2026-08-22T02:00:00+00:00",
+                    "object_id": app_id,
+                    "resource": "cpu",
+                }
+            ],
+            "schema_version": 1,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    receipt = json.dumps(
+        {
+            "acquired_at": "2026-08-22T04:01:00+00:00",
+            "actual_cost_usd": actual,
+            "app_evidence_sha256": hashlib.sha256(app).hexdigest(),
+            "authenticated_workspace_identity_sha256": "7" * 64,
+            "auth_binding_sha256": "6" * 64,
+            "authoritative_report_identity_sha256": "1" * 64,
+            "billing_authority_sha256": hashlib.sha256(
+                _ZERO_BILLING_AUTHORITY_BYTES
+            ).hexdigest(),
+            "billing_method_sha256": "2" * 64,
+            "completeness_delay_seconds": 3600,
+            "entitlement_sha256": entitlement_sha256,
+            "environment_scope_sha256": "9" * 64,
+            "execution_scope_sha256": _test_reconciliation(original)[
+                "original_execution_scope_sha256"
+            ],
+            "filtered_report_sha256": hashlib.sha256(report).hexdigest(),
+            "filtered_report_size_bytes": len(report),
+            "kind": "reference_replacement_billing_settlement",
+            "post_auth_receipt_sha256": hashlib.sha256(post).hexdigest(),
+            "pre_auth_receipt_sha256": hashlib.sha256(pre).hexdigest(),
+            "provider": "modal",
+            "query_end": "2026-08-22T03:00:00+00:00",
+            "query_start": "2026-08-22T02:00:00+00:00",
+            "reservation_id": f"reservation-{child}",
+            "schema_version": 1,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    return receipt, app, report, pre, post
+
+
+@pytest.mark.parametrize(
+    ("actual", "over_cap"), [("0", False), ("0.01", False), ("4.01", True)]
+)
+def test_replacement_billing_settlement_is_atomic_and_records_exact_cost(
+    tmp_path: Path, actual: str, over_cap: bool
+) -> None:
+    suffix = f"billing-{'over' if over_cap else 'within'}"
+    database = ResultsDatabase(tmp_path / f"{suffix}.sqlite")
+    database.initialize()
+    entitlement = _audit_block_replacement(database, suffix)
+    receipt, app, report, pre, post = _replacement_billing_evidence(
+        suffix, entitlement, actual
+    )
+    def call() -> str:
+        return database.settle_reference_replacement_billing(
+            receipt,
+            app,
+            report,
+            pre_auth_receipt_bytes=pre,
+            post_auth_receipt_bytes=post,
+            billing_authority_bytes=_ZERO_BILLING_AUTHORITY_BYTES,
+            occurred_at="2026-08-22T04:01:01+00:00",
+        )
+    if over_cap:
+        with pytest.raises(DatabaseError, match="budget failure"):
+            call()
+    else:
+        assert call() == hashlib.sha256(receipt).hexdigest()
+    reservation = database.get_reservation(f"reservation-{suffix}-child")
+    assert reservation["status"] == "failed"
+    assert reservation["provider_actual_cost_usd"] == actual
+    assert reservation["app_identity"] == "ap-" + "A" * 22
+    with pytest.raises(DatabaseError):
+        call()
+
+
+def test_replacement_billing_settlement_rejects_inconsistent_run_state(tmp_path: Path) -> None:
+    suffix = "billing-completed"
+    database = ResultsDatabase(tmp_path / f"{suffix}.sqlite")
+    database.initialize()
+    entitlement = _audit_block_replacement(database, suffix)
+    receipt, app, report, pre, post = _replacement_billing_evidence(
+        suffix, entitlement, "0.01"
+    )
+    reservation_id = f"reservation-{suffix}-child"
+    with database.connect() as connection:
+        connection.execute(
+            """UPDATE experiments SET status = 'completed', ended_at = ?,
+                modal_cost_actual_usd = '0' WHERE run_id = ?""",
+            ("2026-08-22T03:30:00+00:00", f"run-{suffix}-child"),
+        )
+
+    with pytest.raises(DatabaseError, match="run state"):
+        database.settle_reference_replacement_billing(
+            receipt,
+            app,
+            report,
+            pre_auth_receipt_bytes=pre,
+            post_auth_receipt_bytes=post,
+            billing_authority_bytes=_ZERO_BILLING_AUTHORITY_BYTES,
+            occurred_at="2026-08-22T04:01:01+00:00",
+        )
+
+    reservation = database.get_reservation(reservation_id)
+    assert reservation["status"] == "audit_blocked"
+    assert reservation["provider_actual_cost_usd"] is None
+    with database.connect_readonly() as connection:
+        transitions = connection.execute(
+            "SELECT COUNT(*) FROM state_transitions WHERE run_id = ? AND to_state = 'failed'",
+            (f"run-{suffix}-child",),
+        ).fetchone()[0]
+    assert transitions == 0
+
+
+def test_replacement_billing_settlement_binds_environment_scope(tmp_path: Path) -> None:
+    suffix = "billing-environment"
+    database = ResultsDatabase(tmp_path / f"{suffix}.sqlite")
+    database.initialize()
+    entitlement = _audit_block_replacement(database, suffix)
+    receipt, app, report, pre, post = _replacement_billing_evidence(
+        suffix, entitlement, "0.01"
+    )
+    run_id = f"run-{suffix}-child"
+    with database.connect() as connection:
+        config_json = connection.execute(
+            "SELECT config_json FROM experiments WHERE run_id = ?", (run_id,)
+        ).fetchone()[0]
+        config = json.loads(config_json)
+        config["provider"]["environment_scope_sha256"] = "8" * 64
+        connection.execute(
+            "UPDATE experiments SET config_json = ? WHERE run_id = ?",
+            (json.dumps(config, sort_keys=True, separators=(",", ":")), run_id),
+        )
+
+    with pytest.raises(DatabaseError, match="environment scope"):
+        database.settle_reference_replacement_billing(
+            receipt,
+            app,
+            report,
+            pre_auth_receipt_bytes=pre,
+            post_auth_receipt_bytes=post,
+            billing_authority_bytes=_ZERO_BILLING_AUTHORITY_BYTES,
+            occurred_at="2026-08-22T04:01:01+00:00",
+        )
+
+    reservation = database.get_reservation(f"reservation-{suffix}-child")
+    assert reservation["status"] == "audit_blocked"
+    assert reservation["provider_actual_cost_usd"] is None
 
 
 def test_v12_to_v13_migration_preserves_rows_and_adds_recovery_tables(tmp_path: Path) -> None:
