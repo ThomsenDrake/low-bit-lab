@@ -219,3 +219,29 @@ run, once:
 uv run --extra remote lowbit-reference-u8 --root . execute-replacement \
   --confirm-request-sha256 <exact-prepare-replacement-request-sha256>
 ```
+
+### App-attributed replacement settlement
+
+Use this path only for the single consumed replacement reservation when its sanitized failure is
+`provider boundary uncertainty: InvalidError`, it has no call identity, and the provider exposes one
+unique stopped app created inside the action window and reporting zero currently running tasks.
+That field is not lifetime task evidence. This path is read-only at Modal and does not restore the
+entitlement or authorize another action.
+
+Choose complete UTC-hour boundaries such that the start is no later than entitlement consumption,
+the end covers the latest durable boundary plus 2,700 seconds, and capture occurs at least 3,600
+seconds after the end. Then run from the exact merged clean WSL checkout:
+
+```text
+uv run --extra remote lowbit-reference-u8 --root . billing-capture-replacement \
+  --query-start <YYYY-MM-DDTHH:00:00Z> \
+  --query-end <YYYY-MM-DDTHH:00:00Z>
+uv run --extra remote lowbit-reference-u8 --root . settle-replacement
+uv run --extra remote lowbit-reference-u8 --root . status
+```
+
+The capture persists only the selected target-neutral app identity, its current running-task count,
+the approved provider-environment digest, and its filtered billing rows; other workspace
+descriptions and costs are discarded in memory. Any ambiguity, incomplete interval,
+workspace drift, noncanonical bytes, attribution mismatch, or over-cap cost stays terminal and must
+not produce a retry.

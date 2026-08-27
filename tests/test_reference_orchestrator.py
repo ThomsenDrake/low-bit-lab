@@ -691,6 +691,10 @@ def _write_billing_authority_fixture(root: Path) -> str:
                 "attribution_method_sha256": "b" * 64,
                 "authoritative_report_identity_sha256": "e" * 64,
                 "billing_completeness_delay_seconds": 3600,
+                "environment_scope_sha256": "d" * 64,
+                "kind": "provider_billing_authority_contract",
+                "provider": "modal",
+                "schema_version": 2,
             }
         ),
         encoding="utf-8",
@@ -924,12 +928,189 @@ def test_billing_capture_persists_exact_provider_snapshot(
     assert orchestrator._sha(post.read_bytes()) == billing_receipt["post_auth_receipt_sha256"]
 
 
+def test_replacement_capture_filters_private_workspace_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    authority_sha256 = _write_billing_authority_fixture(tmp_path)
+    app_id = "ap-" + "A" * 22
+    monkeypatch.setattr(orchestrator, "ResultsDatabase", lambda path: object())
+    monkeypatch.setattr(
+        orchestrator,
+        "_replacement_audit_row",
+        lambda database: {
+            "reservation_id": "replacement",
+            "reference_execution_scope_sha256": "c" * 64,
+            "billing_authority_sha256": authority_sha256,
+            "authoritative_report_identity_sha256": "e" * 64,
+            "billing_completeness_delay_seconds": 3600,
+            "entitlement_sha256": "f" * 64,
+            "consumed_at": "2026-08-26T14:27:54+00:00",
+            "heartbeat_at": "2026-08-26T14:29:27+00:00",
+            "auth_binding_sha256": "b" * 64,
+            "original_workspace_scope_sha256": "1" * 64,
+            "authenticated_workspace_identity_sha256": "2" * 64,
+        },
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "load_reference_job_config",
+        lambda path: SimpleNamespace(
+            provider={"environment": "low-bit-lab", "environment_scope_sha256": "d" * 64}
+        ),
+    )
+    auth_count = 0
+
+    def auth(*args: object, **kwargs: object) -> dict[str, str]:
+        nonlocal auth_count
+        auth_count += 1
+        return {
+            "authenticated_workspace_identity_sha256": "2" * 64,
+            "binding_sha256": "b" * 64,
+            "receipt_sha256": str(auth_count) * 64,
+        }
+
+    monkeypatch.setattr(orchestrator, "verify_workspace_auth", auth)
+    app_rows = [
+        {
+            "app_id": app_id,
+            "created_at": "2026-08-26T14:28:16+00:00",
+            "description": "low-bit-lab-reference-u8",
+            "state": "stopped",
+            "stopped_at": "2026-08-26T14:29:28+00:00",
+            "tasks": "0",
+        },
+        {
+            "app_id": "ap-" + "B" * 22,
+            "created_at": "2026-08-26T14:00:00+00:00",
+            "description": "private-project-name",
+            "state": "stopped",
+            "stopped_at": "2026-08-26T14:01:00+00:00",
+            "tasks": "0",
+        },
+    ]
+    billing_rows = [
+        {
+            "cost": "0.01",
+            "description": "low-bit-lab-reference-u8",
+            "environment": "low-bit-lab",
+            "interval_start": "2026-08-26T14:00:00+00:00",
+            "object_id": app_id,
+            "resource": "cpu",
+        },
+        {
+            "cost": "9.99",
+            "description": "private-project-name",
+            "environment": "low-bit-lab",
+            "interval_start": "2026-08-26T14:00:00+00:00",
+            "object_id": "ap-" + "B" * 22,
+            "resource": "cpu",
+        },
+    ]
+    monkeypatch.setattr(
+        orchestrator,
+        "_run_modal_cli",
+        lambda command, runner=None: json.dumps(
+            app_rows if command[0] == "app" else billing_rows
+        ).encode(),
+    )
+
+    result = orchestrator.capture_replacement_billing(
+        tmp_path,
+        query_start="2026-08-26T14:00:00Z",
+        query_end="2026-08-26T16:00:00Z",
+    )
+
+    assert result["actual_cost_usd"] == "0.01"
+    persisted = (tmp_path / orchestrator.REPLACEMENT_REPORT_PATH).read_bytes()
+    app_evidence = json.loads((tmp_path / orchestrator.REPLACEMENT_APP_EVIDENCE_PATH).read_bytes())
+    receipt = json.loads((tmp_path / orchestrator.REPLACEMENT_RECEIPT_PATH).read_bytes())
+    assert app_evidence["running_tasks"] == 0
+    assert "tasks" not in app_evidence
+    assert receipt["environment_scope_sha256"] == "d" * 64
+    assert b"private-project-name" not in persisted
+    assert b"9.99" not in persisted
+    assert json.loads(persisted)["rows"] == [
+        {
+            "cost": "0.01",
+            "interval_start": "2026-08-26T14:00:00+00:00",
+            "object_id": app_id,
+            "resource": "cpu",
+        }
+    ]
+    for field, value in (("cost", 0.01), ("resource", 1), ("resource", "")):
+        drifted_rows = [dict(row) for row in billing_rows]
+        drifted_rows[0][field] = value
+        monkeypatch.setattr(
+            orchestrator,
+            "_run_modal_cli",
+            lambda command, runner=None, rows=drifted_rows: json.dumps(
+                app_rows if command[0] == "app" else rows
+            ).encode(),
+        )
+        with pytest.raises(orchestrator.ReferenceOrchestratorError, match="type drift"):
+            orchestrator.capture_replacement_billing(
+                tmp_path,
+                query_start="2026-08-26T14:00:00Z",
+                query_end="2026-08-26T16:00:00Z",
+            )
+    ambiguous_rows = [dict(row) for row in billing_rows]
+    ambiguous_rows.append({**billing_rows[0], "object_id": "ap-" + "C" * 22})
+    monkeypatch.setattr(
+        orchestrator,
+        "_run_modal_cli",
+        lambda command, runner=None: json.dumps(
+            app_rows if command[0] == "app" else ambiguous_rows
+        ).encode(),
+    )
+    with pytest.raises(orchestrator.ReferenceOrchestratorError, match="ambiguous"):
+        orchestrator.capture_replacement_billing(
+            tmp_path,
+            query_start="2026-08-26T14:00:00Z",
+            query_end="2026-08-26T16:00:00Z",
+        )
+
+
 def test_local_settlement_source_has_no_submission_adapter_import() -> None:
     import inspect
 
     source = inspect.getsource(orchestrator.settle_workspace_zero)
     assert "reference_modal_adapter" not in source
     assert "submit_reference" not in source
+
+
+def test_replacement_settlement_rejects_oversized_report_before_database_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(orchestrator, "_require_merged_clean_main", lambda root: "a" * 40)
+
+    class NoDatabaseWrite:
+        def settle_reference_replacement_billing(self, *args: object, **kwargs: object) -> str:
+            raise AssertionError("database settlement must not start")
+
+    monkeypatch.setattr(orchestrator, "ResultsDatabase", lambda path: NoDatabaseWrite())
+    for path, content in (
+        (
+            orchestrator.REPLACEMENT_RECEIPT_PATH,
+            json.dumps(
+                {
+                    "actual_cost_usd": "0",
+                    "pre_auth_receipt_sha256": "a" * 64,
+                    "post_auth_receipt_sha256": "b" * 64,
+                }
+            ).encode(),
+        ),
+        (orchestrator.REPLACEMENT_APP_EVIDENCE_PATH, b"{}"),
+        (
+            orchestrator.REPLACEMENT_REPORT_PATH,
+            b" " * (orchestrator.MAX_FILTERED_BILLING_REPORT_BYTES + 1),
+        ),
+    ):
+        output = tmp_path / path
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_bytes(content)
+
+    with pytest.raises(orchestrator.ReferenceOrchestratorError, match="byte limit"):
+        orchestrator.settle_replacement_billing(tmp_path)
 
 
 def test_recovery_authority_materialization_is_create_once_and_offline(

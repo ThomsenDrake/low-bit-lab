@@ -16,6 +16,7 @@ from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit, urlunsplit
@@ -50,6 +51,7 @@ from lowbit_lab.provider_evidence import (
     DEFAULT_BILLING_AUTHORITY,
     DEFAULT_BILLING_RECEIPT,
     DEFAULT_BILLING_REPORT,
+    REPORT_FIELDS,
     validate_provider_capability_receipt,
 )
 from lowbit_lab.provider_evidence import (
@@ -73,12 +75,26 @@ from lowbit_lab.reference_bootstrap import (
     validate_bootstrap_request_bytes,
     validate_image_lock_bytes,
 )
-from lowbit_lab.reference_contract import REFERENCE_RESOURCES
+from lowbit_lab.reference_contract import (
+    REFERENCE_APP_NAME,
+    REFERENCE_REPLACEMENT_AUDIT_REASON,
+    REFERENCE_RESOURCES,
+)
+from lowbit_lab.reference_gates import ReferenceGateError, verify_provider_billing_authority
 from lowbit_lab.reference_provider_auth import (
     OFFICIAL_MODAL_SERVER_URL,
     auth_receipt_path,
     provider_environment_overrides_present,
     sanitized_modal_environment,
+)
+from lowbit_lab.reference_replacement_settlement import (
+    APP_KIND as REPLACEMENT_APP_KIND,
+)
+from lowbit_lab.reference_replacement_settlement import (
+    RECEIPT_KIND as REPLACEMENT_SETTLEMENT_KIND,
+)
+from lowbit_lab.reference_replacement_settlement import (
+    REPORT_KIND as REPLACEMENT_REPORT_KIND,
 )
 from lowbit_lab.reference_settlement import (
     AUTH_METHOD_SHA256,
@@ -105,7 +121,12 @@ AUTH_BINDING_PATH = Path("configs/local/reference-workspace-auth-binding.json")
 AUTH_RECEIPT_PATH = Path("reports/local/reference-workspace-auth-receipt.json")
 WORKSPACE_ZERO_REPORT_PATH = Path("reports/local/reference-preidentity-zero-report.json")
 WORKSPACE_ZERO_RECEIPT_PATH = Path("reports/local/reference-preidentity-zero-receipt.json")
+REPLACEMENT_APP_EVIDENCE_PATH = Path("reports/local/reference-replacement-app-evidence.json")
+REPLACEMENT_REPORT_PATH = Path("reports/local/reference-replacement-billing-report.json")
+REPLACEMENT_RECEIPT_PATH = Path("reports/local/reference-replacement-settlement-receipt.json")
 AUTH_MAXIMUM_AGE_SECONDS = AUTH_RECEIPT_MAXIMUM_AGE_SECONDS
+MAX_LOCAL_EVIDENCE_BYTES = 64 * 1024
+MAX_FILTERED_BILLING_REPORT_BYTES = 1_000_000
 if TYPE_CHECKING:
     from lowbit_lab.reference_modal_adapter import ReferenceModalCapability
 _SOURCE_FILES = {
@@ -146,6 +167,17 @@ def _read_json_bytes(path: Path, label: str) -> tuple[Mapping[str, object], byte
 
 def _read_json(path: Path, label: str) -> Mapping[str, object]:
     return _read_json_bytes(path, label)[0]
+
+
+def _read_bounded(path: Path, *, maximum_bytes: int, label: str) -> bytes:
+    try:
+        with path.open("rb") as handle:
+            content = handle.read(maximum_bytes + 1)
+    except OSError as exc:
+        raise ReferenceOrchestratorError(f"{label} is unavailable") from exc
+    if len(content) > maximum_bytes:
+        raise ReferenceOrchestratorError(f"{label} exceeds its byte limit")
+    return content
 
 
 def _write_atomic(root: Path, path: Path, content: bytes) -> None:
@@ -716,6 +748,294 @@ def settle_workspace_zero(root: Path) -> Mapping[str, object]:
     }
 
 
+def _replacement_audit_row(database: ResultsDatabase) -> Mapping[str, Any]:
+    with database.connect_readonly() as connection:
+        rows = connection.execute(
+            """SELECT br.reservation_id, br.reference_execution_scope_sha256,
+                br.billing_authority_sha256, br.authoritative_report_identity_sha256,
+                br.billing_completeness_delay_seconds, br.heartbeat_at,
+                rre.entitlement_sha256, rre.consumed_at,
+                rps.auth_binding_sha256, rws.original_workspace_scope_sha256,
+                rws.authenticated_workspace_identity_sha256
+            FROM budget_reservations AS br
+            JOIN reference_replacement_entitlements AS rre
+              ON rre.replacement_reservation_id = br.reservation_id
+            JOIN reference_preidentity_settlements AS rps
+              ON rps.settlement_sha256 = rre.settlement_sha256
+            JOIN reference_workspace_scope_reconciliations AS rws
+              ON rws.authority_sha256 = rre.workspace_reconciliation_authority_sha256
+            WHERE br.status = 'audit_blocked'
+              AND br.failure_reason = ?
+              AND br.provider_job_id IS NULL AND br.app_identity IS NULL
+              AND br.submitted_at IS NULL AND br.settlement_pending_at IS NULL
+              AND rre.state = 'consumed' LIMIT 2""",
+            (REFERENCE_REPLACEMENT_AUDIT_REASON,),
+        ).fetchall()
+    if len(rows) != 1:
+        raise ReferenceOrchestratorError("unique replacement audit reservation is unavailable")
+    return dict(rows[0])
+
+
+def _provider_json(raw: bytes, label: str) -> list[Mapping[str, object]]:
+    try:
+        value = json.loads(raw)
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise ReferenceOrchestratorError(f"{label} is not valid JSON") from exc
+    if not isinstance(value, list) or not all(isinstance(row, Mapping) for row in value):
+        raise ReferenceOrchestratorError(f"{label} schema drift")
+    return value
+
+
+def capture_replacement_billing(
+    root: Path,
+    *,
+    query_start: str,
+    query_end: str,
+    runner: Any | None = None,
+) -> Mapping[str, object]:
+    """Capture sanitized app-attributed billing without executing provider work."""
+    root = root.resolve()
+    _require_merged_clean_main(root)
+    if provider_environment_overrides_present():
+        raise ReferenceOrchestratorError("ambient provider environment override is forbidden")
+    start = _utc(query_start, "query start")
+    end = _utc(query_end, "query end")
+    if (
+        start >= end
+        or any((start.minute, start.second, start.microsecond))
+        or any((end.minute, end.second, end.microsecond))
+    ):
+        raise ReferenceOrchestratorError("billing interval must contain complete UTC hours")
+    database = ResultsDatabase(confine_results_db(root, DATABASE_PATH))
+    row = _replacement_audit_row(database)
+    consumed = _utc(str(row["consumed_at"]), "replacement consumed_at")
+    latest = _utc(str(row["heartbeat_at"]), "replacement heartbeat_at")
+    delay = int(row["billing_completeness_delay_seconds"])
+    if (
+        start > consumed
+        or end < latest + timedelta(seconds=int(REFERENCE_RESOURCES["timeout_seconds"]))
+        or datetime.now(UTC) < end + timedelta(seconds=delay)
+    ):
+        raise ReferenceOrchestratorError("replacement billing interval is incomplete")
+    config = load_reference_job_config(root / CONFIG_PATH)
+    environment = str(config.provider["environment"])
+    environment_scope_sha256 = str(config.provider["environment_scope_sha256"])
+    try:
+        authority = verify_provider_billing_authority(
+            root / DEFAULT_BILLING_AUTHORITY,
+            expected_sha256=str(row["billing_authority_sha256"]),
+            expected_environment_scope_sha256=environment_scope_sha256,
+        )
+    except ReferenceGateError as exc:
+        raise ReferenceOrchestratorError("billing authority lineage drift") from exc
+    if (
+        authority["authoritative_report_identity_sha256"]
+        != row["authoritative_report_identity_sha256"]
+        or authority["billing_completeness_delay_seconds"] != delay
+    ):
+        raise ReferenceOrchestratorError("billing authority lineage drift")
+    pre_auth = verify_workspace_auth(root, runner=runner, write_latest=False)
+    app_raw = _run_modal_cli(
+        ["app", "list", "--env", environment, "--json"], runner=runner
+    )
+    app_rows = _provider_json(app_raw, "provider app list")
+    candidates = [
+        item
+        for item in app_rows
+        if set(item) == {"app_id", "created_at", "description", "state", "stopped_at", "tasks"}
+        and item["description"] == REFERENCE_APP_NAME
+        and item["state"] == "stopped"
+        and item["tasks"] == "0"
+        and consumed
+        <= _utc(str(item["created_at"]), "app created_at")
+        <= consumed + timedelta(seconds=int(REFERENCE_RESOURCES["timeout_seconds"]))
+    ]
+    if len(candidates) != 1:
+        raise ReferenceOrchestratorError("unique stopped replacement app is unavailable")
+    app = candidates[0]
+    created = _utc(str(app["created_at"]), "app created_at")
+    stopped = _utc(str(app["stopped_at"]), "app stopped_at")
+    if stopped < created or stopped > consumed + timedelta(
+        seconds=int(REFERENCE_RESOURCES["timeout_seconds"])
+    ):
+        raise ReferenceOrchestratorError("replacement app timing drift")
+    billing_raw = _run_modal_cli(
+        [
+            "billing",
+            "report",
+            "--start",
+            start.isoformat().replace("+00:00", "Z"),
+            "--end",
+            end.isoformat().replace("+00:00", "Z"),
+            "--resolution",
+            "h",
+            "--show-resources",
+            "--json",
+        ],
+        runner=runner,
+    )
+    billing_rows = _provider_json(billing_raw, "provider billing report")
+    filtered: list[dict[str, object]] = []
+    total = Decimal("0")
+    for item in billing_rows:
+        if (
+            item.get("description") == REFERENCE_APP_NAME
+            and item.get("object_id") != app["app_id"]
+        ):
+            raise ReferenceOrchestratorError("replacement billing app identity is ambiguous")
+        if item.get("object_id") != app["app_id"]:
+            continue
+        if set(item) != REPORT_FIELDS or (
+            item["description"] != REFERENCE_APP_NAME
+            or item["environment"] != environment
+        ):
+            raise ReferenceOrchestratorError("replacement billing attribution drift")
+        if (
+            type(item["cost"]) is not str
+            or not item["cost"]
+            or type(item["resource"]) is not str
+            or not item["resource"]
+        ):
+            raise ReferenceOrchestratorError("replacement billing row type drift")
+        try:
+            cost = Decimal(item["cost"])
+        except InvalidOperation as exc:
+            raise ReferenceOrchestratorError("replacement billing cost is invalid") from exc
+        if not cost.is_finite() or cost < 0 or cost.as_tuple().exponent < -10:
+            raise ReferenceOrchestratorError("replacement billing cost is invalid")
+        interval = _utc(str(item["interval_start"]), "billing interval")
+        if interval < start or interval >= end:
+            raise ReferenceOrchestratorError("replacement billing interval drift")
+        total += cost
+        filtered.append(
+            {
+                "cost": item["cost"],
+                "interval_start": interval.isoformat(),
+                "object_id": app["app_id"],
+                "resource": item["resource"],
+            }
+        )
+    post_auth = verify_workspace_auth(root, runner=runner, write_latest=False)
+    if (
+        pre_auth["authenticated_workspace_identity_sha256"]
+        != post_auth["authenticated_workspace_identity_sha256"]
+        or pre_auth["authenticated_workspace_identity_sha256"]
+        != row["authenticated_workspace_identity_sha256"]
+        or pre_auth["binding_sha256"] != row["auth_binding_sha256"]
+        or post_auth["binding_sha256"] != row["auth_binding_sha256"]
+    ):
+        raise ReferenceOrchestratorError("Modal workspace changed during replacement capture")
+    app_evidence = canonical_bytes(
+        {
+            "app_id": app["app_id"],
+            "created_at": created.isoformat(),
+            "kind": REPLACEMENT_APP_KIND,
+            "schema_version": 1,
+            "state": "stopped",
+            "stopped_at": stopped.isoformat(),
+            "running_tasks": 0,
+        }
+    )
+    report = canonical_bytes(
+        {"kind": REPLACEMENT_REPORT_KIND, "rows": filtered, "schema_version": 1}
+    )
+    acquired_at = datetime.now(UTC).isoformat()
+    receipt = canonical_bytes(
+        {
+            "acquired_at": acquired_at,
+            "actual_cost_usd": str(total),
+            "app_evidence_sha256": _sha(app_evidence),
+            "authenticated_workspace_identity_sha256": row[
+                "authenticated_workspace_identity_sha256"
+            ],
+            "auth_binding_sha256": row["auth_binding_sha256"],
+            "authoritative_report_identity_sha256": row[
+                "authoritative_report_identity_sha256"
+            ],
+            "billing_authority_sha256": row["billing_authority_sha256"],
+            "billing_method_sha256": authority["attribution_method_sha256"],
+            "completeness_delay_seconds": delay,
+            "entitlement_sha256": row["entitlement_sha256"],
+            "environment_scope_sha256": environment_scope_sha256,
+            "execution_scope_sha256": row["reference_execution_scope_sha256"],
+            "filtered_report_sha256": _sha(report),
+            "filtered_report_size_bytes": len(report),
+            "kind": REPLACEMENT_SETTLEMENT_KIND,
+            "post_auth_receipt_sha256": post_auth["receipt_sha256"],
+            "pre_auth_receipt_sha256": pre_auth["receipt_sha256"],
+            "provider": "modal",
+            "query_end": end.isoformat(),
+            "query_start": start.isoformat(),
+            "reservation_id": row["reservation_id"],
+            "schema_version": 1,
+        }
+    )
+    for path, content in (
+        (REPLACEMENT_APP_EVIDENCE_PATH, app_evidence),
+        (REPLACEMENT_REPORT_PATH, report),
+        (REPLACEMENT_RECEIPT_PATH, receipt),
+    ):
+        _write_atomic(root, path, content)
+    return {
+        "actual_cost_usd": str(total),
+        "app_identity_sha256": _sha(str(app["app_id"]).encode()),
+        "provider_read_only_contacted": True,
+        "receipt_sha256": _sha(receipt),
+    }
+
+
+def settle_replacement_billing(root: Path) -> Mapping[str, object]:
+    """Settle the replacement from local sanitized snapshots only."""
+    root = root.resolve()
+    _require_merged_clean_main(root)
+    receipt_bytes = _read_bounded(
+        root / REPLACEMENT_RECEIPT_PATH,
+        maximum_bytes=MAX_LOCAL_EVIDENCE_BYTES,
+        label="replacement settlement receipt",
+    )
+    try:
+        receipt = json.loads(receipt_bytes)
+        pre_auth_sha256 = str(receipt["pre_auth_receipt_sha256"])
+        post_auth_sha256 = str(receipt["post_auth_receipt_sha256"])
+    except (KeyError, TypeError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ReferenceOrchestratorError("replacement settlement receipt is invalid") from exc
+    database = ResultsDatabase(confine_results_db(root, DATABASE_PATH))
+    settlement_sha256 = database.settle_reference_replacement_billing(
+        receipt_bytes,
+        _read_bounded(
+            root / REPLACEMENT_APP_EVIDENCE_PATH,
+            maximum_bytes=MAX_LOCAL_EVIDENCE_BYTES,
+            label="replacement app evidence",
+        ),
+        _read_bounded(
+            root / REPLACEMENT_REPORT_PATH,
+            maximum_bytes=MAX_FILTERED_BILLING_REPORT_BYTES,
+            label="replacement filtered billing report",
+        ),
+        pre_auth_receipt_bytes=_read_bounded(
+            root / auth_receipt_path(pre_auth_sha256),
+            maximum_bytes=MAX_LOCAL_EVIDENCE_BYTES,
+            label="replacement pre-auth receipt",
+        ),
+        post_auth_receipt_bytes=_read_bounded(
+            root / auth_receipt_path(post_auth_sha256),
+            maximum_bytes=MAX_LOCAL_EVIDENCE_BYTES,
+            label="replacement post-auth receipt",
+        ),
+        billing_authority_bytes=_read_bounded(
+            root / DEFAULT_BILLING_AUTHORITY,
+            maximum_bytes=MAX_LOCAL_EVIDENCE_BYTES,
+            label="replacement billing authority",
+        ),
+        occurred_at=datetime.now(UTC).isoformat(),
+    )
+    return {
+        "actual_cost_usd": str(receipt["actual_cost_usd"]),
+        "provider_contacted": False,
+        "settlement_receipt_sha256": settlement_sha256,
+    }
+
+
 def materialize_recovery_authority(root: Path) -> Mapping[str, str]:
     """Create the ignored canonical recovery authority without provider contact."""
     root = root.resolve()
@@ -760,7 +1080,12 @@ def reference_status(root: Path) -> Mapping[str, object]:
             ORDER BY br.created_at LIMIT 1"""
         ).fetchone()
         entitlements = connection.execute(
-            "SELECT entitlement_sha256, state FROM reference_replacement_entitlements LIMIT 2"
+            """SELECT rre.entitlement_sha256, rre.state, br.reservation_id,
+                br.status AS reservation_status, br.provider_actual_cost_usd,
+                br.app_identity
+            FROM reference_replacement_entitlements AS rre
+            LEFT JOIN budget_reservations AS br
+              ON br.reservation_id = rre.replacement_reservation_id LIMIT 2"""
         ).fetchall()
     if len(entitlements) > 1:
         raise ReferenceOrchestratorError("multiple replacement entitlements are invalid")
@@ -776,12 +1101,18 @@ def reference_status(root: Path) -> Mapping[str, object]:
             "slot_consumed": original["consumed_at"] is not None,
             "status": original["status"],
         },
-        "provider_contacted": False,
+        "provider_contacted": bool(
+            entitlement is not None and entitlement["reservation_id"] is not None
+        ),
         "proven_useful_context_tokens": None,
         "replacement": None
         if entitlement is None
         else {
             "entitlement_sha256": entitlement["entitlement_sha256"],
+            "actual_cost_usd": entitlement["provider_actual_cost_usd"],
+            "app_identity_bound": entitlement["app_identity"] is not None,
+            "reservation_id": entitlement["reservation_id"],
+            "reservation_status": entitlement["reservation_status"],
             "state": entitlement["state"],
         },
     }
@@ -1449,7 +1780,11 @@ def _parser() -> argparse.ArgumentParser:
     capture = sub.add_parser("billing-capture")
     capture.add_argument("--query-start", required=True)
     capture.add_argument("--query-end", required=True)
+    replacement_capture = sub.add_parser("billing-capture-replacement")
+    replacement_capture.add_argument("--query-start", required=True)
+    replacement_capture.add_argument("--query-end", required=True)
     sub.add_parser("settle-preidentity-zero")
+    sub.add_parser("settle-replacement")
     sub.add_parser("prepare-replacement")
     live = sub.add_parser("execute")
     live.add_argument("--confirm-request-sha256", required=True)
@@ -1527,8 +1862,23 @@ def main(argv: list[str] | None = None) -> int:
                 }
             )
             return 0
+        if command == "billing-capture-replacement":
+            emit(
+                {
+                    "ok": True,
+                    **capture_replacement_billing(
+                        args.root,
+                        query_start=args.query_start,
+                        query_end=args.query_end,
+                    ),
+                }
+            )
+            return 0
         if command == "settle-preidentity-zero":
             emit({"ok": True, **settle_workspace_zero(args.root)})
+            return 0
+        if command == "settle-replacement":
+            emit({"ok": True, **settle_replacement_billing(args.root)})
             return 0
         if command == "prepare-replacement":
             config, request, _, binding = prepare_replacement(args.root)

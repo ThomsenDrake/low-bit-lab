@@ -45,6 +45,7 @@ from lowbit_lab.reference_contract import (
     ORIGINAL_APPROVED_PLAN_SHA256,
     REFERENCE_CONFIG_SCHEMA_VERSION,
     REFERENCE_GATE_FIELDS,
+    REFERENCE_REPLACEMENT_AUDIT_REASON,
     REFERENCE_RESOURCES,
     reference_execution_scope_sha256,
 )
@@ -4438,6 +4439,188 @@ class ResultsDatabase:
                 ),
             )
         return entitlement_sha256
+
+    def settle_reference_replacement_billing(
+        self,
+        receipt_bytes: bytes,
+        app_evidence_bytes: bytes,
+        filtered_report_bytes: bytes,
+        *,
+        pre_auth_receipt_bytes: bytes,
+        post_auth_receipt_bytes: bytes,
+        billing_authority_bytes: bytes,
+        occurred_at: str,
+    ) -> str:
+        """Atomically settle the consumed replacement from app-attributed billing."""
+        from lowbit_lab.reference_replacement_settlement import (
+            ReplacementSettlementError,
+            validate_replacement_settlement,
+        )
+
+        self.initialize()
+        occurred = _database_timestamp(occurred_at, "occurred_at")
+        try:
+            selector = json.loads(receipt_bytes)
+            reservation_id = selector["reservation_id"]
+            authority = json.loads(billing_authority_bytes)
+        except (TypeError, KeyError, UnicodeError, json.JSONDecodeError) as exc:
+            raise DatabaseError("replacement settlement selector is invalid") from exc
+        if not isinstance(reservation_id, str) or not isinstance(authority, dict):
+            raise DatabaseError("replacement settlement selector is invalid")
+        if (
+            set(authority)
+            != {
+                "schema_version",
+                "kind",
+                "provider",
+                "environment_scope_sha256",
+                "attribution_method_sha256",
+                "authoritative_report_identity_sha256",
+                "billing_completeness_delay_seconds",
+            }
+            or authority.get("schema_version") != 2
+            or authority.get("kind") != "provider_billing_authority_contract"
+            or authority.get("provider") != "modal"
+        ):
+            raise DatabaseError("replacement billing authority is invalid")
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """SELECT br.run_id, br.reference_execution_scope_sha256,
+                    br.requested_cost_usd, br.status, br.failure_reason,
+                    br.provider_job_id, br.app_identity, br.submitted_at,
+                    br.settlement_pending_at, br.billing_authority_sha256,
+                    br.authoritative_report_identity_sha256,
+                    br.billing_completeness_delay_seconds, br.heartbeat_at,
+                    e.status AS run_status, e.config_json, rre.entitlement_sha256, rre.consumed_at,
+                    rps.auth_binding_sha256,
+                    rws.original_workspace_scope_sha256,
+                    rws.authenticated_workspace_identity_sha256,
+                    rws.authority_sha256 AS reconciliation_authority_sha256
+                FROM budget_reservations AS br
+                JOIN experiments AS e ON e.run_id = br.run_id
+                JOIN reference_replacement_entitlements AS rre
+                  ON rre.replacement_reservation_id = br.reservation_id
+                JOIN reference_workspace_scope_reconciliations AS rws
+                  ON rws.authority_sha256 = rre.workspace_reconciliation_authority_sha256
+                JOIN reference_preidentity_settlements AS rps
+                  ON rps.settlement_sha256 = rre.settlement_sha256
+                WHERE br.reservation_id = ? AND rre.state = 'consumed'""",
+                (reservation_id,),
+            ).fetchone()
+            if (
+                row is None
+                or row["status"] != "audit_blocked"
+                or row["failure_reason"] != REFERENCE_REPLACEMENT_AUDIT_REASON
+                or row["provider_job_id"] is not None
+                or row["app_identity"] is not None
+                or row["submitted_at"] is not None
+                or row["settlement_pending_at"] is not None
+                or hashlib.sha256(billing_authority_bytes).hexdigest()
+                != row["billing_authority_sha256"]
+                or authority.get("authoritative_report_identity_sha256")
+                != row["authoritative_report_identity_sha256"]
+                or authority.get("billing_completeness_delay_seconds")
+                != row["billing_completeness_delay_seconds"]
+            ):
+                raise DatabaseError("replacement reservation is not settlement-eligible")
+            try:
+                config = json.loads(row["config_json"])
+                environment_scope_sha256 = config["provider"]["environment_scope_sha256"]
+                if environment_scope_sha256 != authority["environment_scope_sha256"]:
+                    raise DatabaseError("replacement billing environment scope lineage drift")
+                evidence = validate_replacement_settlement(
+                    receipt_bytes,
+                    app_evidence_bytes,
+                    filtered_report_bytes,
+                    pre_auth_receipt_bytes=pre_auth_receipt_bytes,
+                    post_auth_receipt_bytes=post_auth_receipt_bytes,
+                    expected_reservation_id=reservation_id,
+                    expected_execution_scope_sha256=row[
+                        "reference_execution_scope_sha256"
+                    ],
+                    expected_entitlement_sha256=row["entitlement_sha256"],
+                    expected_environment_scope_sha256=environment_scope_sha256,
+                    expected_original_workspace_scope_sha256=row[
+                        "original_workspace_scope_sha256"
+                    ],
+                    expected_workspace_identity_sha256=row[
+                        "authenticated_workspace_identity_sha256"
+                    ],
+                    expected_reconciliation_authority_sha256=row[
+                        "reconciliation_authority_sha256"
+                    ],
+                    expected_auth_binding_sha256=row["auth_binding_sha256"],
+                    expected_billing_authority_sha256=row["billing_authority_sha256"],
+                    expected_billing_method_sha256=authority["attribution_method_sha256"],
+                    expected_report_identity_sha256=row[
+                        "authoritative_report_identity_sha256"
+                    ],
+                    action_consumed_at=_database_timestamp(
+                        row["consumed_at"], "replacement consumed_at"
+                    ),
+                    latest_boundary_at=_database_timestamp(
+                        row["heartbeat_at"], "replacement heartbeat_at"
+                    ),
+                    maximum_action_seconds=int(REFERENCE_RESOURCES["timeout_seconds"]),
+                    expected_completeness_delay_seconds=row[
+                        "billing_completeness_delay_seconds"
+                    ],
+                    validated_at=occurred,
+                )
+            except (KeyError, TypeError, json.JSONDecodeError, ReplacementSettlementError) as exc:
+                raise DatabaseError("replacement billing evidence validation failed") from exc
+            if row["run_status"] != "created":
+                raise DatabaseError("replacement run state is not settlement-eligible")
+            if occurred < evidence.acquired_at:
+                raise DatabaseError("replacement settlement time is backdated")
+            actual = _database_actual_money(evidence.actual_cost_usd, "actual_cost_usd")
+            over_cap = actual > _database_money(row["requested_cost_usd"], "requested_cost_usd")
+            failure_reason = (
+                "authoritative provider actual cost exceeds the USD 4.00 local reservation; "
+                "budget failure"
+                if over_cap
+                else "reference provider action failed before call identity persistence"
+            )
+            cursor = connection.execute(
+                """UPDATE budget_reservations SET status = ?, app_identity = ?,
+                    provider_actual_cost_usd = ?, settlement_pending_at = ?,
+                    settlement_identity = ?, failure_reason = ?, heartbeat_at = ?, updated_at = ?
+                WHERE reservation_id = ? AND status = 'audit_blocked'
+                  AND app_identity IS NULL AND provider_job_id IS NULL
+                  AND settlement_pending_at IS NULL""",
+                (
+                    "failed",
+                    evidence.app_id,
+                    evidence.actual_cost_usd,
+                    evidence.query_end.isoformat(),
+                    evidence.receipt_sha256,
+                    failure_reason,
+                    occurred_at,
+                    occurred_at,
+                    reservation_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise DatabaseError("replacement settlement lost its compare-and-set")
+            run_cursor = connection.execute(
+                """UPDATE experiments SET status = 'failed', modal_cost_actual_usd = ?,
+                    failure_reason = ?, ended_at = ? WHERE run_id = ? AND status = 'created'""",
+                (evidence.actual_cost_usd, failure_reason, occurred_at, row["run_id"]),
+            )
+            if run_cursor.rowcount != 1:
+                raise DatabaseError("replacement run settlement lost its compare-and-set")
+            connection.execute(
+                """INSERT INTO state_transitions(
+                    run_id, from_state, to_state, reason, occurred_at
+                ) VALUES (?, 'created', 'failed', ?, ?)""",
+                (row["run_id"], failure_reason, occurred_at),
+            )
+        if over_cap:
+            raise DatabaseError(
+                "authoritative provider cost was recorded as a terminal budget failure"
+            )
+        return evidence.receipt_sha256
 
     def reference_replacement_entitlement(self) -> dict[str, Any] | None:
         """Return the immutable replacement slot without mutating authority."""
