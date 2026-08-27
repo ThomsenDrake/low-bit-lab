@@ -7,6 +7,7 @@ intentionally not copied into the remote image.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import json
@@ -98,7 +99,9 @@ class ReferenceModalCapability:
     image_lock: Mapping[str, object]
     replacement_entitlement_sha256: str | None = None
     recovery_authority_sha256: str | None = None
-    replacement_workspace_scope_sha256: str | None = None
+    replacement_original_workspace_scope_sha256: str | None = None
+    replacement_authenticated_workspace_identity_sha256: str | None = None
+    workspace_reconciliation_authority_sha256: str | None = None
     replacement_auth_binding_sha256: str | None = None
 
 
@@ -581,7 +584,7 @@ def _mark_submission_pending(
     replacement_auth_receipt_bytes: bytes | None = None,
 ) -> None:
     """Consume either the original slot or its one replacement at the same boundary."""
-    replacement_entitlement_sha256 = getattr(capability, "replacement_entitlement_sha256", None)
+    replacement_entitlement_sha256 = capability.replacement_entitlement_sha256
     if replacement_entitlement_sha256 is None:
         database.mark_reference_submission_pending(
             capability.reservation_id,
@@ -592,8 +595,20 @@ def _mark_submission_pending(
             occurred_at=occurred_at,
         )
         return
-    recovery_authority_sha256 = getattr(capability, "recovery_authority_sha256", None)
-    if recovery_authority_sha256 != REFERENCE_RECOVERY_AUTHORITY_SHA256:
+    recovery_authority_sha256 = capability.recovery_authority_sha256
+    original_workspace_scope_sha256 = capability.replacement_original_workspace_scope_sha256
+    authenticated_workspace_identity_sha256 = (
+        capability.replacement_authenticated_workspace_identity_sha256
+    )
+    reconciliation_authority_sha256 = capability.workspace_reconciliation_authority_sha256
+    auth_binding_sha256 = capability.replacement_auth_binding_sha256
+    if (
+        recovery_authority_sha256 != REFERENCE_RECOVERY_AUTHORITY_SHA256
+        or original_workspace_scope_sha256 is None
+        or authenticated_workspace_identity_sha256 is None
+        or reconciliation_authority_sha256 is None
+        or auth_binding_sha256 is None
+    ):
         raise ReferenceModalError("replacement recovery authority is invalid")
     database.mark_reference_replacement_submission_pending(
         capability.reservation_id,
@@ -601,17 +616,17 @@ def _mark_submission_pending(
         owner_id=capability.owner_id,
         recovery_authority_sha256=recovery_authority_sha256,
         auth_receipt_bytes=replacement_auth_receipt_bytes or b"",
-        auth_binding_sha256=str(getattr(capability, "replacement_auth_binding_sha256", "")),
-        workspace_scope_sha256=str(
-            getattr(capability, "replacement_workspace_scope_sha256", "")
-        ),
+        auth_binding_sha256=auth_binding_sha256,
+        original_workspace_scope_sha256=original_workspace_scope_sha256,
+        authenticated_workspace_identity_sha256=authenticated_workspace_identity_sha256,
+        workspace_reconciliation_authority_sha256=reconciliation_authority_sha256,
         authority_root=capability.authority_root,
         occurred_at=occurred_at,
     )
 
 
-def _validate_modal_sdk_boundary(capability: ReferenceModalCapability) -> None:
-    """Reproduce the audited SDK identity immediately before one-shot consumption."""
+def _validate_modal_sdk_boundary(capability: ReferenceModalCapability) -> str:
+    """Authenticate the exact cached SDK profile immediately before consumption."""
     try:
         request = validate_bootstrap_request_bytes(capability.bootstrap_request_bytes)
         request_raw = json.loads(request.canonical_json)
@@ -624,16 +639,32 @@ def _validate_modal_sdk_boundary(capability: ReferenceModalCapability) -> None:
             billing_receipt_path=capability.root / capability.billing_receipt_path,
             billing_report_path=capability.root / capability.billing_report_path,
         )
-        from modal.config import DEFAULT_SERVER_URL, config
+        from modal.config import (
+            DEFAULT_SERVER_URL,
+            _check_config,
+            _lookup_workspace,
+            _profile,
+            config,
+        )
 
+        _check_config()
         if (
             DEFAULT_SERVER_URL != OFFICIAL_MODAL_SERVER_URL
             or config.get("server_url", use_env=False) != OFFICIAL_MODAL_SERVER_URL
             or config.get("override_headers", use_env=False) not in (None, {})
         ):
             raise ReferenceModalError("provider profile transport is unsupported")
+        response = asyncio.run(
+            _lookup_workspace(
+                config.get("server_url", profile=_profile, use_env=False),
+                config.get("token_id", profile=_profile, use_env=False),
+                config.get("token_secret", profile=_profile, use_env=False),
+            )
+        )
+        identity_sha256 = _sha(response.username.encode("utf-8"))
     except Exception as exc:
         raise ReferenceModalError("provider SDK boundary identity drift") from exc
+    return identity_sha256
 
 
 def submit_reference(capability: ReferenceModalCapability) -> dict[str, object]:
@@ -698,13 +729,21 @@ def submit_reference(capability: ReferenceModalCapability) -> dict[str, object]:
             if provider_environment_overrides_present():
                 raise ReferenceModalError("ambient provider environment override is forbidden")
             auth = verify_workspace_auth(capability.root)
-            expected_scope = capability.replacement_workspace_scope_sha256
-            if auth["workspace_scope_sha256"] != expected_scope:
+            expected_original = capability.replacement_original_workspace_scope_sha256
+            expected_identity = capability.replacement_authenticated_workspace_identity_sha256
+            if (
+                auth["original_workspace_scope_sha256"] != expected_original
+                or auth["authenticated_workspace_identity_sha256"] != expected_identity
+                or auth["reconciliation_authority_sha256"]
+                != capability.workspace_reconciliation_authority_sha256
+            ):
                 raise ReferenceModalError("replacement workspace authentication drift")
             if auth["binding_sha256"] != capability.replacement_auth_binding_sha256:
                 raise ReferenceModalError("replacement auth binding drift")
             _validate_fresh_auth_receipt(
-                capability.root, expected_workspace_scope_sha256=str(expected_scope)
+                capability.root,
+                expected_original_workspace_scope_sha256=str(expected_original),
+                expected_authenticated_workspace_identity_sha256=str(expected_identity),
             )
             receipt_sha256 = str(auth["receipt_sha256"])
             boundary_auth_receipt_bytes = (
@@ -716,7 +755,13 @@ def submit_reference(capability: ReferenceModalCapability) -> dict[str, object]:
             raise ReferenceModalError("replacement boundary authentication failed") from exc
     if provider_environment_overrides_present():
         raise ReferenceModalError("ambient provider environment override is forbidden")
-    _validate_modal_sdk_boundary(capability)
+    sdk_workspace_identity_sha256 = _validate_modal_sdk_boundary(capability)
+    if (
+        capability.replacement_entitlement_sha256 is not None
+        and sdk_workspace_identity_sha256
+        != capability.replacement_authenticated_workspace_identity_sha256
+    ):
+        raise ReferenceModalError("replacement SDK workspace identity drift")
     submission_pending_at = datetime.now(UTC).isoformat()
     _mark_submission_pending(
         database,

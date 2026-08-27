@@ -23,7 +23,7 @@ FAILURE_CODE = "auth_before_provider_identity"
 # WSL-only, so bind the exact authoritative stdout bytes instead of normalizing.
 CANONICAL_EMPTY_REPORT = b"[]\n"
 AUTH_METHOD_SHA256 = hashlib.sha256(
-    b"modal-profile-current-before-and-after-with-local-digest-binding/v1"
+    b"modal-profile-current-before-and-after-with-reconciled-identity-binding/v2"
 ).hexdigest()
 AUTH_RECEIPT_MAXIMUM_AGE_SECONDS = 300
 _SAFE_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
@@ -32,7 +32,9 @@ _RECEIPT_FIELDS = {
     "kind",
     "provider",
     "recovery_authority_sha256",
-    "authenticated_workspace_scope_sha256",
+    "original_workspace_scope_sha256",
+    "authenticated_workspace_identity_sha256",
+    "workspace_reconciliation_authority_sha256",
     "auth_binding_sha256",
     "pre_auth_receipt_sha256",
     "post_auth_receipt_sha256",
@@ -64,7 +66,9 @@ _AUTH_RECEIPT_FIELDS = {
     "provider",
     "schema_version",
     "verification_nonce_sha256",
-    "workspace_scope_sha256",
+    "original_workspace_scope_sha256",
+    "authenticated_workspace_identity_sha256",
+    "reconciliation_authority_sha256",
 }
 
 
@@ -78,7 +82,9 @@ class WorkspaceZeroSettlementEvidence:
     report_sha256: str
     report_size_bytes: int
     recovery_authority_sha256: str
-    workspace_scope_sha256: str
+    original_workspace_scope_sha256: str
+    authenticated_workspace_identity_sha256: str
+    workspace_reconciliation_authority_sha256: str
     auth_binding_sha256: str
     pre_auth_receipt_sha256: str
     post_auth_receipt_sha256: str
@@ -99,7 +105,9 @@ class WorkspaceZeroSettlementEvidence:
 class WorkspaceAuthReceiptEvidence:
     receipt_sha256: str
     authenticated_at: datetime
-    workspace_scope_sha256: str
+    original_workspace_scope_sha256: str
+    authenticated_workspace_identity_sha256: str
+    reconciliation_authority_sha256: str
     binding_sha256: str
 
 
@@ -109,9 +117,7 @@ def _canonical_bytes(value: object) -> bytes:
     )
 
 
-def _parse_closed_json(
-    content: bytes, *, label: str, fields: set[str]
-) -> Mapping[str, Any]:
+def _parse_closed_json(content: bytes, *, label: str, fields: set[str]) -> Mapping[str, Any]:
     if not isinstance(content, bytes) or content.startswith(b"\xef\xbb\xbf"):
         raise ReferenceSettlementError(f"{label} must be canonical UTF-8 JSON")
 
@@ -141,15 +147,13 @@ def _parse_closed_json(
 
 
 def _parse_receipt(content: bytes) -> Mapping[str, Any]:
-    return _parse_closed_json(
-        content, label="workspace-zero receipt", fields=_RECEIPT_FIELDS
-    )
+    return _parse_closed_json(content, label="workspace-zero receipt", fields=_RECEIPT_FIELDS)
 
 
 def _parse_auth_receipt(content: bytes, label: str) -> Mapping[str, Any]:
     value = _parse_closed_json(content, label=label, fields=_AUTH_RECEIPT_FIELDS)
     if (
-        value["schema_version"] != 1
+        value["schema_version"] != 2
         or value["kind"] != "reference_modal_workspace_auth_receipt"
         or value["provider"] != "modal"
     ):
@@ -160,18 +164,32 @@ def _parse_auth_receipt(content: bytes, label: str) -> Mapping[str, Any]:
 def validate_workspace_auth_receipt(
     content: bytes,
     *,
-    expected_workspace_scope_sha256: str,
+    expected_original_workspace_scope_sha256: str,
+    expected_authenticated_workspace_identity_sha256: str,
+    expected_reconciliation_authority_sha256: str,
     expected_binding_sha256: str,
     validated_at: datetime,
     maximum_age_seconds: int,
 ) -> WorkspaceAuthReceiptEvidence:
     """Validate one exact canonical provider-local authentication receipt snapshot."""
     receipt = _parse_auth_receipt(content, "workspace auth receipt")
-    workspace = _expected_digest(
-        receipt["workspace_scope_sha256"],
-        expected_workspace_scope_sha256,
-        "workspace auth receipt workspace scope",
+    original_workspace = _expected_digest(
+        receipt["original_workspace_scope_sha256"],
+        expected_original_workspace_scope_sha256,
+        "workspace auth receipt original workspace scope",
     )
+    authenticated_identity = _expected_digest(
+        receipt["authenticated_workspace_identity_sha256"],
+        expected_authenticated_workspace_identity_sha256,
+        "workspace auth receipt authenticated identity",
+    )
+    reconciliation = _expected_digest(
+        receipt["reconciliation_authority_sha256"],
+        expected_reconciliation_authority_sha256,
+        "workspace auth receipt reconciliation authority",
+    )
+    if original_workspace == authenticated_identity:
+        raise ReferenceSettlementError("workspace reconciliation must preserve distinct identities")
     binding = _expected_digest(
         receipt["binding_sha256"],
         expected_binding_sha256,
@@ -195,7 +213,9 @@ def validate_workspace_auth_receipt(
     return WorkspaceAuthReceiptEvidence(
         receipt_sha256=hashlib.sha256(content).hexdigest(),
         authenticated_at=authenticated_at,
-        workspace_scope_sha256=workspace,
+        original_workspace_scope_sha256=original_workspace,
+        authenticated_workspace_identity_sha256=authenticated_identity,
+        reconciliation_authority_sha256=reconciliation,
         binding_sha256=binding,
     )
 
@@ -236,7 +256,9 @@ def validate_workspace_zero_settlement_evidence(
     pre_auth_receipt_bytes: bytes,
     post_auth_receipt_bytes: bytes,
     expected_recovery_authority_sha256: str,
-    expected_workspace_scope_sha256: str,
+    expected_original_workspace_scope_sha256: str,
+    expected_authenticated_workspace_identity_sha256: str,
+    expected_workspace_reconciliation_authority_sha256: str,
     expected_billing_authority_sha256: str,
     expected_billing_method_sha256: str,
     expected_report_identity_sha256: str,
@@ -250,7 +272,7 @@ def validate_workspace_zero_settlement_evidence(
     """Validate an exact empty complete workspace report without provider attribution."""
     receipt = _parse_receipt(receipt_bytes)
     if (
-        receipt["schema_version"] != 1
+        receipt["schema_version"] != 2
         or receipt["kind"] != RECEIPT_KIND
         or receipt["provider"] != "modal"
     ):
@@ -261,11 +283,23 @@ def validate_workspace_zero_settlement_evidence(
         expected_recovery_authority_sha256,
         "recovery authority",
     )
-    workspace = _expected_digest(
-        receipt["authenticated_workspace_scope_sha256"],
-        expected_workspace_scope_sha256,
-        "authenticated workspace scope",
+    original_workspace = _expected_digest(
+        receipt["original_workspace_scope_sha256"],
+        expected_original_workspace_scope_sha256,
+        "original workspace scope",
     )
+    authenticated_identity = _expected_digest(
+        receipt["authenticated_workspace_identity_sha256"],
+        expected_authenticated_workspace_identity_sha256,
+        "authenticated workspace identity",
+    )
+    reconciliation = _expected_digest(
+        receipt["workspace_reconciliation_authority_sha256"],
+        expected_workspace_reconciliation_authority_sha256,
+        "workspace reconciliation authority",
+    )
+    if original_workspace == authenticated_identity:
+        raise ReferenceSettlementError("workspace reconciliation must preserve distinct identities")
     auth_binding = _sha256(receipt["auth_binding_sha256"], "auth binding")
     pre_auth = _sha256(receipt["pre_auth_receipt_sha256"], "pre-auth receipt")
     post_auth = _sha256(receipt["post_auth_receipt_sha256"], "post-auth receipt")
@@ -281,8 +315,12 @@ def validate_workspace_zero_settlement_evidence(
         ("pre-auth", pre_auth_receipt),
         ("post-auth", post_auth_receipt),
     ):
-        if auth_receipt["workspace_scope_sha256"] != workspace:
-            raise ReferenceSettlementError(f"{label} workspace scope mismatch")
+        if auth_receipt["original_workspace_scope_sha256"] != original_workspace:
+            raise ReferenceSettlementError(f"{label} original workspace scope mismatch")
+        if auth_receipt["authenticated_workspace_identity_sha256"] != authenticated_identity:
+            raise ReferenceSettlementError(f"{label} authenticated workspace identity mismatch")
+        if auth_receipt["reconciliation_authority_sha256"] != reconciliation:
+            raise ReferenceSettlementError(f"{label} reconciliation authority mismatch")
         if auth_receipt["binding_sha256"] != auth_binding:
             raise ReferenceSettlementError(f"{label} auth binding mismatch")
         if auth_receipt["method_sha256"] != AUTH_METHOD_SHA256:
@@ -329,6 +367,13 @@ def validate_workspace_zero_settlement_evidence(
     )
     if not pre_authenticated_at <= post_authenticated_at <= acquired_at:
         raise ReferenceSettlementError("workspace-zero auth receipt ordering is invalid")
+    if (
+        (acquired_at - pre_authenticated_at).total_seconds()
+        > AUTH_RECEIPT_MAXIMUM_AGE_SECONDS
+        or (acquired_at - post_authenticated_at).total_seconds()
+        > AUTH_RECEIPT_MAXIMUM_AGE_SECONDS
+    ):
+        raise ReferenceSettlementError("workspace-zero auth receipt is stale")
     if not _hour_boundary(query_start) or not _hour_boundary(query_end) or query_start >= query_end:
         raise ReferenceSettlementError("workspace-zero query interval must contain full hours")
     if latest_durable_boundary.tzinfo is None or latest_durable_boundary.utcoffset() is None:
@@ -378,9 +423,8 @@ def validate_workspace_zero_settlement_evidence(
     if not isinstance(report_bytes, bytes):
         raise ReferenceSettlementError("workspace-zero report bytes are invalid")
     report_sha256 = hashlib.sha256(report_bytes).hexdigest()
-    if (
-        receipt["report_sha256"] != report_sha256
-        or receipt["report_size_bytes"] != len(report_bytes)
+    if receipt["report_sha256"] != report_sha256 or receipt["report_size_bytes"] != len(
+        report_bytes
     ):
         raise ReferenceSettlementError("workspace-zero report bytes do not match the receipt")
     if report_bytes != CANONICAL_EMPTY_REPORT:
@@ -391,7 +435,9 @@ def validate_workspace_zero_settlement_evidence(
         report_sha256=report_sha256,
         report_size_bytes=len(report_bytes),
         recovery_authority_sha256=recovery,
-        workspace_scope_sha256=workspace,
+        original_workspace_scope_sha256=original_workspace,
+        authenticated_workspace_identity_sha256=authenticated_identity,
+        workspace_reconciliation_authority_sha256=reconciliation,
         auth_binding_sha256=auth_binding,
         pre_auth_receipt_sha256=pre_auth,
         post_auth_receipt_sha256=post_auth,

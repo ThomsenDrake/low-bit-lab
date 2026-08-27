@@ -3,7 +3,9 @@ import json
 import sqlite3
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -18,6 +20,7 @@ from lowbit_lab.db import (
     ResultsDatabase,
     _committed_provider_cost,
 )
+from lowbit_lab.handoff import sha256_json
 from lowbit_lab.reference_authority import (
     AUTHORITY_PATH,
     BOOTSTRAP_AUTHORITY_PATH,
@@ -644,23 +647,35 @@ def test_standing_reference_setup_rolls_back_with_failed_reservation(tmp_path: P
         _reserve(database, suffix="rolled-back", standing_setup=True)
 
     with database.connect_readonly() as connection:
-        assert connection.execute(
-            "SELECT 1 FROM attempts WHERE attempt_id = 'attempt-rolled-back'"
-        ).fetchone() is None
-        assert connection.execute(
-            "SELECT count(*) FROM reference_approval_challenges"
-        ).fetchone()[0] == 1
+        assert (
+            connection.execute(
+                "SELECT 1 FROM attempts WHERE attempt_id = 'attempt-rolled-back'"
+            ).fetchone()
+            is None
+        )
+        assert (
+            connection.execute("SELECT count(*) FROM reference_approval_challenges").fetchone()[0]
+            == 1
+        )
 
 
 def _downgrade_v9_to_v8(path: Path) -> None:
     with sqlite3.connect(path) as connection:
         connection.execute("DROP TABLE reference_authority_slots")
-        connection.execute("UPDATE schema_info SET version = 8 WHERE version IN (10, 11, 12, 13)")
+        connection.execute(
+            "UPDATE schema_info SET version = 8 WHERE version IN (10, 11, 12, 13, 14)"
+        )
 
 
 def _downgrade_v10_to_v9(path: Path) -> None:
     with sqlite3.connect(path) as connection:
-        connection.execute("UPDATE schema_info SET version = 9 WHERE version IN (10, 11, 12, 13)")
+        connection.execute("PRAGMA foreign_keys = OFF")
+        connection.execute("DROP TABLE reference_replacement_entitlements")
+        connection.execute("DROP TABLE reference_preidentity_settlements")
+        connection.execute("DROP TABLE reference_workspace_scope_reconciliations")
+        connection.execute(
+            "UPDATE schema_info SET version = 9 WHERE version IN (10, 11, 12, 13, 14)"
+        )
 
 
 def _submit(database: ResultsDatabase, reservation_id: str, *, lease: str) -> None:
@@ -802,6 +817,9 @@ def _downgrade_populated_database_to_v4(path: Path) -> None:
             CREATE UNIQUE INDEX budget_reservations_active_experiment
             ON budget_reservations(experiment_id)
             WHERE status IN ('reserved', 'submitted', 'settlement_pending', 'audit_blocked');
+            DROP TABLE reference_replacement_entitlements;
+            DROP TABLE reference_preidentity_settlements;
+            DROP TABLE reference_workspace_scope_reconciliations;
             DROP TABLE controller_cycle_transitions;
             DROP TABLE controller_cycles;
             DELETE FROM schema_info;
@@ -1537,9 +1555,13 @@ def test_corrupt_v11_without_budget_ledger_fails_closed(tmp_path: Path) -> None:
         ResultsDatabase(path).initialize()
     with sqlite3.connect(path) as connection:
         assert connection.execute("SELECT max(version) FROM schema_info").fetchone()[0] == 12
-        assert connection.execute(
-            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='budget_reservations'"
-        ).fetchone()[0] == 0
+        assert (
+            connection.execute(
+                "SELECT count(*) FROM sqlite_master "
+                "WHERE type='table' AND name='budget_reservations'"
+            ).fetchone()[0]
+            == 0
+        )
 
 
 def test_controller_cycle_lifecycle_commits_artifact_with_fencing(tmp_path: Path) -> None:
@@ -2127,39 +2149,38 @@ _ZERO_BILLING_AUTHORITY_BYTES = json.dumps(
 
 def _preidentity_evidence(suffix: str) -> tuple[bytes, bytes, bytes, bytes, bytes]:
     execution_scope = reference_execution_scope_sha256(
-            source_revision="d" * 40,
-            weight_inventory_sha256="1" * 64,
-            evaluation_lock_sha256="4" * 64,
-            formula_authority_sha256="5" * 64,
-            formula_approval_sha256="8" * 64,
-            trust_override_sha256="3" * 64,
+        source_revision="d" * 40,
+        weight_inventory_sha256="1" * 64,
+        evaluation_lock_sha256="4" * 64,
+        formula_authority_sha256="5" * 64,
+        formula_approval_sha256="8" * 64,
+        trust_override_sha256="3" * 64,
     )
     report = CANONICAL_EMPTY_REPORT
+
     def auth_receipt(*, authenticated_at: str, nonce: str) -> bytes:
         value = {
             "authenticated_at": authenticated_at,
+            "authenticated_workspace_identity_sha256": "7" * 64,
             "binding_sha256": "6" * 64,
             "kind": "reference_modal_workspace_auth_receipt",
             "method_sha256": AUTH_METHOD_SHA256,
             "provider": "modal",
-            "schema_version": 1,
+            "original_workspace_scope_sha256": "8" * 64,
+            "reconciliation_authority_sha256": _test_reconciliation_sha256(suffix),
+            "schema_version": 2,
             "verification_nonce_sha256": nonce,
-            "workspace_scope_sha256": "8" * 64,
         }
         return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
 
-    pre_auth = auth_receipt(
-        authenticated_at="2026-08-22T01:59:00+00:00", nonce="7" * 64
-    )
-    post_auth = auth_receipt(
-        authenticated_at="2026-08-22T01:59:30+00:00", nonce="9" * 64
-    )
+    pre_auth = auth_receipt(authenticated_at="2026-08-22T01:59:00+00:00", nonce="7" * 64)
+    post_auth = auth_receipt(authenticated_at="2026-08-22T01:59:30+00:00", nonce="9" * 64)
     receipt = {
         "actual_cost_usd": "0",
         "acquired_at": "2026-08-22T02:00:00+00:00",
         "all_environments": True,
         "all_resources": True,
-        "authenticated_workspace_scope_sha256": "8" * 64,
+        "authenticated_workspace_identity_sha256": "7" * 64,
         "auth_binding_sha256": "6" * 64,
         "pre_auth_receipt_sha256": hashlib.sha256(pre_auth).hexdigest(),
         "post_auth_receipt_sha256": hashlib.sha256(post_auth).hexdigest(),
@@ -2172,6 +2193,7 @@ def _preidentity_evidence(suffix: str) -> tuple[bytes, bytes, bytes, bytes, byte
         "filters": [],
         "kind": "reference_workspace_zero_billing_evidence",
         "original_execution_scope_sha256": execution_scope,
+        "original_workspace_scope_sha256": "8" * 64,
         "pagination_complete": True,
         "provider": "modal",
         "query_end": "2026-08-22T01:00:00+00:00",
@@ -2181,7 +2203,8 @@ def _preidentity_evidence(suffix: str) -> tuple[bytes, bytes, bytes, bytes, byte
         "report_size_bytes": len(report),
         "reservation_id": f"reservation-{suffix}",
         "row_count": 0,
-        "schema_version": 1,
+        "schema_version": 2,
+        "workspace_reconciliation_authority_sha256": _test_reconciliation_sha256(suffix),
     }
     return (
         json.dumps(receipt, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode(),
@@ -2190,6 +2213,52 @@ def _preidentity_evidence(suffix: str) -> tuple[bytes, bytes, bytes, bytes, byte
         pre_auth,
         post_auth,
     )
+
+
+def _test_reconciliation(suffix: str) -> dict[str, object]:
+    execution_scope = reference_execution_scope_sha256(
+        source_revision="d" * 40,
+        weight_inventory_sha256="1" * 64,
+        evaluation_lock_sha256="4" * 64,
+        formula_authority_sha256="5" * 64,
+        formula_approval_sha256="8" * 64,
+        trust_override_sha256="3" * 64,
+    )
+    return {
+        "approved_base_commit": "f" * 40,
+        "authenticated_workspace_identity_sha256": "7" * 64,
+        "billing_authority_sha256": hashlib.sha256(_ZERO_BILLING_AUTHORITY_BYTES).hexdigest(),
+        "digest_equality_asserted": False,
+        "historical_config_rewrite": False,
+        "kind": "reference_modal_workspace_scope_reconciliation_authority",
+        "maximum_mapping_uses": 1,
+        "original_execution_scope_sha256": execution_scope,
+        "original_reservation_id": f"reservation-{suffix}",
+        "original_workspace_scope_sha256": "8" * 64,
+        "provider": "modal",
+        "replacement_action": "u8_reference_replacement_once",
+        "schema_version": 1,
+        "statement_sha256": "9" * 64,
+    }
+
+
+def _test_reconciliation_sha256(suffix: str) -> str:
+    return sha256_json(_test_reconciliation(suffix))
+
+
+@contextmanager
+def _reconciliation_context(suffix: str):
+    with (
+        patch(
+            "lowbit_lab.db.validate_workspace_scope_reconciliation_authority",
+            return_value=_test_reconciliation(suffix),
+        ),
+        patch(
+            "lowbit_lab.db.REFERENCE_WORKSPACE_RECONCILIATION_AUTHORITY_SHA256",
+            _test_reconciliation_sha256(suffix),
+        ),
+    ):
+        yield
 
 
 def _audit_block_preidentity(database: ResultsDatabase, suffix: str) -> None:
@@ -2219,15 +2288,16 @@ def _audit_block_preidentity(database: ResultsDatabase, suffix: str) -> None:
 
 def _settle_preidentity(database: ResultsDatabase, suffix: str) -> str:
     receipt, report, authority, pre_auth, post_auth = _preidentity_evidence(suffix)
-    return database.settle_reference_preidentity_zero(
-        receipt,
-        report,
-        pre_auth_receipt_bytes=pre_auth,
-        post_auth_receipt_bytes=post_auth,
-        billing_authority_bytes=authority,
-        authority_root=_authority_root(database),
-        occurred_at="2026-08-22T02:00:00+00:00",
-    )
+    with _reconciliation_context(suffix):
+        return database.settle_reference_preidentity_zero(
+            receipt,
+            report,
+            pre_auth_receipt_bytes=pre_auth,
+            post_auth_receipt_bytes=post_auth,
+            billing_authority_bytes=authority,
+            authority_root=_authority_root(database),
+            occurred_at="2026-08-22T02:00:00+00:00",
+        )
 
 
 def test_preidentity_zero_settlement_is_atomic_and_preserves_original_slot(
@@ -2281,7 +2351,10 @@ def test_preidentity_transaction_revalidates_exact_report_bytes(tmp_path: Path) 
     value = json.loads(receipt)
     value["report_size_bytes"] = 99
     altered_receipt = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
-    with pytest.raises(DatabaseError, match="evidence validation"):
+    with (
+        _reconciliation_context("bytes"),
+        pytest.raises(DatabaseError, match="evidence validation"),
+    ):
         database.settle_reference_preidentity_zero(
             altered_receipt,
             report,
@@ -2299,7 +2372,7 @@ def test_preidentity_transaction_rejects_billing_authority_drift(tmp_path: Path)
     database.initialize()
     _audit_block_preidentity(database, "authority")
     receipt, report, _, pre_auth, post_auth = _preidentity_evidence("authority")
-    with pytest.raises(DatabaseError, match="authority"):
+    with _reconciliation_context("authority"), pytest.raises(DatabaseError, match="authority"):
         database.settle_reference_preidentity_zero(
             receipt,
             report,
@@ -2326,9 +2399,12 @@ def test_preidentity_settlement_rolls_back_if_entitlement_insert_fails(tmp_path:
         _settle_preidentity(database, "rollback")
     assert database.get_reservation("reservation-rollback")["status"] == "audit_blocked"
     with database.connect_readonly() as connection:
-        assert connection.execute(
-            "SELECT count(*) FROM reference_preidentity_settlements"
-        ).fetchone()[0] == 0
+        assert (
+            connection.execute("SELECT count(*) FROM reference_preidentity_settlements").fetchone()[
+                0
+            ]
+            == 0
+        )
     assert database.reference_replacement_entitlement() is None
 
 
@@ -2337,6 +2413,7 @@ def test_preidentity_settlement_replay_and_race_have_one_winner(tmp_path: Path) 
     database = ResultsDatabase(path)
     database.initialize()
     _audit_block_preidentity(database, "race-zero")
+
     def settle(_: int) -> str:
         try:
             _settle_preidentity(ResultsDatabase(path), "race-zero")
@@ -2357,7 +2434,7 @@ def test_replacement_entitlement_consumes_once_at_final_boundary(tmp_path: Path)
     database.initialize()
     _audit_block_preidentity(database, "replacement-original")
     entitlement_sha256 = _settle_preidentity(database, "replacement-original")
-    replacement_auth_receipt_bytes = _preidentity_evidence("replacement-auth")[4]
+    replacement_auth_receipt_bytes = _preidentity_evidence("replacement-original")[4]
     _reserve(
         database,
         suffix="replacement-child",
@@ -2372,17 +2449,22 @@ def test_replacement_entitlement_consumes_once_at_final_boundary(tmp_path: Path)
 
     def consume(_: int) -> str:
         try:
-            ResultsDatabase(path).mark_reference_replacement_submission_pending(
-                "reservation-replacement-child",
-                entitlement_sha256=entitlement_sha256,
-                owner_id="owner",
-                recovery_authority_sha256=REFERENCE_RECOVERY_AUTHORITY_SHA256,
-                auth_receipt_bytes=replacement_auth_receipt_bytes,
-                auth_binding_sha256="6" * 64,
-                workspace_scope_sha256="8" * 64,
-                authority_root=_authority_root(database),
-                occurred_at="2026-08-22T02:02:00+00:00",
-            )
+            with _reconciliation_context("replacement-original"):
+                ResultsDatabase(path).mark_reference_replacement_submission_pending(
+                    "reservation-replacement-child",
+                    entitlement_sha256=entitlement_sha256,
+                    owner_id="owner",
+                    recovery_authority_sha256=REFERENCE_RECOVERY_AUTHORITY_SHA256,
+                    auth_receipt_bytes=replacement_auth_receipt_bytes,
+                    auth_binding_sha256="6" * 64,
+                    original_workspace_scope_sha256="8" * 64,
+                    authenticated_workspace_identity_sha256="7" * 64,
+                    workspace_reconciliation_authority_sha256=(
+                        _test_reconciliation_sha256("replacement-original")
+                    ),
+                    authority_root=_authority_root(database),
+                    occurred_at="2026-08-22T02:02:00+00:00",
+                )
         except DatabaseError as exc:
             return str(exc)
         return "ok"
@@ -2413,7 +2495,10 @@ def test_replacement_boundary_revalidates_exact_auth_receipt_bytes(tmp_path: Pat
         lease_expires_at="2026-08-22T02:10:00+00:00",
         approval_expires_at="2026-08-22T03:00:00+00:00",
     )
-    with pytest.raises(DatabaseError, match="auth receipt"):
+    with (
+        _reconciliation_context("replacement-auth-original"),
+        pytest.raises(DatabaseError, match="auth receipt"),
+    ):
         database.mark_reference_replacement_submission_pending(
             "reservation-replacement-auth-child",
             entitlement_sha256=entitlement_sha256,
@@ -2421,7 +2506,11 @@ def test_replacement_boundary_revalidates_exact_auth_receipt_bytes(tmp_path: Pat
             recovery_authority_sha256=REFERENCE_RECOVERY_AUTHORITY_SHA256,
             auth_receipt_bytes=b"{}",
             auth_binding_sha256="6" * 64,
-            workspace_scope_sha256="8" * 64,
+            original_workspace_scope_sha256="8" * 64,
+            authenticated_workspace_identity_sha256="7" * 64,
+            workspace_reconciliation_authority_sha256=(
+                _test_reconciliation_sha256("replacement-auth-original")
+            ),
             authority_root=_authority_root(database),
             occurred_at="2026-08-22T02:02:00+00:00",
         )
@@ -2437,6 +2526,7 @@ def test_v12_to_v13_migration_preserves_rows_and_adds_recovery_tables(tmp_path: 
         connection.execute("PRAGMA foreign_keys = OFF")
         connection.execute("DROP TABLE reference_replacement_entitlements")
         connection.execute("DROP TABLE reference_preidentity_settlements")
+        connection.execute("DROP TABLE reference_workspace_scope_reconciliations")
         connection.execute("DROP INDEX budget_reservations_active_experiment")
         connection.execute("DROP INDEX budget_reservations_reference_scope")
         connection.execute("ALTER TABLE budget_reservations RENAME TO budget_reservations_v13")
@@ -2539,36 +2629,35 @@ def test_v12_to_v13_migration_preserves_rows_and_adds_recovery_tables(tmp_path: 
                 SELECT RAISE(ABORT, 'reference provider image identity required');
             END"""
         )
-        connection.execute("DELETE FROM schema_info WHERE version = 13")
+        connection.execute("DELETE FROM schema_info WHERE version >= 13")
         connection.execute(
             "INSERT INTO schema_info(version, applied_at) VALUES (12, '2026-08-26T00:00:00Z')"
         )
     ResultsDatabase(path).initialize()
     with ResultsDatabase(path).connect_readonly() as connection:
-        assert connection.execute("SELECT max(version) FROM schema_info").fetchone()[0] == 13
+        assert connection.execute("SELECT max(version) FROM schema_info").fetchone()[0] == 14
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
-        assert connection.execute(
-            "SELECT count(*) FROM provider_smoke_reservations"
-        ).fetchone()[0] == 1
-        assert connection.execute(
-            "SELECT count(*) FROM budget_reservations"
-        ).fetchone()[0] == 1
+        assert (
+            connection.execute("SELECT count(*) FROM provider_smoke_reservations").fetchone()[0]
+            == 1
+        )
+        assert connection.execute("SELECT count(*) FROM budget_reservations").fetchone()[0] == 1
         tables = {
             row[0]
             for row in connection.execute(
                 """SELECT name FROM sqlite_master WHERE type = 'table'
                 AND name IN (
                     'reference_preidentity_settlements',
-                    'reference_replacement_entitlements'
+                    'reference_replacement_entitlements',
+                    'reference_workspace_scope_reconciliations'
                 )"""
             )
         }
-        columns = {
-            row[1] for row in connection.execute("PRAGMA table_info(budget_reservations)")
-        }
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(budget_reservations)")}
     assert tables == {
         "reference_preidentity_settlements",
         "reference_replacement_entitlements",
+        "reference_workspace_scope_reconciliations",
     }
     assert "settlement_mode" in columns
 
@@ -2578,7 +2667,7 @@ def test_v12_migration_rejects_unknown_schema_before_ddl(tmp_path: Path) -> None
     database = ResultsDatabase(path)
     database.initialize()
     with database.connect() as connection:
-        connection.execute("DELETE FROM schema_info WHERE version = 13")
+        connection.execute("DELETE FROM schema_info WHERE version >= 13")
         connection.execute(
             "INSERT INTO schema_info(version, applied_at) VALUES (12, '2026-08-26T00:00:00Z')"
         )
@@ -2589,3 +2678,23 @@ def test_v12_migration_rejects_unknown_schema_before_ddl(tmp_path: Path) -> None
         assert "settlement_mode" in {
             row[1] for row in connection.execute("PRAGMA table_info(budget_reservations)")
         }
+
+
+def test_v13_migration_rejects_unknown_empty_recovery_tables_before_ddl(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "unknown-v13.sqlite"
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "CREATE TABLE schema_info(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
+        )
+        connection.execute("INSERT INTO schema_info VALUES (13, '2026-08-27T00:00:00Z')")
+        connection.execute("CREATE TABLE reference_preidentity_settlements(bogus TEXT)")
+        connection.execute("CREATE TABLE reference_replacement_entitlements(bogus TEXT)")
+    with pytest.raises(DatabaseError, match="recovery table shape is unknown"):
+        ResultsDatabase(path).initialize()
+    with sqlite3.connect(path) as connection:
+        assert connection.execute("SELECT max(version) FROM schema_info").fetchone()[0] == 13
+        assert connection.execute(
+            "SELECT sql FROM sqlite_master WHERE name = 'reference_preidentity_settlements'"
+        ).fetchone()[0] == "CREATE TABLE reference_preidentity_settlements(bogus TEXT)"
