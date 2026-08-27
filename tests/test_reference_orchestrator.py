@@ -8,7 +8,12 @@ import pytest
 import yaml
 
 import lowbit_lab.reference_orchestrator as orchestrator
-from lowbit_lab.reference_modal_adapter import ReferenceModalCapability
+from lowbit_lab.reference_modal_adapter import (
+    PreparedModalGraph,
+    ReferenceModalCapability,
+    ReferenceModalError,
+    SerializedRemoteCallable,
+)
 from lowbit_lab.reference_provider_auth import MODAL_AUTH_OVERRIDE_KEYS, auth_receipt_path
 
 _REAL_MERGED_MAIN_GATE = orchestrator._require_merged_clean_main
@@ -522,8 +527,19 @@ def test_execute_reserves_once_then_hands_closed_capability_to_adapter(
         lambda capability: calls.append("preflight"),
     )
     monkeypatch.setattr(
+        "lowbit_lab.reference_modal_adapter.prepare_local_modal_graph",
+        lambda capability: calls.append("serialize")
+        or PreparedModalGraph(
+            serialized=SerializedRemoteCallable(entry=lambda value: {}, payload=b"blob"),
+            image=object(),
+            app=object(),
+            remote=object(),
+        ),
+    )
+    monkeypatch.setattr(
         "lowbit_lab.reference_modal_adapter.submit_reference",
-        lambda capability: calls.append(("submit", capability)) or {"status": "settlement_pending"},
+        lambda capability, prepared: calls.append(("submit", capability, prepared))
+        or {"status": "settlement_pending"},
     )
 
     result = orchestrator.execute(tmp_path, confirm_request_sha256=orchestrator._sha(request))
@@ -534,11 +550,48 @@ def test_execute_reserves_once_then_hands_closed_capability_to_adapter(
     assert ("reserve", "4.00") in calls
     final_topology = len(calls) - 1 - calls[::-1].index("topology")
     database_open = calls.index(("db", tmp_path / orchestrator.DATABASE_PATH))
-    assert calls.index("preflight") < final_topology < database_open
+    assert calls.index("preflight") < calls.index("serialize") < final_topology < database_open
     submitted = next(item[1] for item in calls if isinstance(item, tuple) and item[0] == "submit")
     assert submitted.reservation_id
     assert submitted.owner_id
     assert submitted.bootstrap_request_bytes == request
+
+
+def test_serialized_size_failure_precedes_database_and_reservation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    request = b"request"
+    calls: list[str] = []
+    monkeypatch.setattr(orchestrator, "_watchdog_ready", lambda: None)
+    monkeypatch.setattr(
+        orchestrator,
+        "prepare",
+        lambda root: (SimpleNamespace(), request, _capability(tmp_path)),
+    )
+    monkeypatch.setattr(orchestrator, "observe_topology", lambda path: calls.append("topology"))
+    monkeypatch.setattr(
+        "lowbit_lab.reference_modal_adapter.validate_reference_preflight",
+        lambda capability: calls.append("preflight"),
+    )
+    monkeypatch.setattr(
+        "lowbit_lab.reference_modal_adapter.prepare_local_modal_graph",
+        lambda capability: (_ for _ in ()).throw(
+            ReferenceModalError("serialized function exceeds provider cap")
+        ),
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "ResultsDatabase",
+        lambda path: (_ for _ in ()).throw(AssertionError("database boundary crossed")),
+    )
+
+    with pytest.raises(ReferenceModalError, match="provider cap"):
+        orchestrator.execute(
+            tmp_path,
+            confirm_request_sha256=orchestrator._sha(request),
+        )
+
+    assert calls == ["topology", "preflight"]
 
 
 def test_cli_failure_is_sanitized(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:

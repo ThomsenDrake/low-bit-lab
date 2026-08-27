@@ -27,6 +27,22 @@ class FakeDeadlineSignal:
         pass
 
 
+def _prepared(entry=None, payload: bytes = b"blob") -> adapter.SerializedRemoteCallable:
+    return adapter.SerializedRemoteCallable(
+        entry=(lambda value: {}) if entry is None else entry,
+        payload=payload,
+    )
+
+
+def _prepared_graph() -> adapter.PreparedModalGraph:
+    return adapter.PreparedModalGraph(
+        serialized=_prepared(),
+        image=object(),
+        app=object(),
+        remote=object(),
+    )
+
+
 def test_remote_contract_rejects_unbound_or_noncanonical_input() -> None:
     with pytest.raises(ReferenceModalError, match="schema drift"):
         adapter.validate_remote_contract_bytes(b"{}")
@@ -405,7 +421,7 @@ def test_image_recipe_treats_hostile_url_as_one_pip_argument(
 
 def test_serialized_callable_round_trips_without_repository_on_import_path(tmp_path: Path) -> None:
     """The function blob, not a package mount, supplies its reviewed validation code."""
-    _, payload, modules = adapter._serialized_remote_callable()
+    _, payload, modules = adapter._build_serialized_remote_callable()
     payload_path = tmp_path / "reference-entry.bin"
     payload_path.write_bytes(payload)
     site_packages = Path(sys.executable).parent.parent / "Lib" / "site-packages"
@@ -422,18 +438,94 @@ def test_serialized_callable_round_trips_without_repository_on_import_path(tmp_p
     assert completed.returncode == 0
     assert "ReferenceModalError remote contract schema drift" in completed.stdout
     assert "low-bit-lab" not in completed.stderr
-    assert len(payload) < 16 << 20
+    assert len(payload) > adapter.MODAL_SERIALIZED_FUNCTION_MAX_BYTES
     adapter._clear_serialization_policy(modules)
 
 
-def test_modal_hydration_serializer_matches_the_audited_function_bytes() -> None:
-    entry, payload, modules = adapter._serialized_remote_callable()
+def test_modal_hydration_uses_the_exact_cached_audited_bytes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entry, payload, modules = adapter._build_serialized_remote_callable()
     try:
         from modal._utils.function_utils import FunctionInfo
 
-        assert FunctionInfo(entry, serialized=True).serialized_function() == payload
+        info = FunctionInfo(entry, serialized=True)
+        remote = SimpleNamespace(_info=info)
+        prepared = adapter.SerializedRemoteCallable(entry=entry, payload=payload)
+        adapter._bind_cached_hydration_payload(remote, prepared)
+        monkeypatch.setattr(
+            "modal._serialization.serialize",
+            lambda value: (_ for _ in ()).throw(AssertionError("must use cached bytes")),
+        )
+        assert info.serialized_function() is payload
     finally:
         adapter._clear_serialization_policy(modules)
+
+
+@pytest.mark.parametrize(
+    ("payload_size", "accepted"),
+    (
+        (adapter.MODAL_SERIALIZED_FUNCTION_MAX_BYTES, True),
+        (adapter.MODAL_SERIALIZED_FUNCTION_MAX_BYTES + 1, False),
+    ),
+)
+def test_serialized_callable_enforces_exact_modal_cap_and_cleans_on_rejection(
+    monkeypatch: pytest.MonkeyPatch, payload_size: int, accepted: bool
+) -> None:
+    modules = (object(),)
+    cleared: list[tuple[object, ...]] = []
+    monkeypatch.setattr(
+        adapter,
+        "_build_serialized_remote_callable",
+        lambda: (lambda value: {}, b"x" * payload_size, modules),
+    )
+    monkeypatch.setattr(adapter, "_clear_serialization_policy", cleared.append)
+
+    if accepted:
+        prepared = adapter.prepare_serialized_remote_callable()
+        assert len(prepared.payload) == adapter.MODAL_SERIALIZED_FUNCTION_MAX_BYTES
+        assert cleared == [modules]
+    else:
+        with pytest.raises(adapter.ReferenceModalError, match="provider cap"):
+            adapter.prepare_serialized_remote_callable()
+        assert cleared == [modules]
+
+
+def test_graph_preflight_failure_is_audited_without_run_or_reservation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config_path = Path("configs/local/reference.yaml")
+    config = tmp_path / config_path
+    config.parent.mkdir(parents=True)
+    config.write_bytes(b"config")
+    capability = SimpleNamespace(
+        root=tmp_path,
+        config_path=config_path,
+        image_lock={},
+    )
+    monkeypatch.setattr(
+        adapter,
+        "prepare_serialized_remote_callable",
+        lambda: (_ for _ in ()).throw(
+            ReferenceModalError("serialized function exceeds provider cap")
+        ),
+    )
+
+    with pytest.raises(ReferenceModalError, match="provider cap"):
+        adapter.prepare_local_modal_graph(capability)
+
+    database = adapter.ResultsDatabase(tmp_path / "results/local/reference.sqlite")
+    with database.connect() as connection:
+        attempts = connection.execute(
+            "SELECT status, run_id, failure_reason FROM attempts"
+        ).fetchall()
+        reservations = connection.execute(
+            "SELECT reservation_id FROM budget_reservations"
+        ).fetchall()
+    assert [tuple(row) for row in attempts] == [
+        ("failed", None, "local_provider_graph_preflight_failed")
+    ]
+    assert reservations == []
 
 
 def test_fake_modal_persists_image_then_call_identity_and_uses_one_spawn(
@@ -564,9 +656,10 @@ def test_fake_modal_persists_image_then_call_identity_and_uses_one_spawn(
     monkeypatch.setattr(adapter, "build_remote_contract", lambda *args, **kwargs: b"contract")
     monkeypatch.setattr(adapter, "_validate_modal_sdk_boundary", lambda capability: None)
     monkeypatch.setattr(
-        adapter, "_serialized_remote_callable", lambda: (lambda value: {}, b"blob", ())
+        adapter,
+        "_bind_cached_hydration_payload",
+        lambda remote, prepared: events.append("bind_cached_payload"),
     )
-    monkeypatch.setattr(adapter, "_clear_serialization_policy", lambda modules: None)
     monkeypatch.setattr(adapter, "_image_from_lock", lambda modal, lock: fake_image)
     monkeypatch.setattr(
         adapter,
@@ -603,15 +696,18 @@ def test_fake_modal_persists_image_then_call_identity_and_uses_one_spawn(
         execution_identity={},
         image_lock={},
     )
-    result = adapter.submit_reference(capability)
+    monkeypatch.setattr(adapter, "prepare_serialized_remote_callable", _prepared)
+    prepared_graph = adapter.prepare_local_modal_graph(capability)
+    result = adapter.submit_reference(capability, prepared_graph)
     assert result["status"] == "failed"
     assert result["full_context_usefulness_proven"] is False
     assert (tmp_path / str(result["receipt_path"])).read_bytes() == b"receipt"
     assert events == [
+        "decorate",
+        "bind_cached_payload",
         "attempt_received",
         "attempt_linked",
         "pending",
-        "decorate",
         "run",
         "build",
         ("prepared", "im-one", "ap-one"),
@@ -670,7 +766,7 @@ def test_fresh_preview_failure_prevents_the_database_boundary_and_modal_import(
         image_lock={},
     )
     with pytest.raises(ReferenceModalError, match="deterministic remote contract gate failed"):
-        adapter.submit_reference(capability)
+        adapter.submit_reference(capability, _prepared_graph())
     assert boundaries == ["attempt_received:invalid", "attempt_failed"]
 
 
@@ -712,7 +808,7 @@ def test_missing_reservation_is_recorded_as_a_failed_preflight(
         owner_id="owner",
     )
     with pytest.raises(ReferenceModalError, match="deterministic remote contract gate failed"):
-        adapter.submit_reference(capability)
+        adapter.submit_reference(capability, _prepared_graph())
     assert events == ["received", "failed"]
 
 
@@ -781,7 +877,7 @@ def test_watchdog_install_failure_after_boundary_is_audit_blocked(
         replacement_entitlement_sha256=None,
     )
     with pytest.raises(ReferenceModalError, match="requires audit"):
-        adapter.submit_reference(capability)
+        adapter.submit_reference(capability, _prepared_graph())
     assert events == ["received", "linked", "pending", "audit_blocked"]
 
 
@@ -796,7 +892,7 @@ def test_serialization_failure_clears_every_registered_module(
         "modal._serialization.serialize", lambda value: (_ for _ in ()).throw(RuntimeError())
     )
     with pytest.raises(RuntimeError):
-        adapter._serialized_remote_callable()
+        adapter.prepare_serialized_remote_callable()
     assert registered
     assert unregistered == registered
 
@@ -844,7 +940,6 @@ def test_audit_block_persistence_failure_is_fatal(
     )
     monkeypatch.setattr(adapter, "build_remote_contract", lambda *args, **kwargs: b"contract")
     monkeypatch.setattr(adapter, "_validate_modal_sdk_boundary", lambda capability: None)
-    monkeypatch.setitem(sys.modules, "modal", SimpleNamespace())
     capability = adapter.ReferenceModalCapability(
         db_path=tmp_path / "results/local/reference.sqlite",
         root=tmp_path,
@@ -867,7 +962,7 @@ def test_audit_block_persistence_failure_is_fatal(
         image_lock={},
     )
     with pytest.raises(ReferenceModalError, match="could not be durably audit-blocked"):
-        adapter.submit_reference(capability)
+        adapter.submit_reference(capability, _prepared_graph())
 
 
 def test_replacement_boundary_consumes_entitlement_instead_of_original_slot(
@@ -970,5 +1065,5 @@ def test_replacement_boundary_rejects_ambient_modal_override_before_consumption(
         replacement_auth_binding_sha256="6" * 64,
     )
     with pytest.raises(ReferenceModalError, match="boundary authentication failed"):
-        adapter.submit_reference(capability)
+        adapter.submit_reference(capability, _prepared_graph())
     assert events == ["received", "linked"]

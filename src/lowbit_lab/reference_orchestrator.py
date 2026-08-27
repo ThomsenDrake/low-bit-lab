@@ -1303,11 +1303,15 @@ def execute(
         raise ReferenceOrchestratorError("request confirmation does not match fresh bytes")
     observe_topology(root / REQUEST_PATH)
     from lowbit_lab.reference_modal_adapter import (
+        prepare_local_modal_graph,
         submit_reference,
         validate_reference_preflight,
     )
 
     validate_reference_preflight(unreserved)
+    # Freeze, cap, and bind Modal's exact hydration bytes before creating the
+    # USD 4 local reservation. This builds only lazy local SDK objects.
+    prepared_graph = prepare_local_modal_graph(unreserved)
     # Runtime lineage reproduction can exceed the topology receipt's freshness window on DrvFS.
     # Re-observe after that slow gate so reservation never relies on a stale route receipt.
     observe_topology(root / REQUEST_PATH)
@@ -1421,7 +1425,7 @@ def execute(
         ),
     )
     try:
-        return submit_reference(capability)
+        return submit_reference(capability, prepared_graph)
     except Exception:
         try:
             reservation = database.get_reservation(reservation_id)
