@@ -20,6 +20,7 @@ from lowbit_lab.constants import (
     REFERENCE_INCREMENTAL_CAP_USD,
     REFERENCE_RECOVERY_AUTHORITY_SHA256,
     REFERENCE_SETTLED_SMOKE_USD,
+    REFERENCE_WORKSPACE_RECONCILIATION_AUTHORITY_SHA256,
 )
 from lowbit_lab.handoff import sha256_json
 from lowbit_lab.jsonio import emit
@@ -27,10 +28,12 @@ from lowbit_lab.reference_authority import (
     AUTHORITY_PATH,
     BOOTSTRAP_AUTHORITY_PATH,
     RECOVERY_AUTHORITY_PATH,
+    WORKSPACE_RECONCILIATION_AUTHORITY_PATH,
     ReferenceAuthorityError,
     validate_reference_authority,
     validate_reference_bootstrap_authority,
     validate_reference_recovery_authority,
+    validate_workspace_scope_reconciliation_authority,
 )
 from lowbit_lab.reference_contract import (
     APPROVED_PROVIDER_AMENDMENT_PATH,
@@ -52,11 +55,21 @@ from lowbit_lab.reference_settlement import (
     validate_workspace_zero_settlement_evidence,
 )
 
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 14
 _V12_BUDGET_SCHEMA_SHA256 = {
     # Fresh schema-v12 creation and the deployed incremental-v12 migration shape.
     "fc16ab0b3adb0b84dbe85ac23afcc961ab64aed4e8ff64f5c852610ba555911b",
     "0ebfd58fb3a607cf764e25f120ee0c1476085c53097e4ee59b60e5ca0b7e2965",
+}
+_V13_RECOVERY_TABLE_SHA256 = {
+    "reference_preidentity_settlements": {
+        "0fdefe99f28960a37f018693d969faea429aefe6ba9b7efc651ec6a19559d2c9",
+        "093e16096b0b7a5e2bf92c4c3ca7fe44789fee4109bfffdc86ed5c640e3d28c7",
+    },
+    "reference_replacement_entitlements": {
+        "4bfdc09f9bc258a1d65879e154413a5140230ae21813f4041d26d2d412bf0af1",
+        "1508470df20434b8b10a9a9f7028b675ae388076ea284163ded1427cb2399bca",
+    },
 }
 REFERENCE_RESERVATION_USD = REFERENCE_INCREMENTAL_CAP_USD
 TERMINAL_STATES = {"completed", "failed"}
@@ -323,14 +336,37 @@ CREATE TABLE IF NOT EXISTS reference_authority_slots (
     execution_scope_sha256 TEXT NOT NULL UNIQUE CHECK(length(execution_scope_sha256) = 64),
     consumed_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS reference_workspace_scope_reconciliations (
+    authority_sha256 TEXT PRIMARY KEY CHECK(length(authority_sha256) = 64),
+    original_workspace_scope_sha256 TEXT NOT NULL UNIQUE
+        CHECK(length(original_workspace_scope_sha256) = 64),
+    authenticated_workspace_identity_sha256 TEXT NOT NULL UNIQUE
+        CHECK(length(authenticated_workspace_identity_sha256) = 64),
+    original_reservation_id TEXT NOT NULL UNIQUE
+        REFERENCES budget_reservations(reservation_id) ON DELETE RESTRICT,
+    original_execution_scope_sha256 TEXT NOT NULL UNIQUE
+        CHECK(length(original_execution_scope_sha256) = 64),
+    billing_authority_sha256 TEXT NOT NULL CHECK(length(billing_authority_sha256) = 64),
+    statement_sha256 TEXT NOT NULL CHECK(length(statement_sha256) = 64),
+    approved_base_commit TEXT NOT NULL CHECK(length(approved_base_commit) = 40),
+    replacement_action TEXT NOT NULL CHECK(replacement_action = 'u8_reference_replacement_once'),
+    maximum_mapping_uses INTEGER NOT NULL CHECK(maximum_mapping_uses = 1),
+    recorded_at TEXT NOT NULL,
+    CHECK(original_workspace_scope_sha256 != authenticated_workspace_identity_sha256)
+);
 CREATE TABLE IF NOT EXISTS reference_preidentity_settlements (
     settlement_sha256 TEXT PRIMARY KEY CHECK(length(settlement_sha256) = 64),
     reservation_id TEXT NOT NULL UNIQUE
         REFERENCES budget_reservations(reservation_id) ON DELETE RESTRICT,
     recovery_authority_sha256 TEXT NOT NULL
         CHECK(length(recovery_authority_sha256) = 64),
-    authenticated_workspace_scope_sha256 TEXT NOT NULL
-        CHECK(length(authenticated_workspace_scope_sha256) = 64),
+    original_workspace_scope_sha256 TEXT NOT NULL
+        CHECK(length(original_workspace_scope_sha256) = 64),
+    authenticated_workspace_identity_sha256 TEXT NOT NULL
+        CHECK(length(authenticated_workspace_identity_sha256) = 64),
+    workspace_reconciliation_authority_sha256 TEXT NOT NULL UNIQUE
+        REFERENCES reference_workspace_scope_reconciliations(authority_sha256)
+        ON DELETE RESTRICT,
     auth_binding_sha256 TEXT NOT NULL CHECK(length(auth_binding_sha256) = 64),
     pre_auth_receipt_sha256 TEXT NOT NULL CHECK(length(pre_auth_receipt_sha256) = 64),
     post_auth_receipt_sha256 TEXT NOT NULL CHECK(length(post_auth_receipt_sha256) = 64),
@@ -355,6 +391,9 @@ CREATE TABLE IF NOT EXISTS reference_replacement_entitlements (
     entitlement_sha256 TEXT PRIMARY KEY CHECK(length(entitlement_sha256) = 64),
     recovery_authority_sha256 TEXT NOT NULL
         CHECK(length(recovery_authority_sha256) = 64),
+    workspace_reconciliation_authority_sha256 TEXT NOT NULL UNIQUE
+        REFERENCES reference_workspace_scope_reconciliations(authority_sha256)
+        ON DELETE RESTRICT,
     original_reservation_id TEXT NOT NULL UNIQUE
         REFERENCES budget_reservations(reservation_id) ON DELETE RESTRICT,
     original_execution_scope_sha256 TEXT NOT NULL UNIQUE
@@ -967,6 +1006,15 @@ def _budget_schema_sha256(connection: sqlite3.Connection) -> str:
     ).hexdigest()
 
 
+def _table_sql_sha256(connection: sqlite3.Connection, table: str) -> str | None:
+    row = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)
+    ).fetchone()
+    if row is None or not isinstance(row[0], str):
+        return None
+    return hashlib.sha256(row[0].encode()).hexdigest()
+
+
 class ResultsDatabase:
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -1048,6 +1096,9 @@ class ResultsDatabase:
             if existing == 12:
                 self._migrate_v12_to_v13(connection)
                 existing = 13
+            if existing == 13:
+                self._migrate_v13_to_v14(connection)
+                existing = 14
             if existing != SCHEMA_VERSION:
                 raise DatabaseError(f"database schema {existing} != supported {SCHEMA_VERSION}")
 
@@ -1074,9 +1125,7 @@ class ResultsDatabase:
                     (recovery_table,),
                 ).fetchone()
                 if exists is not None:
-                    if connection.execute(
-                        f"SELECT count(*) FROM {recovery_table}"
-                    ).fetchone()[0]:
+                    if connection.execute(f"SELECT count(*) FROM {recovery_table}").fetchone()[0]:
                         raise DatabaseError(
                             "schema v13 recovery lineage already exists before migration"
                         )
@@ -1165,9 +1214,7 @@ class ResultsDatabase:
                 f"INSERT INTO budget_reservations_v13 ({old_columns}) "
                 f"SELECT {old_columns} FROM budget_reservations"
             )
-            after = connection.execute(
-                "SELECT count(*) FROM budget_reservations_v13"
-            ).fetchone()[0]
+            after = connection.execute("SELECT count(*) FROM budget_reservations_v13").fetchone()[0]
             if before != after:
                 raise DatabaseError("schema v13 budget row-count validation failed")
             copied_rows = connection.execute(
@@ -1180,9 +1227,7 @@ class ResultsDatabase:
             connection.execute("DROP INDEX IF EXISTS budget_reservations_active_experiment")
             connection.execute("DROP INDEX IF EXISTS budget_reservations_reference_scope")
             connection.execute("DROP TABLE budget_reservations")
-            connection.execute(
-                "ALTER TABLE budget_reservations_v13 RENAME TO budget_reservations"
-            )
+            connection.execute("ALTER TABLE budget_reservations_v13 RENAME TO budget_reservations")
             connection.execute(
                 """CREATE UNIQUE INDEX budget_reservations_active_experiment
                 ON budget_reservations(experiment_id)
@@ -1290,6 +1335,138 @@ class ResultsDatabase:
         except Exception as exc:
             connection.rollback()
             raise DatabaseError(f"database schema v13 migration failed: {exc}") from exc
+        finally:
+            connection.execute("PRAGMA foreign_keys = ON")
+
+    def _migrate_v13_to_v14(self, connection: sqlite3.Connection) -> None:
+        """Replace the ambiguous scope field with a one-use, distinct-identity mapping."""
+        for table, supported in _V13_RECOVERY_TABLE_SHA256.items():
+            if _table_sql_sha256(connection, table) not in supported:
+                raise DatabaseError(f"schema v13 recovery table shape is unknown: {table}")
+        connection.commit()
+        connection.execute("PRAGMA foreign_keys = OFF")
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            for table in (
+                "reference_replacement_entitlements",
+                "reference_preidentity_settlements",
+            ):
+                if connection.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone():
+                    raise DatabaseError(
+                        "schema v14 cannot infer reconciliation from existing recovery rows"
+                    )
+            connection.execute("DROP TABLE reference_replacement_entitlements")
+            connection.execute("DROP TABLE reference_preidentity_settlements")
+            connection.execute(
+                """CREATE TABLE reference_workspace_scope_reconciliations (
+                    authority_sha256 TEXT PRIMARY KEY CHECK(length(authority_sha256) = 64),
+                    original_workspace_scope_sha256 TEXT NOT NULL UNIQUE
+                        CHECK(length(original_workspace_scope_sha256) = 64),
+                    authenticated_workspace_identity_sha256 TEXT NOT NULL UNIQUE
+                        CHECK(length(authenticated_workspace_identity_sha256) = 64),
+                    original_reservation_id TEXT NOT NULL UNIQUE
+                        REFERENCES budget_reservations(reservation_id) ON DELETE RESTRICT,
+                    original_execution_scope_sha256 TEXT NOT NULL UNIQUE
+                        CHECK(length(original_execution_scope_sha256) = 64),
+                    billing_authority_sha256 TEXT NOT NULL
+                        CHECK(length(billing_authority_sha256) = 64),
+                    statement_sha256 TEXT NOT NULL CHECK(length(statement_sha256) = 64),
+                    approved_base_commit TEXT NOT NULL CHECK(length(approved_base_commit) = 40),
+                    replacement_action TEXT NOT NULL
+                        CHECK(replacement_action = 'u8_reference_replacement_once'),
+                    maximum_mapping_uses INTEGER NOT NULL CHECK(maximum_mapping_uses = 1),
+                    recorded_at TEXT NOT NULL,
+                    CHECK(
+                        original_workspace_scope_sha256
+                        != authenticated_workspace_identity_sha256
+                    )
+                )"""
+            )
+            connection.execute(
+                """CREATE TABLE reference_preidentity_settlements (
+                    settlement_sha256 TEXT PRIMARY KEY CHECK(length(settlement_sha256) = 64),
+                    reservation_id TEXT NOT NULL UNIQUE
+                        REFERENCES budget_reservations(reservation_id) ON DELETE RESTRICT,
+                    recovery_authority_sha256 TEXT NOT NULL
+                        CHECK(length(recovery_authority_sha256) = 64),
+                    original_workspace_scope_sha256 TEXT NOT NULL
+                        CHECK(length(original_workspace_scope_sha256) = 64),
+                    authenticated_workspace_identity_sha256 TEXT NOT NULL
+                        CHECK(length(authenticated_workspace_identity_sha256) = 64),
+                    workspace_reconciliation_authority_sha256 TEXT NOT NULL UNIQUE
+                        REFERENCES reference_workspace_scope_reconciliations(authority_sha256)
+                        ON DELETE RESTRICT,
+                    auth_binding_sha256 TEXT NOT NULL CHECK(length(auth_binding_sha256) = 64),
+                    pre_auth_receipt_sha256 TEXT NOT NULL
+                        CHECK(length(pre_auth_receipt_sha256) = 64),
+                    post_auth_receipt_sha256 TEXT NOT NULL
+                        CHECK(length(post_auth_receipt_sha256) = 64),
+                    billing_authority_sha256 TEXT NOT NULL
+                        CHECK(length(billing_authority_sha256) = 64),
+                    billing_method_sha256 TEXT NOT NULL CHECK(length(billing_method_sha256) = 64),
+                    authoritative_report_identity_sha256 TEXT NOT NULL
+                        CHECK(length(authoritative_report_identity_sha256) = 64),
+                    original_execution_scope_sha256 TEXT NOT NULL
+                        CHECK(length(original_execution_scope_sha256) = 64),
+                    failure_code TEXT NOT NULL
+                        CHECK(failure_code = 'auth_before_provider_identity'),
+                    query_start TEXT NOT NULL, query_end TEXT NOT NULL, acquired_at TEXT NOT NULL,
+                    completeness_delay_seconds INTEGER NOT NULL
+                        CHECK(completeness_delay_seconds > 0),
+                    actual_cost_usd TEXT NOT NULL CHECK(actual_cost_usd = '0'),
+                    report_sha256 TEXT NOT NULL UNIQUE CHECK(length(report_sha256) = 64),
+                    report_size_bytes INTEGER NOT NULL CHECK(report_size_bytes = 3),
+                    row_count INTEGER NOT NULL CHECK(row_count = 0), recorded_at TEXT NOT NULL
+                )"""
+            )
+            connection.execute(
+                """CREATE TABLE reference_replacement_entitlements (
+                    entitlement_sha256 TEXT PRIMARY KEY CHECK(length(entitlement_sha256) = 64),
+                    recovery_authority_sha256 TEXT NOT NULL
+                        CHECK(length(recovery_authority_sha256) = 64),
+                    workspace_reconciliation_authority_sha256 TEXT NOT NULL UNIQUE
+                        REFERENCES reference_workspace_scope_reconciliations(authority_sha256)
+                        ON DELETE RESTRICT,
+                    original_reservation_id TEXT NOT NULL UNIQUE
+                        REFERENCES budget_reservations(reservation_id) ON DELETE RESTRICT,
+                    original_execution_scope_sha256 TEXT NOT NULL UNIQUE
+                        CHECK(length(original_execution_scope_sha256) = 64),
+                    settlement_sha256 TEXT NOT NULL UNIQUE
+                        REFERENCES reference_preidentity_settlements(settlement_sha256)
+                        ON DELETE RESTRICT,
+                    state TEXT NOT NULL CHECK(state IN ('available', 'consumed')),
+                    replacement_reservation_id TEXT UNIQUE
+                        REFERENCES budget_reservations(reservation_id) ON DELETE RESTRICT,
+                    replacement_execution_scope_sha256 TEXT UNIQUE CHECK(
+                        replacement_execution_scope_sha256 IS NULL
+                        OR length(replacement_execution_scope_sha256) = 64
+                    ),
+                    created_at TEXT NOT NULL, consumed_at TEXT,
+                    consumed_auth_receipt_sha256 TEXT CHECK(
+                        consumed_auth_receipt_sha256 IS NULL
+                        OR length(consumed_auth_receipt_sha256) = 64
+                    ),
+                    CHECK(
+                        (state = 'available' AND replacement_reservation_id IS NULL
+                         AND replacement_execution_scope_sha256 IS NULL
+                         AND consumed_at IS NULL AND consumed_auth_receipt_sha256 IS NULL)
+                        OR (state = 'consumed' AND replacement_reservation_id IS NOT NULL
+                            AND replacement_execution_scope_sha256 IS NOT NULL
+                            AND consumed_at IS NOT NULL
+                            AND consumed_auth_receipt_sha256 IS NOT NULL)
+                    )
+                )"""
+            )
+            if connection.execute("PRAGMA foreign_key_check").fetchall():
+                raise DatabaseError("schema v14 foreign-key validation failed")
+            connection.execute(
+                """INSERT INTO schema_info(version, applied_at)
+                VALUES (14, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))"""
+            )
+            connection.commit()
+        except Exception as exc:
+            connection.rollback()
+            raise DatabaseError(f"database schema v14 migration failed: {exc}") from exc
         finally:
             connection.execute("PRAGMA foreign_keys = ON")
 
@@ -3268,9 +3445,7 @@ class ResultsDatabase:
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             if standing_packet_sha256 is not None:
-                approval_expiry = _database_timestamp(
-                    approval_expires_at, "approval_expires_at"
-                )
+                approval_expiry = _database_timestamp(approval_expires_at, "approval_expires_at")
                 if approval_expiry <= start_time or initial_lease_expiry > approval_expiry:
                     raise DatabaseError("standing reference approval expiry is invalid")
                 connection.execute(
@@ -3344,8 +3519,7 @@ class ResultsDatabase:
                     allowed_original = (
                         replacement is not None
                         and prior["reservation_id"] == replacement["original_reservation_id"]
-                        and execution_scope_sha256
-                        == replacement["original_execution_scope_sha256"]
+                        and execution_scope_sha256 == replacement["original_execution_scope_sha256"]
                         and prior["status"] == "settled"
                     )
                     if not allowed_original:
@@ -4017,6 +4191,7 @@ class ResultsDatabase:
         authority_root: Path,
         occurred_at: str,
         recovery_authority_path: Path = RECOVERY_AUTHORITY_PATH,
+        reconciliation_authority_path: Path = WORKSPACE_RECONCILIATION_AUTHORITY_PATH,
     ) -> str:
         """Atomically settle the sole identity-less AuthError and mint one child entitlement."""
         self.initialize()
@@ -4052,6 +4227,9 @@ class ResultsDatabase:
                 validated_recovery = validate_reference_recovery_authority(
                     authority_root, recovery_authority_path
                 )
+                reconciliation = validate_workspace_scope_reconciliation_authority(
+                    authority_root, reconciliation_authority_path
+                )
                 config = json.loads(row["config_json"])
                 provider = config["provider"]
                 workspace_scope = provider["workspace_scope_sha256"]
@@ -4062,6 +4240,13 @@ class ResultsDatabase:
             if (
                 validated_recovery != REFERENCE_RECOVERY_AUTHORITY_SHA256
                 or row["original_authority_sha256"] != REFERENCE_AUTHORITY_SHA256
+                or sha256_json(reconciliation)
+                != REFERENCE_WORKSPACE_RECONCILIATION_AUTHORITY_SHA256
+                or reconciliation["original_workspace_scope_sha256"] != workspace_scope
+                or reconciliation["original_reservation_id"] != reservation_id
+                or reconciliation["original_execution_scope_sha256"]
+                != row["reference_execution_scope_sha256"]
+                or reconciliation["billing_authority_sha256"] != row["billing_authority_sha256"]
                 or hashlib.sha256(billing_authority_bytes).hexdigest()
                 != row["billing_authority_sha256"]
                 or authority.get("authoritative_report_identity_sha256")
@@ -4100,22 +4285,22 @@ class ResultsDatabase:
                     pre_auth_receipt_bytes=pre_auth_receipt_bytes,
                     post_auth_receipt_bytes=post_auth_receipt_bytes,
                     expected_recovery_authority_sha256=validated_recovery,
-                    expected_workspace_scope_sha256=workspace_scope,
+                    expected_original_workspace_scope_sha256=workspace_scope,
+                    expected_authenticated_workspace_identity_sha256=reconciliation[
+                        "authenticated_workspace_identity_sha256"
+                    ],
+                    expected_workspace_reconciliation_authority_sha256=(
+                        REFERENCE_WORKSPACE_RECONCILIATION_AUTHORITY_SHA256
+                    ),
                     expected_billing_authority_sha256=row["billing_authority_sha256"],
                     expected_billing_method_sha256=billing_method,
-                    expected_report_identity_sha256=row[
-                        "authoritative_report_identity_sha256"
-                    ],
+                    expected_report_identity_sha256=row["authoritative_report_identity_sha256"],
                     expected_reservation_id=reservation_id,
-                    expected_execution_scope_sha256=row[
-                        "reference_execution_scope_sha256"
-                    ],
+                    expected_execution_scope_sha256=row["reference_execution_scope_sha256"],
                     latest_durable_boundary=latest_boundary,
                     validated_at=occurred,
                     maximum_action_seconds=int(REFERENCE_RESOURCES["timeout_seconds"]),
-                    expected_completeness_delay_seconds=row[
-                        "billing_completeness_delay_seconds"
-                    ],
+                    expected_completeness_delay_seconds=row["billing_completeness_delay_seconds"],
                 )
             except ReferenceSettlementError as exc:
                 raise DatabaseError("pre-identity evidence validation failed") from exc
@@ -4128,29 +4313,61 @@ class ResultsDatabase:
                     "original_reservation_id": evidence.reservation_id,
                     "recovery_authority_sha256": evidence.recovery_authority_sha256,
                     "settlement_sha256": evidence.receipt_sha256,
+                    "workspace_reconciliation_authority_sha256": (
+                        evidence.workspace_reconciliation_authority_sha256
+                    ),
                 }
             )
             if connection.execute(
                 "SELECT 1 FROM reference_preidentity_settlements LIMIT 1"
             ).fetchone():
                 raise DatabaseError("pre-identity settlement authority is already consumed")
+            if connection.execute(
+                "SELECT 1 FROM reference_workspace_scope_reconciliations LIMIT 1"
+            ).fetchone():
+                raise DatabaseError("workspace reconciliation authority is already consumed")
+            connection.execute(
+                """INSERT INTO reference_workspace_scope_reconciliations(
+                    authority_sha256, original_workspace_scope_sha256,
+                    authenticated_workspace_identity_sha256, original_reservation_id,
+                    original_execution_scope_sha256, billing_authority_sha256,
+                    statement_sha256, approved_base_commit, replacement_action,
+                    maximum_mapping_uses, recorded_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)""",
+                (
+                    evidence.workspace_reconciliation_authority_sha256,
+                    evidence.original_workspace_scope_sha256,
+                    evidence.authenticated_workspace_identity_sha256,
+                    evidence.reservation_id,
+                    evidence.execution_scope_sha256,
+                    evidence.billing_authority_sha256,
+                    reconciliation["statement_sha256"],
+                    reconciliation["approved_base_commit"],
+                    reconciliation["replacement_action"],
+                    occurred_at,
+                ),
+            )
             connection.execute(
                 """INSERT INTO reference_preidentity_settlements(
                     settlement_sha256, reservation_id, recovery_authority_sha256,
-                    authenticated_workspace_scope_sha256, auth_binding_sha256,
+                    original_workspace_scope_sha256,
+                    authenticated_workspace_identity_sha256,
+                    workspace_reconciliation_authority_sha256, auth_binding_sha256,
                     pre_auth_receipt_sha256, post_auth_receipt_sha256,
                     billing_authority_sha256,
                     billing_method_sha256, authoritative_report_identity_sha256,
                     original_execution_scope_sha256, failure_code, query_start, query_end,
                     acquired_at, completeness_delay_seconds, actual_cost_usd,
                     report_sha256, report_size_bytes, row_count, recorded_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'auth_before_provider_identity',
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'auth_before_provider_identity',
                     ?, ?, ?, ?, '0', ?, ?, 0, ?)""",
                 (
                     evidence.receipt_sha256,
                     evidence.reservation_id,
                     evidence.recovery_authority_sha256,
-                    evidence.workspace_scope_sha256,
+                    evidence.original_workspace_scope_sha256,
+                    evidence.authenticated_workspace_identity_sha256,
+                    evidence.workspace_reconciliation_authority_sha256,
                     evidence.auth_binding_sha256,
                     evidence.pre_auth_receipt_sha256,
                     evidence.post_auth_receipt_sha256,
@@ -4206,12 +4423,14 @@ class ResultsDatabase:
             connection.execute(
                 """INSERT INTO reference_replacement_entitlements(
                     entitlement_sha256, recovery_authority_sha256,
+                    workspace_reconciliation_authority_sha256,
                     original_reservation_id, original_execution_scope_sha256,
                     settlement_sha256, state, created_at
-                ) VALUES (?, ?, ?, ?, ?, 'available', ?)""",
+                ) VALUES (?, ?, ?, ?, ?, ?, 'available', ?)""",
                 (
                     entitlement_sha256,
                     evidence.recovery_authority_sha256,
+                    evidence.workspace_reconciliation_authority_sha256,
                     evidence.reservation_id,
                     evidence.execution_scope_sha256,
                     evidence.receipt_sha256,
@@ -4239,7 +4458,9 @@ class ResultsDatabase:
         recovery_authority_sha256: str,
         auth_receipt_bytes: bytes,
         auth_binding_sha256: str,
-        workspace_scope_sha256: str,
+        original_workspace_scope_sha256: str,
+        authenticated_workspace_identity_sha256: str,
+        workspace_reconciliation_authority_sha256: str,
         authority_root: Path,
         occurred_at: str,
         recovery_authority_path: Path = RECOVERY_AUTHORITY_PATH,
@@ -4248,23 +4469,42 @@ class ResultsDatabase:
         occurred = _database_timestamp(occurred_at, "occurred_at")
         _database_sha256(entitlement_sha256, "entitlement_sha256")
         _database_sha256(auth_binding_sha256, "auth_binding_sha256")
-        _database_sha256(workspace_scope_sha256, "workspace_scope_sha256")
+        _database_sha256(original_workspace_scope_sha256, "original_workspace_scope_sha256")
+        _database_sha256(
+            authenticated_workspace_identity_sha256,
+            "authenticated_workspace_identity_sha256",
+        )
+        _database_sha256(
+            workspace_reconciliation_authority_sha256,
+            "workspace_reconciliation_authority_sha256",
+        )
         if not owner_id or recovery_authority_sha256 != REFERENCE_RECOVERY_AUTHORITY_SHA256:
             raise DatabaseError("reference replacement boundary authority is invalid")
         try:
             validated = validate_reference_recovery_authority(
                 authority_root, recovery_authority_path
             )
+            reconciliation = validate_workspace_scope_reconciliation_authority(
+                authority_root, WORKSPACE_RECONCILIATION_AUTHORITY_PATH
+            )
         except ReferenceAuthorityError as exc:
-            raise DatabaseError("reference recovery authority files are invalid") from exc
-        if validated != recovery_authority_sha256:
-            raise DatabaseError("reference recovery authority digest does not match its files")
+            raise DatabaseError("reference replacement authority files are invalid") from exc
+        if (
+            validated != recovery_authority_sha256
+            or sha256_json(reconciliation) != workspace_reconciliation_authority_sha256
+            or reconciliation["original_workspace_scope_sha256"] != original_workspace_scope_sha256
+            or reconciliation["authenticated_workspace_identity_sha256"]
+            != authenticated_workspace_identity_sha256
+        ):
+            raise DatabaseError("reference replacement authority lineage mismatch")
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
                 """SELECT br.reference_execution_scope_sha256, br.lease_expires_at,
                     br.heartbeat_at, rre.original_execution_scope_sha256,
-                    rps.authenticated_workspace_scope_sha256,
+                    rps.original_workspace_scope_sha256,
+                    rps.authenticated_workspace_identity_sha256,
+                    rps.workspace_reconciliation_authority_sha256,
                     rps.auth_binding_sha256
                 FROM budget_reservations AS br
                 JOIN reference_replacement_entitlements AS rre
@@ -4283,16 +4523,25 @@ class ResultsDatabase:
             ).fetchone()
             if (
                 row is None
-                or row["reference_execution_scope_sha256"]
-                != row["original_execution_scope_sha256"]
-                or row["authenticated_workspace_scope_sha256"] != workspace_scope_sha256
+                or row["reference_execution_scope_sha256"] != row["original_execution_scope_sha256"]
+                or row["original_workspace_scope_sha256"] != original_workspace_scope_sha256
+                or row["authenticated_workspace_identity_sha256"]
+                != authenticated_workspace_identity_sha256
+                or row["workspace_reconciliation_authority_sha256"]
+                != workspace_reconciliation_authority_sha256
                 or row["auth_binding_sha256"] != auth_binding_sha256
             ):
                 raise DatabaseError("reference replacement is not ready for provider contact")
             try:
                 auth_receipt = validate_workspace_auth_receipt(
                     auth_receipt_bytes,
-                    expected_workspace_scope_sha256=workspace_scope_sha256,
+                    expected_original_workspace_scope_sha256=(original_workspace_scope_sha256),
+                    expected_authenticated_workspace_identity_sha256=(
+                        authenticated_workspace_identity_sha256
+                    ),
+                    expected_reconciliation_authority_sha256=(
+                        workspace_reconciliation_authority_sha256
+                    ),
                     expected_binding_sha256=auth_binding_sha256,
                     validated_at=occurred,
                     maximum_age_seconds=AUTH_RECEIPT_MAXIMUM_AGE_SECONDS,

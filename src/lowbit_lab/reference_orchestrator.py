@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -34,6 +35,7 @@ from lowbit_lab.constants import (
     REFERENCE_SIGNED_CDN_AUTHORITY_SHA256,
     REFERENCE_SIGNED_CDN_MERGE_COMMIT,
     REFERENCE_SIGNED_REDIRECT_POLICY,
+    REFERENCE_WORKSPACE_RECONCILIATION_AUTHORITY_SHA256,
 )
 from lowbit_lab.db import SCHEMA_VERSION, ResultsDatabase, confine_results_db
 from lowbit_lab.evaluation_lock import validate_pending_evaluation_lock
@@ -55,9 +57,12 @@ from lowbit_lab.provider_evidence import (
 )
 from lowbit_lab.reference_authority import (
     RECOVERY_AUTHORITY_PATH,
+    WORKSPACE_RECONCILIATION_AUTHORITY_PATH,
     ReferenceAuthorityError,
     build_reference_recovery_authority,
+    build_workspace_scope_reconciliation_authority,
     validate_reference_recovery_authority,
+    validate_workspace_scope_reconciliation_authority,
 )
 from lowbit_lab.reference_bootstrap import (
     EMPIRICAL_FACTS,
@@ -177,14 +182,49 @@ def _configured_workspace_scope(root: Path) -> str:
     return scope
 
 
+def _require_merged_clean_main(root: Path) -> str:
+    """Require the local checkout to be exact, clean, reviewed public main."""
+    commands = (
+        ["git", "status", "--porcelain=v1"],
+        ["git", "branch", "--show-current"],
+        ["git", "rev-parse", "HEAD"],
+        ["git", "rev-parse", "origin/main"],
+    )
+    outputs: list[str] = []
+    try:
+        for command in commands:
+            completed = subprocess.run(
+                command,
+                cwd=root,
+                check=False,
+                capture_output=True,
+                text=True,
+                shell=False,
+                timeout=10,
+            )
+            if completed.returncode != 0:
+                raise ReferenceOrchestratorError("reviewed main lineage is unavailable")
+            outputs.append(completed.stdout.strip())
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ReferenceOrchestratorError("reviewed main lineage is unavailable") from exc
+    dirty, branch, head, origin_main = outputs
+    if (
+        dirty
+        or branch != "main"
+        or re.fullmatch(r"[0-9a-f]{40}", head) is None
+        or head != origin_main
+    ):
+        raise ReferenceOrchestratorError("live actions require clean merged origin/main")
+    return head
+
+
 def _run_modal_cli(
     arguments: list[str],
     *,
     runner: Any | None = None,
 ) -> bytes:
     """Run only the read-only Modal CLI surfaces and return uncaptured bytes."""
-    _validate_modal_profile_security(runner=runner)
-    command = [sys.executable, "-I", "-B", "-m", "modal", *arguments]
+    command = [sys.executable, "-I", "-B", "-c", _VALIDATED_MODAL_CLI_SCRIPT, *arguments]
     environment = sanitized_modal_environment()
     try:
         if runner is not None:
@@ -224,18 +264,34 @@ def _run_modal_cli(
     return stdout
 
 
-_PROFILE_SECURITY_SCRIPT = (
-    "from modal.config import DEFAULT_SERVER_URL,config;"
+_VALIDATED_MODAL_CLI_SCRIPT = (
+    "from modal.config import DEFAULT_SERVER_URL,_check_config,config;"
+    "_check_config();"
     "ok=(DEFAULT_SERVER_URL==" + repr(OFFICIAL_MODAL_SERVER_URL) + " and "
     "config.get('server_url',use_env=False)==DEFAULT_SERVER_URL and "
     "config.get('override_headers',use_env=False) in (None,{}));"
-    "raise SystemExit(0 if ok else 23)"
+    "ok or (_ for _ in ()).throw(RuntimeError('unsupported provider transport'));"
+    "from modal.__main__ import main;main()"
+)
+_ACTIVE_WORKSPACE_DIGEST_SCRIPT = (
+    "import asyncio,hashlib;"
+    "from modal.config import DEFAULT_SERVER_URL,_check_config,_lookup_workspace,_profile,config;"
+    "_check_config();"
+    "server=config.get('server_url',profile=_profile,use_env=False);"
+    "headers=config.get('override_headers',profile=_profile,use_env=False);"
+    "ok=(DEFAULT_SERVER_URL==" + repr(OFFICIAL_MODAL_SERVER_URL) + " and "
+    "server==DEFAULT_SERVER_URL and headers in (None,{}));"
+    "ok or (_ for _ in ()).throw(RuntimeError('unsupported provider transport'));"
+    "token_id=config.get('token_id',profile=_profile,use_env=False);"
+    "token_secret=config.get('token_secret',profile=_profile,use_env=False);"
+    "response=asyncio.run(_lookup_workspace(server,token_id,token_secret));"
+    "print(hashlib.sha256(response.username.encode('utf-8')).hexdigest())"
 )
 
 
-def _validate_modal_profile_security(*, runner: Any | None = None) -> None:
-    """Ask the pinned SDK to validate only noncredential profile transport settings."""
-    command = [sys.executable, "-I", "-B", "-c", _PROFILE_SECURITY_SCRIPT]
+def _run_active_workspace_digest(*, runner: Any | None = None) -> bytes:
+    """Authenticate only the active profile and emit only its workspace digest."""
+    command = [sys.executable, "-I", "-B", "-c", _ACTIVE_WORKSPACE_DIGEST_SCRIPT]
     environment = sanitized_modal_environment()
     try:
         completed = (runner or subprocess.run)(
@@ -247,46 +303,28 @@ def _validate_modal_profile_security(*, runner: Any | None = None) -> None:
             timeout=60,
         )
     except (OSError, subprocess.SubprocessError) as exc:
-        raise ReferenceOrchestratorError(
-            "Modal provider profile validation is unavailable"
-        ) from exc
+        raise ReferenceOrchestratorError("Modal workspace identity is unavailable") from exc
     if completed.returncode != 0:
-        raise ReferenceOrchestratorError("Modal provider profile transport is unsupported")
+        raise ReferenceOrchestratorError("Modal workspace identity is unavailable")
+    if not isinstance(completed.stdout, bytes):
+        raise ReferenceOrchestratorError("Modal workspace identity is invalid")
+    return completed.stdout
 
 
 def _current_workspace_digest(*, runner: Any | None = None) -> str:
-    raw = _run_modal_cli(["profile", "list", "--json"], runner=runner)
+    raw = _run_active_workspace_digest(runner=runner)
     try:
-        value = json.loads(raw.decode("utf-8", errors="strict"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        digest = raw.decode("ascii", errors="strict").strip()
+    except UnicodeDecodeError as exc:
         raise ReferenceOrchestratorError("Modal workspace identity is invalid") from exc
-    records = (
-        value
-        if isinstance(value, list)
-        else value.get("profiles", [])
-        if isinstance(value, Mapping)
-        else []
-    )
-    active = [
-        item for item in records if isinstance(item, Mapping) and item.get("active") is True
-    ]
-    if len(active) != 1:
-        active = [
-            item
-            for item in records
-            if isinstance(item, Mapping) and item.get("current") is True
-        ]
-    if len(active) != 1:
-        raise ReferenceOrchestratorError("Modal workspace identity is ambiguous")
-    identity = active[0].get("workspace_name", active[0].get("workspace"))
-    if (
-        not isinstance(identity, str)
-        or not identity
-        or len(identity) > 256
-        or any(ord(character) < 32 for character in identity)
-    ):
+    encoded = digest.encode("ascii")
+    if SHA256_RE.fullmatch(digest) is None or raw not in {
+        encoded,
+        encoded + b"\n",
+        encoded + b"\r\n",
+    }:
         raise ReferenceOrchestratorError("Modal workspace identity is invalid")
-    return _sha(identity.encode("utf-8"))
+    return digest
 
 
 def bind_workspace_auth(root: Path, *, runner: Any | None = None) -> Mapping[str, object]:
@@ -295,15 +333,20 @@ def bind_workspace_auth(root: Path, *, runner: Any | None = None) -> Mapping[str
         raise ReferenceOrchestratorError("ambient provider environment override is forbidden")
     root = root.resolve()
     scope = _configured_workspace_scope(root)
+    reconciliation = validate_workspace_scope_reconciliation_authority(root)
     workspace_identity_sha256 = _current_workspace_digest(runner=runner)
-    if workspace_identity_sha256 != scope:
-        raise ReferenceOrchestratorError("authenticated Modal workspace scope mismatch")
+    if (
+        reconciliation["original_workspace_scope_sha256"] != scope
+        or reconciliation["authenticated_workspace_identity_sha256"] != workspace_identity_sha256
+    ):
+        raise ReferenceOrchestratorError("authenticated Modal workspace reconciliation mismatch")
     binding = {
+        "authenticated_workspace_identity_sha256": workspace_identity_sha256,
         "kind": "reference_modal_workspace_auth_binding",
-        "workspace_identity_sha256": workspace_identity_sha256,
+        "original_workspace_scope_sha256": scope,
         "provider": "modal",
-        "schema_version": 1,
-        "workspace_scope_sha256": scope,
+        "reconciliation_authority_sha256": (REFERENCE_WORKSPACE_RECONCILIATION_AUTHORITY_SHA256),
+        "schema_version": 2,
     }
     encoded = canonical_bytes(binding)
     path = root / AUTH_BINDING_PATH
@@ -316,8 +359,10 @@ def bind_workspace_auth(root: Path, *, runner: Any | None = None) -> Mapping[str
         except SafeFileError as exc:
             raise ReferenceOrchestratorError("workspace auth binding raced") from exc
     return {
+        "authenticated_workspace_identity_sha256": workspace_identity_sha256,
         "binding_sha256": _sha(encoded),
-        "workspace_scope_sha256": scope,
+        "original_workspace_scope_sha256": scope,
+        "reconciliation_authority_sha256": (REFERENCE_WORKSPACE_RECONCILIATION_AUTHORITY_SHA256),
     }
 
 
@@ -333,34 +378,44 @@ def verify_workspace_auth(
     root = root.resolve()
     binding = _root_json(root, AUTH_BINDING_PATH, "workspace auth binding")
     expected = {
+        "authenticated_workspace_identity_sha256",
         "kind",
-        "workspace_identity_sha256",
+        "original_workspace_scope_sha256",
         "provider",
+        "reconciliation_authority_sha256",
         "schema_version",
-        "workspace_scope_sha256",
     }
     if (
         set(binding) != expected
-        or binding.get("schema_version") != 1
+        or binding.get("schema_version") != 2
         or binding.get("kind") != "reference_modal_workspace_auth_binding"
         or binding.get("provider") != "modal"
     ):
         raise ReferenceOrchestratorError("workspace auth binding schema drift")
     scope = _configured_workspace_scope(root)
-    if binding.get("workspace_scope_sha256") != scope or binding.get(
-        "workspace_identity_sha256"
-    ) != _current_workspace_digest(runner=runner):
-        raise ReferenceOrchestratorError("authenticated Modal workspace scope mismatch")
+    reconciliation = validate_workspace_scope_reconciliation_authority(root)
+    current_identity = _current_workspace_digest(runner=runner)
+    if (
+        binding.get("original_workspace_scope_sha256") != scope
+        or binding.get("authenticated_workspace_identity_sha256") != current_identity
+        or binding.get("reconciliation_authority_sha256")
+        != REFERENCE_WORKSPACE_RECONCILIATION_AUTHORITY_SHA256
+        or reconciliation["original_workspace_scope_sha256"] != scope
+        or reconciliation["authenticated_workspace_identity_sha256"] != current_identity
+    ):
+        raise ReferenceOrchestratorError("authenticated Modal workspace reconciliation mismatch")
     authenticated_at = datetime.now(UTC).isoformat()
     receipt = {
         "authenticated_at": authenticated_at,
+        "authenticated_workspace_identity_sha256": current_identity,
         "binding_sha256": _sha(canonical_bytes(binding)),
         "kind": "reference_modal_workspace_auth_receipt",
         "method_sha256": AUTH_METHOD_SHA256,
         "provider": "modal",
-        "schema_version": 1,
+        "original_workspace_scope_sha256": scope,
+        "reconciliation_authority_sha256": (REFERENCE_WORKSPACE_RECONCILIATION_AUTHORITY_SHA256),
+        "schema_version": 2,
         "verification_nonce_sha256": _sha(os.urandom(32)),
-        "workspace_scope_sha256": scope,
     }
     encoded = canonical_bytes(receipt)
     receipt_sha256 = _sha(encoded)
@@ -379,21 +434,28 @@ def verify_workspace_auth(
     return {**receipt, "receipt_sha256": receipt_sha256}
 
 
-def _validate_fresh_auth_receipt(root: Path, *, expected_workspace_scope_sha256: str) -> None:
+def _validate_fresh_auth_receipt(
+    root: Path,
+    *,
+    expected_original_workspace_scope_sha256: str,
+    expected_authenticated_workspace_identity_sha256: str,
+) -> None:
     receipt = _root_json(root, AUTH_RECEIPT_PATH, "workspace auth receipt")
     if (
         set(receipt)
         != {
             "authenticated_at",
+            "authenticated_workspace_identity_sha256",
             "binding_sha256",
             "kind",
             "method_sha256",
             "provider",
+            "original_workspace_scope_sha256",
+            "reconciliation_authority_sha256",
             "schema_version",
             "verification_nonce_sha256",
-            "workspace_scope_sha256",
         }
-        or receipt.get("schema_version") != 1
+        or receipt.get("schema_version") != 2
         or receipt.get("kind") != "reference_modal_workspace_auth_receipt"
         or receipt.get("provider") != "modal"
     ):
@@ -403,10 +465,14 @@ def _validate_fresh_auth_receipt(root: Path, *, expected_workspace_scope_sha256:
     if age < 0 or age > AUTH_MAXIMUM_AGE_SECONDS:
         raise ReferenceOrchestratorError("workspace auth receipt is stale")
     if (
-        receipt.get("workspace_scope_sha256") != expected_workspace_scope_sha256
+        receipt.get("original_workspace_scope_sha256") != expected_original_workspace_scope_sha256
+        or receipt.get("authenticated_workspace_identity_sha256")
+        != expected_authenticated_workspace_identity_sha256
+        or receipt.get("reconciliation_authority_sha256")
+        != REFERENCE_WORKSPACE_RECONCILIATION_AUTHORITY_SHA256
         or receipt.get("method_sha256") != AUTH_METHOD_SHA256
     ):
-        raise ReferenceOrchestratorError("workspace auth receipt scope mismatch")
+        raise ReferenceOrchestratorError("workspace auth receipt reconciliation mismatch")
 
 
 def _original_preidentity_row(database: ResultsDatabase) -> Mapping[str, Any]:
@@ -429,6 +495,49 @@ def _original_preidentity_row(database: ResultsDatabase) -> Mapping[str, Any]:
     return dict(rows[0])
 
 
+def materialize_workspace_reconciliation_authority(
+    root: Path, *, runner: Any | None = None
+) -> Mapping[str, str]:
+    """Create the exact ignored one-time mapping from live, read-only lineage."""
+    root = root.resolve()
+    _require_merged_clean_main(root)
+    if provider_environment_overrides_present():
+        raise ReferenceOrchestratorError("ambient provider environment override is forbidden")
+    if validate_reference_recovery_authority(root) != REFERENCE_RECOVERY_AUTHORITY_SHA256:
+        raise ReferenceOrchestratorError("recovery authority lineage drift")
+    database = ResultsDatabase(confine_results_db(root, DATABASE_PATH))
+    row = _original_preidentity_row(database)
+    authority = build_workspace_scope_reconciliation_authority(
+        original_workspace_scope_sha256=_configured_workspace_scope(root),
+        authenticated_workspace_identity_sha256=_current_workspace_digest(runner=runner),
+        original_reservation_id=str(row["reservation_id"]),
+        original_execution_scope_sha256=str(row["reference_execution_scope_sha256"]),
+        billing_authority_sha256=str(row["billing_authority_sha256"]),
+    )
+    encoded = canonical_bytes(authority) + b"\n"
+    if canonical_sha256(authority) != REFERENCE_WORKSPACE_RECONCILIATION_AUTHORITY_SHA256:
+        raise ReferenceOrchestratorError("workspace reconciliation authority lineage drift")
+    output = root / WORKSPACE_RECONCILIATION_AUTHORITY_PATH
+    try:
+        if output.exists():
+            if output.read_bytes() != encoded:
+                raise ReferenceOrchestratorError("workspace reconciliation authority is immutable")
+        else:
+            atomic_write(root, WORKSPACE_RECONCILIATION_AUTHORITY_PATH, encoded, replace=False)
+        validated = validate_workspace_scope_reconciliation_authority(root)
+    except (OSError, SafeFileError, ReferenceAuthorityError) as exc:
+        raise ReferenceOrchestratorError(
+            "workspace reconciliation authority is invalid"
+        ) from exc
+    return {
+        "authenticated_workspace_identity_sha256": str(
+            validated["authenticated_workspace_identity_sha256"]
+        ),
+        "original_workspace_scope_sha256": str(validated["original_workspace_scope_sha256"]),
+        "reconciliation_authority_sha256": (REFERENCE_WORKSPACE_RECONCILIATION_AUTHORITY_SHA256),
+    }
+
+
 def capture_workspace_zero_billing(
     root: Path,
     *,
@@ -438,6 +547,7 @@ def capture_workspace_zero_billing(
 ) -> Mapping[str, object]:
     """Capture one explicit, complete, unfiltered, canonical empty workspace report."""
     root = root.resolve()
+    _require_merged_clean_main(root)
     start = _utc(query_start, "query start")
     end = _utc(query_end, "query end")
     if (
@@ -455,8 +565,7 @@ def capture_workspace_zero_billing(
     completeness_delay = int(row["billing_completeness_delay_seconds"])
     if (
         start > _utc(str(row["consumed_at"]), "original consumed_at")
-        or end
-        < latest_boundary + timedelta(seconds=int(REFERENCE_RESOURCES["timeout_seconds"]))
+        or end < latest_boundary + timedelta(seconds=int(REFERENCE_RESOURCES["timeout_seconds"]))
         or datetime.now(UTC) < end + timedelta(seconds=completeness_delay)
     ):
         raise ReferenceOrchestratorError(
@@ -497,7 +606,11 @@ def capture_workspace_zero_billing(
         )
     # Recheck the selected local profile after the provider response.
     after = verify_workspace_auth(root, runner=runner, write_latest=False)
-    if after["workspace_scope_sha256"] != auth["workspace_scope_sha256"]:
+    if (
+        after["authenticated_workspace_identity_sha256"]
+        != auth["authenticated_workspace_identity_sha256"]
+        or after["original_workspace_scope_sha256"] != auth["original_workspace_scope_sha256"]
+    ):
         raise ReferenceOrchestratorError("Modal workspace changed during billing capture")
     acquired_at = datetime.now(UTC).isoformat()
     report = raw_report
@@ -506,7 +619,7 @@ def capture_workspace_zero_billing(
         "acquired_at": acquired_at,
         "all_environments": True,
         "all_resources": True,
-        "authenticated_workspace_scope_sha256": auth["workspace_scope_sha256"],
+        "authenticated_workspace_identity_sha256": auth["authenticated_workspace_identity_sha256"],
         "auth_binding_sha256": auth["binding_sha256"],
         "pre_auth_receipt_sha256": auth["receipt_sha256"],
         "post_auth_receipt_sha256": after["receipt_sha256"],
@@ -519,6 +632,7 @@ def capture_workspace_zero_billing(
         "filters": [],
         "kind": WORKSPACE_ZERO_RECEIPT_KIND,
         "original_execution_scope_sha256": row["reference_execution_scope_sha256"],
+        "original_workspace_scope_sha256": auth["original_workspace_scope_sha256"],
         "pagination_complete": True,
         "provider": "modal",
         "query_end": end.isoformat(),
@@ -528,7 +642,10 @@ def capture_workspace_zero_billing(
         "report_size_bytes": len(report),
         "reservation_id": row["reservation_id"],
         "row_count": 0,
-        "schema_version": 1,
+        "schema_version": 2,
+        "workspace_reconciliation_authority_sha256": (
+            REFERENCE_WORKSPACE_RECONCILIATION_AUTHORITY_SHA256
+        ),
     }
     receipt_bytes = canonical_bytes(receipt)
     try:
@@ -541,13 +658,20 @@ def capture_workspace_zero_billing(
         "provider_read_only_contacted": True,
         "receipt_sha256": _sha(receipt_bytes),
         "report_sha256": _sha(report),
-        "workspace_scope_sha256": auth["workspace_scope_sha256"],
+        "authenticated_workspace_identity_sha256": auth["authenticated_workspace_identity_sha256"],
+        "original_workspace_scope_sha256": auth["original_workspace_scope_sha256"],
     }
 
 
 def settle_workspace_zero(root: Path) -> Mapping[str, object]:
     """Settle from local byte snapshots only; this path has no adapter import."""
     root = root.resolve()
+    _require_merged_clean_main(root)
+    try:
+        validate_reference_recovery_authority(root)
+        validate_workspace_scope_reconciliation_authority(root)
+    except ReferenceAuthorityError as exc:
+        raise ReferenceOrchestratorError("workspace settlement authority is invalid") from exc
     database = ResultsDatabase(confine_results_db(root, DATABASE_PATH))
     database.initialize()
     row = _original_preidentity_row(database)
@@ -670,7 +794,10 @@ def _replacement_binding(
         rows = connection.execute(
             """SELECT rre.entitlement_sha256, rre.state,
                 rre.original_execution_scope_sha256,
-                rps.authenticated_workspace_scope_sha256, rps.auth_binding_sha256
+                rps.original_workspace_scope_sha256,
+                rps.authenticated_workspace_identity_sha256,
+                rps.workspace_reconciliation_authority_sha256,
+                rps.auth_binding_sha256
             FROM reference_replacement_entitlements AS rre
             JOIN reference_preidentity_settlements AS rps
               ON rps.settlement_sha256 = rre.settlement_sha256
@@ -686,8 +813,12 @@ def _replacement_binding(
         raise ReferenceOrchestratorError("reference replacement entitlement is unavailable")
     return {
         "entitlement_sha256": str(entitlement["entitlement_sha256"]),
-        "workspace_scope_sha256": str(
-            entitlement["authenticated_workspace_scope_sha256"]
+        "original_workspace_scope_sha256": str(entitlement["original_workspace_scope_sha256"]),
+        "authenticated_workspace_identity_sha256": str(
+            entitlement["authenticated_workspace_identity_sha256"]
+        ),
+        "workspace_reconciliation_authority_sha256": str(
+            entitlement["workspace_reconciliation_authority_sha256"]
         ),
         "auth_binding_sha256": str(entitlement["auth_binding_sha256"]),
     }
@@ -1141,7 +1272,11 @@ def prepare_replacement(
         database, execution_scope_sha256=config.reference_execution_scope_sha256
     )
     _validate_fresh_auth_receipt(
-        root, expected_workspace_scope_sha256=binding["workspace_scope_sha256"]
+        root,
+        expected_original_workspace_scope_sha256=binding["original_workspace_scope_sha256"],
+        expected_authenticated_workspace_identity_sha256=binding[
+            "authenticated_workspace_identity_sha256"
+        ],
     )
     return config, request, capability, binding
 
@@ -1158,6 +1293,7 @@ def execute(
 ) -> Mapping[str, object]:
     """Reserve once and cross the existing adapter boundary after fresh local checks."""
     root = root.resolve()
+    _require_merged_clean_main(root)
     _watchdog_ready()
     if provider_environment_overrides_present():
         raise ReferenceOrchestratorError("ambient provider environment override is forbidden")
@@ -1185,7 +1321,12 @@ def execute(
         verify_workspace_auth(root)
         _validate_fresh_auth_receipt(
             root,
-            expected_workspace_scope_sha256=replacement_binding["workspace_scope_sha256"],
+            expected_original_workspace_scope_sha256=replacement_binding[
+                "original_workspace_scope_sha256"
+            ],
+            expected_authenticated_workspace_identity_sha256=replacement_binding[
+                "authenticated_workspace_identity_sha256"
+            ],
         )
     now = datetime.now(UTC)
     expires = now + timedelta(hours=1)
@@ -1260,8 +1401,20 @@ def execute(
         recovery_authority_sha256=(
             None if replacement_binding is None else REFERENCE_RECOVERY_AUTHORITY_SHA256
         ),
-        replacement_workspace_scope_sha256=(
-            None if replacement_binding is None else replacement_binding["workspace_scope_sha256"]
+        replacement_original_workspace_scope_sha256=(
+            None
+            if replacement_binding is None
+            else replacement_binding["original_workspace_scope_sha256"]
+        ),
+        replacement_authenticated_workspace_identity_sha256=(
+            None
+            if replacement_binding is None
+            else replacement_binding["authenticated_workspace_identity_sha256"]
+        ),
+        workspace_reconciliation_authority_sha256=(
+            None
+            if replacement_binding is None
+            else replacement_binding["workspace_reconciliation_authority_sha256"]
         ),
         replacement_auth_binding_sha256=(
             None if replacement_binding is None else replacement_binding["auth_binding_sha256"]
@@ -1287,6 +1440,7 @@ def _parser() -> argparse.ArgumentParser:
     sub.add_parser("status")
     sub.add_parser("auth-bind")
     sub.add_parser("recovery-authority")
+    sub.add_parser("reconciliation-authority")
     sub.add_parser("auth-verify")
     capture = sub.add_parser("billing-capture")
     capture.add_argument("--query-start", required=True)
@@ -1336,6 +1490,15 @@ def main(argv: list[str] | None = None) -> int:
                     "ok": True,
                     "provider_contacted": False,
                     **materialize_recovery_authority(args.root),
+                }
+            )
+            return 0
+        if command == "reconciliation-authority":
+            emit(
+                {
+                    "ok": True,
+                    "provider_contacted": False,
+                    **materialize_workspace_reconciliation_authority(args.root),
                 }
             )
             return 0

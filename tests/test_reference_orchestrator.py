@@ -11,6 +11,13 @@ import lowbit_lab.reference_orchestrator as orchestrator
 from lowbit_lab.reference_modal_adapter import ReferenceModalCapability
 from lowbit_lab.reference_provider_auth import MODAL_AUTH_OVERRIDE_KEYS, auth_receipt_path
 
+_REAL_MERGED_MAIN_GATE = orchestrator._require_merged_clean_main
+
+
+@pytest.fixture(autouse=True)
+def _merged_main_gate(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(orchestrator, "_require_merged_clean_main", lambda root: "f" * 40)
+
 
 def _capability(root: Path) -> ReferenceModalCapability:
     return ReferenceModalCapability(
@@ -545,8 +552,53 @@ def test_cli_failure_is_sanitized(tmp_path: Path, capsys: pytest.CaptureFixture[
     }
 
 
-def _write_auth_fixture(root: Path, profile: str = "private-profile-name") -> None:
-    workspace_scope = orchestrator._sha(profile.encode())
+@pytest.mark.parametrize(
+    "outputs",
+    (
+        (" M tracked.py\n", "main\n", "a" * 40 + "\n", "a" * 40 + "\n"),
+        ("", "feature\n", "a" * 40 + "\n", "a" * 40 + "\n"),
+        ("", "main\n", "a" * 40 + "\n", "b" * 40 + "\n"),
+    ),
+)
+def test_live_gate_rejects_dirty_nonmain_or_unmerged_checkout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    outputs: tuple[str, str, str, str],
+) -> None:
+    responses = iter(outputs)
+    monkeypatch.setattr(
+        orchestrator.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=0, stdout=next(responses), stderr=""
+        ),
+    )
+    with pytest.raises(orchestrator.ReferenceOrchestratorError, match="clean merged"):
+        _REAL_MERGED_MAIN_GATE(tmp_path)
+
+
+def test_live_gate_accepts_exact_clean_origin_main(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    head = "a" * 40
+    responses = iter(("", "main\n", head + "\n", head + "\n"))
+    monkeypatch.setattr(
+        orchestrator.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=0, stdout=next(responses), stderr=""
+        ),
+    )
+    assert _REAL_MERGED_MAIN_GATE(tmp_path) == head
+
+
+def _write_auth_fixture(
+    root: Path,
+    profile: str = "private-profile-name",
+    monkeypatch: pytest.MonkeyPatch | None = None,
+) -> None:
+    workspace_identity = orchestrator._sha(profile.encode())
+    workspace_scope = "b" * 64
     config = root / orchestrator.CONFIG_PATH
     config.parent.mkdir(parents=True, exist_ok=True)
     config.write_text(
@@ -554,15 +606,27 @@ def _write_auth_fixture(root: Path, profile: str = "private-profile-name") -> No
         encoding="utf-8",
     )
     binding = {
+        "authenticated_workspace_identity_sha256": workspace_identity,
         "kind": "reference_modal_workspace_auth_binding",
-        "workspace_identity_sha256": workspace_scope,
+        "original_workspace_scope_sha256": workspace_scope,
         "provider": "modal",
-        "schema_version": 1,
-        "workspace_scope_sha256": workspace_scope,
+        "reconciliation_authority_sha256": (
+            orchestrator.REFERENCE_WORKSPACE_RECONCILIATION_AUTHORITY_SHA256
+        ),
+        "schema_version": 2,
     }
     path = root / orchestrator.AUTH_BINDING_PATH
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(orchestrator.canonical_bytes(binding))
+    if monkeypatch is not None:
+        monkeypatch.setattr(
+            orchestrator,
+            "validate_workspace_scope_reconciliation_authority",
+            lambda root: {
+                "original_workspace_scope_sha256": workspace_scope,
+                "authenticated_workspace_identity_sha256": workspace_identity,
+            },
+        )
 
 
 def _write_billing_authority_fixture(root: Path) -> str:
@@ -581,14 +645,14 @@ def _write_billing_authority_fixture(root: Path) -> str:
     return orchestrator._sha(path.read_bytes())
 
 
-def test_auth_receipt_never_persists_profile_display_value(tmp_path: Path) -> None:
+def test_auth_receipt_never_persists_profile_display_value(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     profile = "private-profile-name"
-    _write_auth_fixture(tmp_path, profile)
+    _write_auth_fixture(tmp_path, profile, monkeypatch)
 
     def runner(*args: object, **kwargs: object) -> SimpleNamespace:
-        stdout = json.dumps(
-            [{"active": True, "workspace_name": profile}]
-        ).encode()
+        stdout = orchestrator._sha(profile.encode()).encode() + b"\n"
         return SimpleNamespace(returncode=0, stdout=stdout, stderr=b"")
 
     receipt = orchestrator.verify_workspace_auth(tmp_path, runner=runner)
@@ -596,7 +660,8 @@ def test_auth_receipt_never_persists_profile_display_value(tmp_path: Path) -> No
     persisted = (tmp_path / orchestrator.AUTH_RECEIPT_PATH).read_bytes()
     assert profile.encode() not in persisted
     assert "profile" not in json.loads(persisted)
-    assert receipt["workspace_scope_sha256"] == orchestrator._sha(profile.encode())
+    assert receipt["authenticated_workspace_identity_sha256"] == orchestrator._sha(profile.encode())
+    assert receipt["original_workspace_scope_sha256"] == "b" * 64
 
 
 def test_workspace_probe_accepts_pinned_modal_shape_and_strips_auth_overrides(
@@ -613,17 +678,15 @@ def test_workspace_probe_accepts_pinned_modal_shape_and_strips_auth_overrides(
         monkeypatch.setenv(key, "must-not-be-read")
 
     def runner(command: list[str], **kwargs: object) -> SimpleNamespace:
-        if "-c" in command:
-            return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
-        assert command[1:4] == ["-I", "-B", "-m"]
-        assert command[-4:] == ["modal", "profile", "list", "--json"]
+        assert command[1:4] == ["-I", "-B", "-c"]
+        assert command[4] == orchestrator._ACTIVE_WORKSPACE_DIGEST_SCRIPT
         environment = kwargs["env"]
         assert isinstance(environment, dict)
         assert not any(key in environment for key in MODAL_AUTH_OVERRIDE_KEYS)
         assert kwargs["shell"] is False
         return SimpleNamespace(
             returncode=0,
-            stdout=json.dumps([{"active": True, "workspace": profile}]).encode(),
+            stdout=orchestrator._sha(profile.encode()).encode() + b"\n",
             stderr=b"",
         )
 
@@ -661,21 +724,31 @@ def test_workspace_auth_rejects_transport_or_import_override_before_cli(
     assert not (tmp_path / orchestrator.AUTH_RECEIPT_PATH).exists()
 
 
-def test_workspace_auth_binding_cannot_be_rebound(tmp_path: Path) -> None:
+def test_workspace_auth_binding_cannot_be_rebound(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     config = tmp_path / orchestrator.CONFIG_PATH
     config.parent.mkdir(parents=True, exist_ok=True)
     config.write_text(
-        "provider:\n  workspace_scope_sha256: '" + orchestrator._sha(b"first-profile") + "'\n",
+        "provider:\n  workspace_scope_sha256: '" + "b" * 64 + "'\n",
         encoding="utf-8",
     )
 
     def runner_for(profile: str) -> object:
         return lambda *args, **kwargs: SimpleNamespace(
             returncode=0,
-            stdout=json.dumps([{"active": True, "workspace_name": profile}]).encode(),
+            stdout=orchestrator._sha(profile.encode()).encode() + b"\n",
             stderr=b"",
         )
 
+    monkeypatch.setattr(
+        orchestrator,
+        "validate_workspace_scope_reconciliation_authority",
+        lambda root: {
+            "original_workspace_scope_sha256": "b" * 64,
+            "authenticated_workspace_identity_sha256": orchestrator._sha(b"first-profile"),
+        },
+    )
     orchestrator.bind_workspace_auth(tmp_path, runner=runner_for("first-profile"))
     with pytest.raises(orchestrator.ReferenceOrchestratorError, match="immutable|mismatch"):
         orchestrator.bind_workspace_auth(tmp_path, runner=runner_for("second-profile"))
@@ -708,7 +781,7 @@ def test_billing_capture_rejects_noncanonical_provider_bytes(
     report: bytes,
 ) -> None:
     profile = "private-profile-name"
-    _write_auth_fixture(tmp_path, profile)
+    _write_auth_fixture(tmp_path, profile, monkeypatch)
     authority_sha256 = _write_billing_authority_fixture(tmp_path)
     monkeypatch.setattr(orchestrator, "ResultsDatabase", lambda path: object())
     monkeypatch.setattr(
@@ -728,8 +801,8 @@ def test_billing_capture_rejects_noncanonical_provider_bytes(
 
     def runner(command: list[str], **kwargs: object) -> SimpleNamespace:
         stdout = (
-            json.dumps([{"active": True, "workspace_name": profile}]).encode()
-            if "profile" in command
+            orchestrator._sha(profile.encode()).encode() + b"\n"
+            if command[4] == orchestrator._ACTIVE_WORKSPACE_DIGEST_SCRIPT
             else report
         )
         return SimpleNamespace(returncode=0, stdout=stdout, stderr=b"")
@@ -749,7 +822,7 @@ def test_billing_capture_persists_exact_provider_snapshot(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     profile = "private-profile-name"
-    _write_auth_fixture(tmp_path, profile)
+    _write_auth_fixture(tmp_path, profile, monkeypatch)
     authority_sha256 = _write_billing_authority_fixture(tmp_path)
     monkeypatch.setattr(orchestrator, "ResultsDatabase", lambda path: object())
     monkeypatch.setattr(
@@ -769,8 +842,8 @@ def test_billing_capture_persists_exact_provider_snapshot(
 
     def runner(command: list[str], **kwargs: object) -> SimpleNamespace:
         stdout = (
-            json.dumps([{"active": True, "workspace_name": profile}]).encode()
-            if "profile" in command
+            orchestrator._sha(profile.encode()).encode() + b"\n"
+            if command[4] == orchestrator._ACTIVE_WORKSPACE_DIGEST_SCRIPT
             else orchestrator.CANONICAL_EMPTY_REPORT
         )
         return SimpleNamespace(returncode=0, stdout=stdout, stderr=b"")
@@ -790,15 +863,9 @@ def test_billing_capture_persists_exact_provider_snapshot(
     assert (
         profile.encode() not in (tmp_path / orchestrator.WORKSPACE_ZERO_RECEIPT_PATH).read_bytes()
     )
-    billing_receipt = json.loads(
-        (tmp_path / orchestrator.WORKSPACE_ZERO_RECEIPT_PATH).read_bytes()
-    )
-    pre = tmp_path / auth_receipt_path(
-        billing_receipt["pre_auth_receipt_sha256"]
-    )
-    post = tmp_path / auth_receipt_path(
-        billing_receipt["post_auth_receipt_sha256"]
-    )
+    billing_receipt = json.loads((tmp_path / orchestrator.WORKSPACE_ZERO_RECEIPT_PATH).read_bytes())
+    pre = tmp_path / auth_receipt_path(billing_receipt["pre_auth_receipt_sha256"])
+    post = tmp_path / auth_receipt_path(billing_receipt["post_auth_receipt_sha256"])
     assert pre.is_file() and post.is_file() and pre != post
     assert orchestrator._sha(pre.read_bytes()) == billing_receipt["pre_auth_receipt_sha256"]
     assert orchestrator._sha(post.read_bytes()) == billing_receipt["post_auth_receipt_sha256"]
@@ -827,9 +894,11 @@ def test_recovery_authority_materialization_is_create_once_and_offline(
     )
     first = orchestrator.materialize_recovery_authority(tmp_path)
     second = orchestrator.materialize_recovery_authority(tmp_path)
-    assert first == second == {
-        "recovery_authority_sha256": orchestrator.REFERENCE_RECOVERY_AUTHORITY_SHA256
-    }
+    assert (
+        first
+        == second
+        == {"recovery_authority_sha256": orchestrator.REFERENCE_RECOVERY_AUTHORITY_SHA256}
+    )
     output = tmp_path / orchestrator.RECOVERY_AUTHORITY_PATH
     output.write_bytes(output.read_bytes() + b" ")
     with pytest.raises(orchestrator.ReferenceOrchestratorError, match="immutable"):
@@ -854,6 +923,4 @@ def test_recovery_authority_repairs_only_exact_legacy_missing_newline(
     result = orchestrator.materialize_recovery_authority(tmp_path)
 
     assert output.read_bytes() == legacy + b"\n"
-    assert result == {
-        "recovery_authority_sha256": orchestrator.REFERENCE_RECOVERY_AUTHORITY_SHA256
-    }
+    assert result == {"recovery_authority_sha256": orchestrator.REFERENCE_RECOVERY_AUTHORITY_SHA256}

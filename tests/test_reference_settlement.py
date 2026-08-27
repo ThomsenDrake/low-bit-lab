@@ -14,6 +14,8 @@ from lowbit_lab.reference_settlement import (
 DIGESTS = {
     "recovery": "a" * 64,
     "workspace": "b" * 64,
+    "authenticated_identity": "2" * 64,
+    "reconciliation": "3" * 64,
     "authority": "c" * 64,
     "method": "d" * 64,
     "report_identity": "e" * 64,
@@ -25,7 +27,7 @@ ACQUIRED_AT = datetime(2026, 8, 27, 3, 0, tzinfo=UTC)
 LATEST_BOUNDARY = datetime(2026, 8, 26, 23, 41, 52, tzinfo=UTC)
 REPORT = b"[]\n"
 AUTH_METHOD = hashlib.sha256(
-    b"modal-profile-current-before-and-after-with-local-digest-binding/v1"
+    b"modal-profile-current-before-and-after-with-reconciled-identity-binding/v2"
 ).hexdigest()
 
 
@@ -37,13 +39,15 @@ def _auth_receipt(*, authenticated_at: str, nonce: str) -> bytes:
     return _canonical(
         {
             "authenticated_at": authenticated_at,
+            "authenticated_workspace_identity_sha256": DIGESTS["authenticated_identity"],
             "binding_sha256": "1" * 64,
             "kind": "reference_modal_workspace_auth_receipt",
             "method_sha256": AUTH_METHOD,
             "provider": "modal",
-            "schema_version": 1,
+            "original_workspace_scope_sha256": DIGESTS["workspace"],
+            "reconciliation_authority_sha256": DIGESTS["reconciliation"],
+            "schema_version": 2,
             "verification_nonce_sha256": nonce,
-            "workspace_scope_sha256": DIGESTS["workspace"],
         }
     )
 
@@ -54,11 +58,13 @@ POST_AUTH = _auth_receipt(authenticated_at="2026-08-27T02:59:30+00:00", nonce="5
 
 def _receipt(**changes: object) -> bytes:
     receipt: dict[str, object] = {
-        "schema_version": 1,
+        "schema_version": 2,
         "kind": "reference_workspace_zero_billing_evidence",
         "provider": "modal",
         "recovery_authority_sha256": DIGESTS["recovery"],
-        "authenticated_workspace_scope_sha256": DIGESTS["workspace"],
+        "original_workspace_scope_sha256": DIGESTS["workspace"],
+        "authenticated_workspace_identity_sha256": DIGESTS["authenticated_identity"],
+        "workspace_reconciliation_authority_sha256": DIGESTS["reconciliation"],
         "auth_binding_sha256": "1" * 64,
         "pre_auth_receipt_sha256": hashlib.sha256(PRE_AUTH).hexdigest(),
         "post_auth_receipt_sha256": hashlib.sha256(POST_AUTH).hexdigest(),
@@ -91,7 +97,9 @@ def _validate(receipt: bytes | None = None, report: bytes = REPORT, **changes: o
         "pre_auth_receipt_bytes": PRE_AUTH,
         "post_auth_receipt_bytes": POST_AUTH,
         "expected_recovery_authority_sha256": DIGESTS["recovery"],
-        "expected_workspace_scope_sha256": DIGESTS["workspace"],
+        "expected_original_workspace_scope_sha256": DIGESTS["workspace"],
+        "expected_authenticated_workspace_identity_sha256": DIGESTS["authenticated_identity"],
+        "expected_workspace_reconciliation_authority_sha256": DIGESTS["reconciliation"],
         "expected_billing_authority_sha256": DIGESTS["authority"],
         "expected_billing_method_sha256": DIGESTS["method"],
         "expected_report_identity_sha256": DIGESTS["report_identity"],
@@ -146,7 +154,9 @@ def test_nonzero_rounded_filtered_partial_or_open_receipt_fails_closed(
     ("field", "message"),
     (
         ("recovery_authority_sha256", "recovery"),
-        ("authenticated_workspace_scope_sha256", "workspace"),
+        ("original_workspace_scope_sha256", "workspace"),
+        ("authenticated_workspace_identity_sha256", "workspace"),
+        ("workspace_reconciliation_authority_sha256", "reconciliation"),
         ("billing_authority_sha256", "billing authority"),
         ("billing_method_sha256", "billing method"),
         (
@@ -156,9 +166,7 @@ def test_nonzero_rounded_filtered_partial_or_open_receipt_fails_closed(
         ("original_execution_scope_sha256", "execution scope"),
     ),
 )
-def test_wrong_authority_workspace_or_scope_binding_fails(
-    field: str, message: str
-) -> None:
+def test_wrong_authority_workspace_or_scope_binding_fails(field: str, message: str) -> None:
     with pytest.raises(ReferenceSettlementError, match=message):
         _validate(_receipt(**{field: "9" * 64}))
 
@@ -186,7 +194,9 @@ def test_auth_receipt_bytes_are_revalidated_and_cross_bound() -> None:
             pre_auth_receipt_bytes=PRE_AUTH + b" ",
             post_auth_receipt_bytes=POST_AUTH,
             expected_recovery_authority_sha256=DIGESTS["recovery"],
-            expected_workspace_scope_sha256=DIGESTS["workspace"],
+            expected_original_workspace_scope_sha256=DIGESTS["workspace"],
+            expected_authenticated_workspace_identity_sha256=DIGESTS["authenticated_identity"],
+            expected_workspace_reconciliation_authority_sha256=DIGESTS["reconciliation"],
             expected_billing_authority_sha256=DIGESTS["authority"],
             expected_billing_method_sha256=DIGESTS["method"],
             expected_report_identity_sha256=DIGESTS["report_identity"],
@@ -197,8 +207,19 @@ def test_auth_receipt_bytes_are_revalidated_and_cross_bound() -> None:
             maximum_action_seconds=2700,
             expected_completeness_delay_seconds=3600,
         )
+
+
+def test_workspace_zero_auth_receipts_must_be_fresh_at_capture() -> None:
+    stale_pre = _auth_receipt(
+        authenticated_at="2026-08-27T02:54:59+00:00", nonce="4" * 64
+    )
+    with pytest.raises(ReferenceSettlementError, match="stale"):
+        _validate(
+            _receipt(pre_auth_receipt_sha256=hashlib.sha256(stale_pre).hexdigest()),
+            pre_auth_receipt_bytes=stale_pre,
+        )
     wrong_scope = json.loads(PRE_AUTH)
-    wrong_scope["workspace_scope_sha256"] = "9" * 64
+    wrong_scope["original_workspace_scope_sha256"] = "9" * 64
     wrong_scope_bytes = _canonical(wrong_scope)
     with pytest.raises(ReferenceSettlementError, match="workspace scope"):
         _validate(

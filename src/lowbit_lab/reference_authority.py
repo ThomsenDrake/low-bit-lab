@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+from lowbit_lab.config import SHA256_RE
 from lowbit_lab.constants import (
     REFERENCE_AUTHORITY_SHA256,
     REFERENCE_AUTHORITY_STATEMENT_SHA256,
@@ -21,6 +22,9 @@ from lowbit_lab.constants import (
     REFERENCE_SIGNED_CDN_MERGE_COMMIT,
     REFERENCE_SIGNED_CDN_STATEMENT_SHA256,
     REFERENCE_SIGNED_REDIRECT_POLICY,
+    REFERENCE_WORKSPACE_RECONCILIATION_AUTHORITY_SHA256,
+    REFERENCE_WORKSPACE_RECONCILIATION_BASE_COMMIT,
+    REFERENCE_WORKSPACE_RECONCILIATION_STATEMENT_SHA256,
 )
 from lowbit_lab.handoff import canonical_json, sha256_json
 
@@ -39,6 +43,12 @@ SIGNED_CDN_STATEMENT_PATH = Path("configs/local/reference-signed-cdn-statement.t
 SIGNED_CDN_AUTHORITY_PATH = Path("configs/local/reference-signed-cdn-authority.json")
 RECOVERY_STATEMENT_PATH = Path("configs/local/reference-recovery-standing-authority.txt")
 RECOVERY_AUTHORITY_PATH = Path("configs/local/reference-recovery-authority.json")
+WORKSPACE_RECONCILIATION_STATEMENT_PATH = Path(
+    "docs/plans/local/2026-08-27-workspace-scope-reconciliation-authority.txt"
+)
+WORKSPACE_RECONCILIATION_AUTHORITY_PATH = Path(
+    "configs/local/reference-workspace-scope-reconciliation-authority.json"
+)
 CONTROLLING_PLANS = {
     "original_reference_baseline": (
         Path("docs/plans/local/2026-08-21-2358-feat-full-weight-baseline-plan.md"),
@@ -210,6 +220,33 @@ def build_reference_recovery_authority() -> dict[str, Any]:
         "destructive_cleanup_authorized": False,
         "candidate_conversion_training_promotion_authorized": False,
         "u9_proposal_only": True,
+    }
+
+
+def build_workspace_scope_reconciliation_authority(
+    *,
+    original_workspace_scope_sha256: str,
+    authenticated_workspace_identity_sha256: str,
+    original_reservation_id: str,
+    original_execution_scope_sha256: str,
+    billing_authority_sha256: str,
+) -> dict[str, Any]:
+    """Build the only approved historical-scope to authenticated-identity mapping."""
+    return {
+        "approved_base_commit": REFERENCE_WORKSPACE_RECONCILIATION_BASE_COMMIT,
+        "authenticated_workspace_identity_sha256": authenticated_workspace_identity_sha256,
+        "billing_authority_sha256": billing_authority_sha256,
+        "digest_equality_asserted": False,
+        "historical_config_rewrite": False,
+        "kind": "reference_modal_workspace_scope_reconciliation_authority",
+        "maximum_mapping_uses": 1,
+        "original_execution_scope_sha256": original_execution_scope_sha256,
+        "original_reservation_id": original_reservation_id,
+        "original_workspace_scope_sha256": original_workspace_scope_sha256,
+        "provider": "modal",
+        "replacement_action": "u8_reference_replacement_once",
+        "schema_version": 1,
+        "statement_sha256": REFERENCE_WORKSPACE_RECONCILIATION_STATEMENT_SHA256,
     }
 
 
@@ -466,3 +503,88 @@ def validate_reference_recovery_authority(
     if authority != expected or sha256_json(authority) != REFERENCE_RECOVERY_AUTHORITY_SHA256:
         raise ReferenceAuthorityError("recovery authority boundary has drifted")
     return REFERENCE_RECOVERY_AUTHORITY_SHA256
+
+
+def validate_workspace_scope_reconciliation_authority(
+    root: Path,
+    authority_path: Path = WORKSPACE_RECONCILIATION_AUTHORITY_PATH,
+) -> dict[str, Any]:
+    """Validate the exact one-time scope mapping without changing historical lineage."""
+    validate_reference_recovery_authority(root, RECOVERY_AUTHORITY_PATH)
+    root = root.resolve(strict=True)
+    expected_path = _confined_path(
+        root,
+        WORKSPACE_RECONCILIATION_AUTHORITY_PATH,
+        "workspace reconciliation authority",
+    )
+    resolved_path = (
+        authority_path.resolve()
+        if authority_path.is_absolute()
+        else (root / authority_path).resolve()
+    )
+    if resolved_path != expected_path:
+        raise ReferenceAuthorityError("workspace reconciliation authority path is fixed")
+
+    statement = _read(
+        _confined_path(
+            root,
+            WORKSPACE_RECONCILIATION_STATEMENT_PATH,
+            "workspace reconciliation statement",
+        ),
+        "workspace reconciliation statement",
+    )
+    if (
+        statement.startswith(b"\xef\xbb\xbf")
+        or hashlib.sha256(statement).hexdigest()
+        != REFERENCE_WORKSPACE_RECONCILIATION_STATEMENT_SHA256
+    ):
+        raise ReferenceAuthorityError("workspace reconciliation statement bytes have drifted")
+    try:
+        statement.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as exc:
+        raise ReferenceAuthorityError("workspace reconciliation statement is not UTF-8") from exc
+
+    authority_bytes = _read(resolved_path, "workspace reconciliation authority")
+    try:
+        authority = json.loads(
+            authority_bytes.decode("utf-8", errors="strict"),
+            object_pairs_hook=_reject_duplicate_keys,
+        )
+        expected = build_workspace_scope_reconciliation_authority(
+            original_workspace_scope_sha256=authority["original_workspace_scope_sha256"],
+            authenticated_workspace_identity_sha256=authority[
+                "authenticated_workspace_identity_sha256"
+            ],
+            original_reservation_id=authority["original_reservation_id"],
+            original_execution_scope_sha256=authority["original_execution_scope_sha256"],
+            billing_authority_sha256=authority["billing_authority_sha256"],
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError) as exc:
+        raise ReferenceAuthorityError("workspace reconciliation authority is invalid") from exc
+    digests = (
+        expected["original_workspace_scope_sha256"],
+        expected["authenticated_workspace_identity_sha256"],
+        expected["original_execution_scope_sha256"],
+        expected["billing_authority_sha256"],
+    )
+    if any(
+        not isinstance(value, str)
+        or SHA256_RE.fullmatch(value) is None
+        for value in digests
+    ):
+        raise ReferenceAuthorityError("workspace reconciliation digest is invalid")
+    if (
+        expected["original_workspace_scope_sha256"]
+        == expected["authenticated_workspace_identity_sha256"]
+    ):
+        raise ReferenceAuthorityError("workspace reconciliation must preserve distinct identities")
+    canonical_bytes = (canonical_json(expected) + "\n").encode("utf-8")
+    if authority_bytes != canonical_bytes:
+        raise ReferenceAuthorityError(
+            "workspace reconciliation authority raw bytes are not canonical"
+        )
+    if authority != expected or sha256_json(authority) != (
+        REFERENCE_WORKSPACE_RECONCILIATION_AUTHORITY_SHA256
+    ):
+        raise ReferenceAuthorityError("workspace reconciliation authority boundary has drifted")
+    return authority

@@ -595,6 +595,7 @@ def test_fake_modal_persists_image_then_call_identity_and_uses_one_spawn(
         reservation_id="reservation",
         owner_id="owner",
         authority_root=tmp_path,
+        replacement_entitlement_sha256=None,
         provider_environment="low-bit-lab",
         bootstrap_request_bytes=b"request",
         evaluation_lock_bytes=b"lock",
@@ -777,6 +778,7 @@ def test_watchdog_install_failure_after_boundary_is_audit_blocked(
         reservation_id="reservation",
         owner_id="owner",
         authority_root=tmp_path,
+        replacement_entitlement_sha256=None,
     )
     with pytest.raises(ReferenceModalError, match="requires audit"):
         adapter.submit_reference(capability)
@@ -888,6 +890,10 @@ def test_replacement_boundary_consumes_entitlement_instead_of_original_slot(
         authority_root=tmp_path,
         replacement_entitlement_sha256="a" * 64,
         recovery_authority_sha256=adapter.REFERENCE_RECOVERY_AUTHORITY_SHA256,
+        replacement_original_workspace_scope_sha256="8" * 64,
+        replacement_authenticated_workspace_identity_sha256="7" * 64,
+        workspace_reconciliation_authority_sha256="9" * 64,
+        replacement_auth_binding_sha256="6" * 64,
     )
 
     adapter._mark_submission_pending(FakeDatabase(), capability, "2026-08-27T02:00:00+00:00")
@@ -958,7 +964,9 @@ def test_replacement_boundary_rejects_ambient_modal_override_before_consumption(
         owner_id="owner",
         authority_root=tmp_path,
         replacement_entitlement_sha256="a" * 64,
-        replacement_workspace_scope_sha256="8" * 64,
+        replacement_original_workspace_scope_sha256="8" * 64,
+        replacement_authenticated_workspace_identity_sha256="7" * 64,
+        workspace_reconciliation_authority_sha256="9" * 64,
         replacement_auth_binding_sha256="6" * 64,
     )
     with pytest.raises(ReferenceModalError, match="boundary authentication failed"):

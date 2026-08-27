@@ -176,9 +176,10 @@ unauthorized.
 Use this path only when the reservation is `audit_blocked` with the exact sanitized AuthError class
 and every provider identity field is absent. Never invent an app, job, image, or call identity.
 
-1. From the isolated WSL environment, verify Modal authentication using the read-only recovery
-   command. Durable evidence contains only a workspace-scope digest, never credential material or a
-   workspace display name.
+1. From clean merged `main` in the isolated WSL environment, materialize the one-time reconciliation
+   authority and verify Modal authentication. The original configured workspace scope remains
+   historical lineage; the separately authenticated workspace identity is never treated as equal.
+   Durable evidence contains only their digests, never credential material or a display name.
 2. Capture an explicit unfiltered workspace billing interval composed only of complete UTC hours.
    It must cover the original consumed boundary through the latest durable boundary plus 2,700
    seconds and be acquired only after the billing-completeness delay.
@@ -200,6 +201,7 @@ verify the provider-local workspace, capture complete hourly evidence, then sett
 
 ```bash
 uv run --extra remote lowbit-reference-u8 --root . recovery-authority
+uv run --extra remote lowbit-reference-u8 --root . reconciliation-authority
 uv run --extra remote lowbit-reference-u8 --root . auth-bind
 uv run --extra remote lowbit-reference-u8 --root . auth-verify
 uv run --extra remote lowbit-reference-u8 --root . billing-capture \

@@ -10,7 +10,9 @@ The single approved Phase 1 reference replacement is governed by ignored local a
 not alter the public zero-spend defaults. A pre-identity authentication failure can settle only from
 an exact, complete, unfiltered workspace report whose WSL CLI bytes are `[]` plus LF and whose cost is the
 exact string `0`. Settlement preserves the original consumed U8 slot and failure reason while
-atomically creating one separate replacement entitlement. That entitlement has no reset or retry
+atomically recording the approved distinct workspace-identity reconciliation and creating one
+separate replacement entitlement. The original configured scope is never rewritten or equated to
+the authenticated identity. That entitlement has no reset or retry
 transition, remains capped at USD 4.00, and keeps the cumulative lifetime ceiling at USD 4.00270969
 including the settled USD 0.00270969 provider smoke.
 

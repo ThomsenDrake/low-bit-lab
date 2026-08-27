@@ -4,8 +4,9 @@ from pathlib import Path
 
 import pytest
 
+import lowbit_lab.reference_authority as reference_authority
 from lowbit_lab.constants import REFERENCE_RECOVERY_AUTHORITY_SHA256
-from lowbit_lab.handoff import canonical_json
+from lowbit_lab.handoff import canonical_json, sha256_json
 from lowbit_lab.reference_authority import (
     ACTION_CLASSES,
     BOOTSTRAP_AUTHORITY_PATH,
@@ -17,14 +18,18 @@ from lowbit_lab.reference_authority import (
     REFERENCE_SIGNED_CDN_AUTHORITY_SHA256,
     SIGNED_CDN_AUTHORITY_PATH,
     SIGNED_CDN_STATEMENT_PATH,
+    WORKSPACE_RECONCILIATION_AUTHORITY_PATH,
+    WORKSPACE_RECONCILIATION_STATEMENT_PATH,
     ReferenceAuthorityError,
     authorize_reference_action,
     authorize_reference_bootstrap_action,
     build_reference_recovery_authority,
+    build_workspace_scope_reconciliation_authority,
     validate_reference_authority,
     validate_reference_bootstrap_authority,
     validate_reference_recovery_authority,
     validate_reference_signed_cdn_authority,
+    validate_workspace_scope_reconciliation_authority,
 )
 
 
@@ -78,6 +83,57 @@ def _copy_recovery_authority_inputs(root: Path) -> Path:
         (canonical_json(build_reference_recovery_authority()) + "\n").encode("utf-8")
     )
     return authority
+
+
+def _write_reconciliation_authority(
+    root: Path, monkeypatch: pytest.MonkeyPatch, *, equal_identities: bool = False
+) -> Path:
+    _copy_recovery_authority_inputs(root)
+    statement = b"synthetic workspace reconciliation authority\n"
+    monkeypatch.setattr(
+        reference_authority,
+        "REFERENCE_WORKSPACE_RECONCILIATION_STATEMENT_SHA256",
+        hashlib.sha256(statement).hexdigest(),
+    )
+    statement_path = root / WORKSPACE_RECONCILIATION_STATEMENT_PATH
+    statement_path.parent.mkdir(parents=True, exist_ok=True)
+    statement_path.write_bytes(statement)
+    original = "1" * 64
+    authority = build_workspace_scope_reconciliation_authority(
+        original_workspace_scope_sha256=original,
+        authenticated_workspace_identity_sha256=(original if equal_identities else "2" * 64),
+        original_reservation_id="reservation-test",
+        original_execution_scope_sha256="3" * 64,
+        billing_authority_sha256="4" * 64,
+    )
+    monkeypatch.setattr(
+        reference_authority,
+        "REFERENCE_WORKSPACE_RECONCILIATION_AUTHORITY_SHA256",
+        sha256_json(authority),
+    )
+    authority_path = root / WORKSPACE_RECONCILIATION_AUTHORITY_PATH
+    authority_path.parent.mkdir(parents=True, exist_ok=True)
+    authority_path.write_bytes((canonical_json(authority) + "\n").encode())
+    return authority_path
+
+
+def test_workspace_reconciliation_validates_real_canonical_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    authority_path = _write_reconciliation_authority(tmp_path, monkeypatch)
+    validated = validate_workspace_scope_reconciliation_authority(tmp_path, authority_path)
+    assert validated["original_workspace_scope_sha256"] == "1" * 64
+    assert validated["authenticated_workspace_identity_sha256"] == "2" * 64
+
+
+def test_workspace_reconciliation_rejects_equal_identities(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    authority_path = _write_reconciliation_authority(
+        tmp_path, monkeypatch, equal_identities=True
+    )
+    with pytest.raises(ReferenceAuthorityError, match="distinct identities"):
+        validate_workspace_scope_reconciliation_authority(tmp_path, authority_path)
 
 
 def test_exact_authority_accepts_all_closed_action_classes(tmp_path: Path) -> None:
