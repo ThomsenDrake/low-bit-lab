@@ -287,6 +287,11 @@ authority boundary, and recompute schema, scope, binding, timestamp, and digest 
 transaction that consumes one-shot authority. The durable consumption timestamp must follow the
 validated authentication timestamp.
 
+When an authority validator freezes exact serialized bytes, its materializer must use the same
+framing contract, including terminal newlines. If a released generator omitted framing, self-repair
+may accept only that one exact legacy byte sequence and atomically replace it with the validator's
+canonical bytes; every other existing value remains immutable and fails closed.
+
 Database migrations in an unknown-state control plane should fingerprint the complete deployed
 source schema before DDL: ordered column metadata plus normalized table, index, and trigger SQL.
 Allow only explicitly reproduced historical fingerprints, compare every copied cell by stable key,

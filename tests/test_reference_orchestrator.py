@@ -834,3 +834,26 @@ def test_recovery_authority_materialization_is_create_once_and_offline(
     output.write_bytes(output.read_bytes() + b" ")
     with pytest.raises(orchestrator.ReferenceOrchestratorError, match="immutable"):
         orchestrator.materialize_recovery_authority(tmp_path)
+
+
+def test_recovery_authority_repairs_only_exact_legacy_missing_newline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    value = {"kind": "test-recovery-authority", "schema_version": 1}
+    monkeypatch.setattr(orchestrator, "build_reference_recovery_authority", lambda: value)
+    monkeypatch.setattr(
+        orchestrator,
+        "validate_reference_recovery_authority",
+        lambda root: orchestrator.REFERENCE_RECOVERY_AUTHORITY_SHA256,
+    )
+    output = tmp_path / orchestrator.RECOVERY_AUTHORITY_PATH
+    output.parent.mkdir(parents=True)
+    legacy = orchestrator.canonical_bytes(value)
+    output.write_bytes(legacy)
+
+    result = orchestrator.materialize_recovery_authority(tmp_path)
+
+    assert output.read_bytes() == legacy + b"\n"
+    assert result == {
+        "recovery_authority_sha256": orchestrator.REFERENCE_RECOVERY_AUTHORITY_SHA256
+    }

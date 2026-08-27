@@ -595,11 +595,15 @@ def settle_workspace_zero(root: Path) -> Mapping[str, object]:
 def materialize_recovery_authority(root: Path) -> Mapping[str, str]:
     """Create the ignored canonical recovery authority without provider contact."""
     root = root.resolve()
-    content = canonical_bytes(build_reference_recovery_authority())
+    legacy_content = canonical_bytes(build_reference_recovery_authority())
+    content = legacy_content + b"\n"
     output = root / RECOVERY_AUTHORITY_PATH
     try:
         if output.exists():
-            if output.read_bytes() != content:
+            existing = output.read_bytes()
+            if existing == legacy_content:
+                atomic_write(root, RECOVERY_AUTHORITY_PATH, content, replace=True)
+            elif existing != content:
                 raise ReferenceOrchestratorError("recovery authority is immutable")
         else:
             atomic_write(root, RECOVERY_AUTHORITY_PATH, content, replace=False)
