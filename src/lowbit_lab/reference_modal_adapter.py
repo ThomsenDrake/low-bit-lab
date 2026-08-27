@@ -1,6 +1,7 @@
 """The single, deliberately narrow Modal boundary for the U8 reference action.
 
-Nothing in this module imports Modal until the database has durably consumed U8.
+Nothing in this module invokes a Modal execution primitive until the database has
+durably consumed U8.
 The callable is serialized by value because the reviewed control-plane package is
 intentionally not copied into the remote image.
 """
@@ -57,6 +58,7 @@ class ReferenceModalError(RuntimeError):
 
 REMOTE_CONTRACT_KIND = "reference_modal_remote_contract"
 REMOTE_RESULT_KIND = "reference_modal_remote_result"
+MODAL_SERIALIZED_FUNCTION_MAX_BYTES = 64 << 10
 _REMOTE_CONTRACT_FIELDS = {
     "evaluation_lock_bytes_b64",
     "execution_identity",
@@ -125,6 +127,24 @@ class FreshDeterministicEvidence:
     execution_identity: Mapping[str, str]
     config_sha256: str
     reference_execution_scope_sha256: str
+
+
+@dataclass(frozen=True)
+class SerializedRemoteCallable:
+    """Exact provider hydration bytes prepared before any budget reservation."""
+
+    entry: Any
+    payload: bytes
+
+
+@dataclass(frozen=True)
+class PreparedModalGraph:
+    """Fully bound lazy SDK graph prepared before any budget reservation."""
+
+    serialized: SerializedRemoteCallable
+    image: Any
+    app: Any
+    remote: Any
 
 
 @dataclass(frozen=True)
@@ -484,7 +504,7 @@ def _run_closed_remote_contract(content: bytes) -> dict[str, object]:
     return json.loads(_canonical_json(raw))
 
 
-def _serialized_remote_callable() -> tuple[Any, bytes, tuple[Any, ...]]:
+def _build_serialized_remote_callable() -> tuple[Any, bytes, tuple[Any, ...]]:
     """Package the reviewed execution graph by value; never mount local source."""
     import sys
 
@@ -517,11 +537,99 @@ def _serialized_remote_callable() -> tuple[Any, bytes, tuple[Any, ...]]:
 
         # Modal's FunctionInfo uses this exact serializer during app hydration.
         payload = serialize(remote_entry)
-        if len(payload) > 16 << 20:
-            raise ReferenceModalError("serialized function exceeds provider cap")
         return remote_entry, payload, modules
     except Exception:
         _clear_serialization_policy(tuple(registered))
+        raise
+
+
+def prepare_serialized_remote_callable() -> SerializedRemoteCallable:
+    """Freeze admissible Modal hydration bytes without retaining global pickle policy."""
+    entry, payload, modules = _build_serialized_remote_callable()
+    try:
+        if len(payload) > MODAL_SERIALIZED_FUNCTION_MAX_BYTES:
+            raise ReferenceModalError("serialized function exceeds provider cap")
+        return SerializedRemoteCallable(entry=entry, payload=payload)
+    finally:
+        _clear_serialization_policy(modules)
+
+
+def _bind_cached_hydration_payload(remote: Any, prepared: SerializedRemoteCallable) -> None:
+    """Make pinned Modal hydration return the exact bytes admitted by preflight."""
+    info = getattr(remote, "_info", None)
+    if (
+        info is None
+        or getattr(info, "raw_f", None) is not prepared.entry
+        or not callable(getattr(info, "is_serialized", None))
+        or not info.is_serialized()
+    ):
+        raise ReferenceModalError("provider function metadata binding drift")
+
+    def cached_payload() -> bytes:
+        return prepared.payload
+
+    info.serialized_function = cached_payload
+    if info.serialized_function() is not prepared.payload:
+        raise ReferenceModalError("provider hydration payload binding drift")
+
+
+def prepare_local_modal_graph(capability: ReferenceModalCapability) -> PreparedModalGraph:
+    """Build Modal's lazy local objects without invoking a provider primitive."""
+    try:
+        import modal
+
+        prepared = prepare_serialized_remote_callable()
+        image = _image_from_lock(modal, capability.image_lock)
+        app = modal.App("low-bit-lab-reference-u8", image=image, include_source=False)
+        remote = app.function(
+            image=image,
+            gpu="A100-80GB:1",
+            cpu=8,
+            memory=98304,
+            ephemeral_disk=524288,
+            timeout=2700,
+            retries=0,
+            max_containers=1,
+            include_source=False,
+            serialized=True,
+            restrict_modal_access=True,
+            single_use_containers=True,
+        )(prepared.entry)
+        _bind_cached_hydration_payload(remote, prepared)
+        return PreparedModalGraph(serialized=prepared, image=image, app=app, remote=remote)
+    except Exception:
+        # Every production execution attempt is auditable even though this local
+        # failure intentionally occurs before a run or budget reservation exists.
+        try:
+            database = ResultsDatabase(
+                capability.root.resolve() / "results/local/reference.sqlite"
+            )
+            database.initialize()
+            occurred_at = datetime.now(UTC).isoformat()
+            attempt_id = "u8-graph-preflight-" + _sha(
+                f"{occurred_at}:{time.time_ns()}".encode()
+            )[:24]
+            config_path = (
+                capability.config_path.as_posix()
+                if not capability.config_path.is_absolute()
+                and ".." not in capability.config_path.parts
+                else "invalid"
+            )
+            database.create_attempt(
+                attempt_id=attempt_id,
+                config_path=config_path,
+                raw_config_sha256=_optional_local_sha(
+                    capability.root.resolve(), capability.config_path
+                ),
+                started_at=occurred_at,
+            )
+            database.fail_attempt(
+                attempt_id,
+                "local_provider_graph_preflight_failed",
+                datetime.now(UTC).isoformat(),
+            )
+        except Exception as audit_exc:
+            raise ReferenceModalError("local provider graph preflight audit failed") from audit_exc
         raise
 
 
@@ -667,8 +775,22 @@ def _validate_modal_sdk_boundary(capability: ReferenceModalCapability) -> str:
     return identity_sha256
 
 
-def submit_reference(capability: ReferenceModalCapability) -> dict[str, object]:
+def submit_reference(
+    capability: ReferenceModalCapability, prepared_graph: PreparedModalGraph
+) -> dict[str, object]:
     """The only U8 provider call path. Callers must already hold a reservation."""
+    prepared = getattr(prepared_graph, "serialized", None)
+    if (
+        not isinstance(prepared_graph, PreparedModalGraph)
+        or not isinstance(prepared, SerializedRemoteCallable)
+        or not callable(prepared.entry)
+        or not isinstance(prepared.payload, bytes)
+        or len(prepared.payload) > MODAL_SERIALIZED_FUNCTION_MAX_BYTES
+    ):
+        raise ReferenceModalError("serialized function preflight binding is invalid")
+    image = prepared_graph.image
+    app = prepared_graph.app
+    remote = prepared_graph.remote
     canonical_db_path = capability.root.resolve() / "results/local/reference.sqlite"
     database = ResultsDatabase(canonical_db_path)
     attempt_started_at = datetime.now(UTC).isoformat()
@@ -788,30 +910,8 @@ def submit_reference(capability: ReferenceModalCapability) -> dict[str, object]:
         )
         timer_may_be_armed = True
         deadline_signal.setitimer(deadline_signal.ITIMER_REAL, remaining_action_seconds)
-        import modal
-
-        remote_entry, serialized, serialized_modules = _serialized_remote_callable()
-        image = _image_from_lock(modal, capability.image_lock)
-        app = modal.App("low-bit-lab-reference-u8", image=image, include_source=False)
-        remote = app.function(
-            image=image,
-            gpu="A100-80GB:1",
-            cpu=8,
-            memory=98304,
-            ephemeral_disk=524288,
-            timeout=2700,
-            retries=0,
-            max_containers=1,
-            include_source=False,
-            serialized=True,
-            restrict_modal_access=True,
-            single_use_containers=True,
-        )(remote_entry)
         with app.run(environment_name=capability.provider_environment):
             image.build(app)
-            # App hydration serializes the function.  The reviewed registration window
-            # ends before the one spawn and is always cleared below on failure as well.
-            _clear_serialization_policy(serialized_modules)
             image_identity = image.object_id
             app_identity = app.app_id
             if not isinstance(image_identity, str) or not isinstance(app_identity, str):
@@ -822,7 +922,7 @@ def submit_reference(capability: ReferenceModalCapability) -> dict[str, object]:
             contract = build_remote_contract(
                 capability,
                 provider_image_identity=image_identity,
-                serialized_function_sha256=_sha(serialized),
+                serialized_function_sha256=_sha(prepared.payload),
                 submission_pending_at=submission_pending_at,
             )
             call = remote.spawn(contract)
@@ -883,8 +983,6 @@ def submit_reference(capability: ReferenceModalCapability) -> dict[str, object]:
         if handler_may_be_installed:
             with suppress(BaseException):
                 deadline_signal.signal(deadline_signal.SIGALRM, previous_deadline_handler)
-        if "serialized_modules" in locals():
-            _clear_serialization_policy(serialized_modules)
         try:
             _audit_block(database, capability, type(exc).__name__)
         except DatabaseError as audit_exc:
