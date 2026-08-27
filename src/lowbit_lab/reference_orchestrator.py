@@ -7,17 +7,21 @@ import hashlib
 import json
 import os
 import signal
+import subprocess
 import sys
+import tempfile
 import uuid
 from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit, urlunsplit
 
 import yaml
 
+from lowbit_lab.config import SHA256_RE
 from lowbit_lab.constants import (
     REFERENCE_AUTHORITY_SHA256,
     REFERENCE_BOOTSTRAP_AUTHORITY_SHA256,
@@ -25,12 +29,13 @@ from lowbit_lab.constants import (
     REFERENCE_CUMULATIVE_CAP_USD,
     REFERENCE_IMMUTABLE_ORIGIN_HOSTS,
     REFERENCE_INCREMENTAL_CAP_USD,
+    REFERENCE_RECOVERY_AUTHORITY_SHA256,
     REFERENCE_SETTLED_SMOKE_USD,
     REFERENCE_SIGNED_CDN_AUTHORITY_SHA256,
     REFERENCE_SIGNED_CDN_MERGE_COMMIT,
     REFERENCE_SIGNED_REDIRECT_POLICY,
 )
-from lowbit_lab.db import ResultsDatabase, confine_results_db
+from lowbit_lab.db import SCHEMA_VERSION, ResultsDatabase, confine_results_db
 from lowbit_lab.evaluation_lock import validate_pending_evaluation_lock
 from lowbit_lab.jsonio import emit
 from lowbit_lab.modal_job import (
@@ -48,6 +53,12 @@ from lowbit_lab.provider_evidence import (
 from lowbit_lab.provider_evidence import (
     DEFAULT_OUTPUT as PROVIDER_CAPABILITY_PATH,
 )
+from lowbit_lab.reference_authority import (
+    RECOVERY_AUTHORITY_PATH,
+    ReferenceAuthorityError,
+    build_reference_recovery_authority,
+    validate_reference_recovery_authority,
+)
 from lowbit_lab.reference_bootstrap import (
     EMPIRICAL_FACTS,
     FUTURE_STAGE_RESERVES_SECONDS,
@@ -58,19 +69,40 @@ from lowbit_lab.reference_bootstrap import (
     validate_image_lock_bytes,
 )
 from lowbit_lab.reference_contract import REFERENCE_RESOURCES
-from lowbit_lab.reference_modal_adapter import ReferenceModalCapability
+from lowbit_lab.reference_provider_auth import (
+    OFFICIAL_MODAL_SERVER_URL,
+    auth_receipt_path,
+    provider_environment_overrides_present,
+    sanitized_modal_environment,
+)
+from lowbit_lab.reference_settlement import (
+    AUTH_METHOD_SHA256,
+    AUTH_RECEIPT_MAXIMUM_AGE_SECONDS,
+    CANONICAL_EMPTY_REPORT,
+)
+from lowbit_lab.reference_settlement import (
+    RECEIPT_KIND as WORKSPACE_ZERO_RECEIPT_KIND,
+)
 from lowbit_lab.reference_transport import observe_topology
 from lowbit_lab.runtime import (
     load_runtime_lock,
     runtime_metadata,
     verify_current_installed_environment,
 )
+from lowbit_lab.safe_files import SafeFileError, atomic_write
 
 CONFIG_PATH = Path("configs/local/reference.yaml")
 REQUEST_PATH = Path("reports/local/u8-bootstrap-request.json")
 IMAGE_LOCK_PATH = Path("configs/local/reference-image-lock.json")
 PUBLICATION_MANIFEST_PATH = Path("configs/local/publication.yaml")
 DATABASE_PATH = Path("results/local/reference.sqlite")
+AUTH_BINDING_PATH = Path("configs/local/reference-workspace-auth-binding.json")
+AUTH_RECEIPT_PATH = Path("reports/local/reference-workspace-auth-receipt.json")
+WORKSPACE_ZERO_REPORT_PATH = Path("reports/local/reference-preidentity-zero-report.json")
+WORKSPACE_ZERO_RECEIPT_PATH = Path("reports/local/reference-preidentity-zero-receipt.json")
+AUTH_MAXIMUM_AGE_SECONDS = AUTH_RECEIPT_MAXIMUM_AGE_SECONDS
+if TYPE_CHECKING:
+    from lowbit_lab.reference_modal_adapter import ReferenceModalCapability
 _SOURCE_FILES = {
     "chat_template.jinja": "text",
     "config.json": "json",
@@ -111,13 +143,550 @@ def _read_json(path: Path, label: str) -> Mapping[str, object]:
     return _read_json_bytes(path, label)[0]
 
 
-def _write_atomic(path: Path, content: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_bytes(content)
-    temporary.replace(path)
-    if path.read_bytes() != content:
-        raise ReferenceOrchestratorError("persisted orchestration evidence drift")
+def _write_atomic(root: Path, path: Path, content: bytes) -> None:
+    try:
+        atomic_write(root.resolve(strict=True), path, content, replace=True)
+    except SafeFileError as exc:
+        raise ReferenceOrchestratorError("orchestration evidence path is unsafe") from exc
+
+
+def _utc(value: str, label: str) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ReferenceOrchestratorError(f"{label} is invalid") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() != timedelta(0):
+        raise ReferenceOrchestratorError(f"{label} must be UTC")
+    return parsed.astimezone(UTC)
+
+
+def _root_json(root: Path, relative: Path, label: str) -> Mapping[str, Any]:
+    if relative.is_absolute() or ".." in relative.parts:
+        raise ReferenceOrchestratorError(f"{label} path is invalid")
+    return _read_json(root.resolve() / relative, label)
+
+
+def _configured_workspace_scope(root: Path) -> str:
+    try:
+        raw = yaml.safe_load((root.resolve() / CONFIG_PATH).read_text(encoding="utf-8"))
+        scope = raw["provider"]["workspace_scope_sha256"]
+    except (OSError, TypeError, KeyError, yaml.YAMLError) as exc:
+        raise ReferenceOrchestratorError("configured workspace scope is unavailable") from exc
+    if not isinstance(scope, str) or SHA256_RE.fullmatch(scope) is None:
+        raise ReferenceOrchestratorError("configured workspace scope is invalid")
+    return scope
+
+
+def _run_modal_cli(
+    arguments: list[str],
+    *,
+    runner: Any | None = None,
+) -> bytes:
+    """Run only the read-only Modal CLI surfaces and return uncaptured bytes."""
+    _validate_modal_profile_security(runner=runner)
+    command = [sys.executable, "-I", "-B", "-m", "modal", *arguments]
+    environment = sanitized_modal_environment()
+    try:
+        if runner is not None:
+            completed = runner(
+                command,
+                check=False,
+                capture_output=True,
+                env=environment,
+                shell=False,
+                timeout=60,
+            )
+            stdout = completed.stdout
+            returncode = completed.returncode
+        else:
+            with tempfile.TemporaryFile() as output:
+                process = subprocess.Popen(
+                    command,
+                    stdout=output,
+                    stderr=subprocess.DEVNULL,
+                    env=environment,
+                    shell=False,
+                )
+                try:
+                    returncode = process.wait(timeout=60)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+                    raise
+                output.seek(0)
+                stdout = output.read(1_000_001)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ReferenceOrchestratorError("Modal read-only CLI is unavailable") from exc
+    if returncode != 0:
+        raise ReferenceOrchestratorError("Modal read-only CLI failed")
+    if not isinstance(stdout, bytes) or len(stdout) > 1_000_000:
+        raise ReferenceOrchestratorError("Modal read-only CLI output is invalid")
+    return stdout
+
+
+_PROFILE_SECURITY_SCRIPT = (
+    "from modal.config import DEFAULT_SERVER_URL,config;"
+    "ok=(DEFAULT_SERVER_URL==" + repr(OFFICIAL_MODAL_SERVER_URL) + " and "
+    "config.get('server_url',use_env=False)==DEFAULT_SERVER_URL and "
+    "config.get('override_headers',use_env=False) in (None,{}));"
+    "raise SystemExit(0 if ok else 23)"
+)
+
+
+def _validate_modal_profile_security(*, runner: Any | None = None) -> None:
+    """Ask the pinned SDK to validate only noncredential profile transport settings."""
+    command = [sys.executable, "-I", "-B", "-c", _PROFILE_SECURITY_SCRIPT]
+    environment = sanitized_modal_environment()
+    try:
+        completed = (runner or subprocess.run)(
+            command,
+            check=False,
+            capture_output=True,
+            env=environment,
+            shell=False,
+            timeout=60,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ReferenceOrchestratorError(
+            "Modal provider profile validation is unavailable"
+        ) from exc
+    if completed.returncode != 0:
+        raise ReferenceOrchestratorError("Modal provider profile transport is unsupported")
+
+
+def _current_workspace_digest(*, runner: Any | None = None) -> str:
+    raw = _run_modal_cli(["profile", "list", "--json"], runner=runner)
+    try:
+        value = json.loads(raw.decode("utf-8", errors="strict"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ReferenceOrchestratorError("Modal workspace identity is invalid") from exc
+    records = (
+        value
+        if isinstance(value, list)
+        else value.get("profiles", [])
+        if isinstance(value, Mapping)
+        else []
+    )
+    active = [
+        item for item in records if isinstance(item, Mapping) and item.get("active") is True
+    ]
+    if len(active) != 1:
+        active = [
+            item
+            for item in records
+            if isinstance(item, Mapping) and item.get("current") is True
+        ]
+    if len(active) != 1:
+        raise ReferenceOrchestratorError("Modal workspace identity is ambiguous")
+    identity = active[0].get("workspace_name", active[0].get("workspace"))
+    if (
+        not isinstance(identity, str)
+        or not identity
+        or len(identity) > 256
+        or any(ord(character) < 32 for character in identity)
+    ):
+        raise ReferenceOrchestratorError("Modal workspace identity is invalid")
+    return _sha(identity.encode("utf-8"))
+
+
+def bind_workspace_auth(root: Path, *, runner: Any | None = None) -> Mapping[str, object]:
+    """Bind the current provider-local profile without persisting its display value."""
+    if provider_environment_overrides_present():
+        raise ReferenceOrchestratorError("ambient provider environment override is forbidden")
+    root = root.resolve()
+    scope = _configured_workspace_scope(root)
+    workspace_identity_sha256 = _current_workspace_digest(runner=runner)
+    if workspace_identity_sha256 != scope:
+        raise ReferenceOrchestratorError("authenticated Modal workspace scope mismatch")
+    binding = {
+        "kind": "reference_modal_workspace_auth_binding",
+        "workspace_identity_sha256": workspace_identity_sha256,
+        "provider": "modal",
+        "schema_version": 1,
+        "workspace_scope_sha256": scope,
+    }
+    encoded = canonical_bytes(binding)
+    path = root / AUTH_BINDING_PATH
+    if path.exists():
+        if path.read_bytes() != encoded:
+            raise ReferenceOrchestratorError("workspace auth binding is immutable")
+    else:
+        try:
+            atomic_write(root, AUTH_BINDING_PATH, encoded, replace=False)
+        except SafeFileError as exc:
+            raise ReferenceOrchestratorError("workspace auth binding raced") from exc
+    return {
+        "binding_sha256": _sha(encoded),
+        "workspace_scope_sha256": scope,
+    }
+
+
+def verify_workspace_auth(
+    root: Path,
+    *,
+    runner: Any | None = None,
+    write_latest: bool = True,
+) -> Mapping[str, object]:
+    """Verify the current local profile against the private digest binding."""
+    if provider_environment_overrides_present():
+        raise ReferenceOrchestratorError("ambient provider environment override is forbidden")
+    root = root.resolve()
+    binding = _root_json(root, AUTH_BINDING_PATH, "workspace auth binding")
+    expected = {
+        "kind",
+        "workspace_identity_sha256",
+        "provider",
+        "schema_version",
+        "workspace_scope_sha256",
+    }
+    if (
+        set(binding) != expected
+        or binding.get("schema_version") != 1
+        or binding.get("kind") != "reference_modal_workspace_auth_binding"
+        or binding.get("provider") != "modal"
+    ):
+        raise ReferenceOrchestratorError("workspace auth binding schema drift")
+    scope = _configured_workspace_scope(root)
+    if binding.get("workspace_scope_sha256") != scope or binding.get(
+        "workspace_identity_sha256"
+    ) != _current_workspace_digest(runner=runner):
+        raise ReferenceOrchestratorError("authenticated Modal workspace scope mismatch")
+    authenticated_at = datetime.now(UTC).isoformat()
+    receipt = {
+        "authenticated_at": authenticated_at,
+        "binding_sha256": _sha(canonical_bytes(binding)),
+        "kind": "reference_modal_workspace_auth_receipt",
+        "method_sha256": AUTH_METHOD_SHA256,
+        "provider": "modal",
+        "schema_version": 1,
+        "verification_nonce_sha256": _sha(os.urandom(32)),
+        "workspace_scope_sha256": scope,
+    }
+    encoded = canonical_bytes(receipt)
+    receipt_sha256 = _sha(encoded)
+    try:
+        immutable_path = auth_receipt_path(receipt_sha256)
+        absolute_immutable_path = root / immutable_path
+        if absolute_immutable_path.exists():
+            if absolute_immutable_path.read_bytes() != encoded:
+                raise ReferenceOrchestratorError("workspace auth receipt digest collision")
+        else:
+            atomic_write(root, immutable_path, encoded, replace=False)
+        if write_latest:
+            atomic_write(root, AUTH_RECEIPT_PATH, encoded, replace=True)
+    except SafeFileError as exc:
+        raise ReferenceOrchestratorError("workspace auth receipt path is unsafe") from exc
+    return {**receipt, "receipt_sha256": receipt_sha256}
+
+
+def _validate_fresh_auth_receipt(root: Path, *, expected_workspace_scope_sha256: str) -> None:
+    receipt = _root_json(root, AUTH_RECEIPT_PATH, "workspace auth receipt")
+    if (
+        set(receipt)
+        != {
+            "authenticated_at",
+            "binding_sha256",
+            "kind",
+            "method_sha256",
+            "provider",
+            "schema_version",
+            "verification_nonce_sha256",
+            "workspace_scope_sha256",
+        }
+        or receipt.get("schema_version") != 1
+        or receipt.get("kind") != "reference_modal_workspace_auth_receipt"
+        or receipt.get("provider") != "modal"
+    ):
+        raise ReferenceOrchestratorError("workspace auth receipt schema drift")
+    authenticated = _utc(str(receipt["authenticated_at"]), "authenticated_at")
+    age = (datetime.now(UTC) - authenticated).total_seconds()
+    if age < 0 or age > AUTH_MAXIMUM_AGE_SECONDS:
+        raise ReferenceOrchestratorError("workspace auth receipt is stale")
+    if (
+        receipt.get("workspace_scope_sha256") != expected_workspace_scope_sha256
+        or receipt.get("method_sha256") != AUTH_METHOD_SHA256
+    ):
+        raise ReferenceOrchestratorError("workspace auth receipt scope mismatch")
+
+
+def _original_preidentity_row(database: ResultsDatabase) -> Mapping[str, Any]:
+    with database.connect_readonly() as connection:
+        rows = connection.execute(
+            """SELECT br.reservation_id, br.reference_execution_scope_sha256,
+                billing_authority_sha256, authoritative_report_identity_sha256,
+                billing_completeness_delay_seconds, heartbeat_at, updated_at,
+                ras.consumed_at
+            FROM budget_reservations AS br
+            JOIN reference_authority_slots AS ras
+              ON ras.execution_scope_sha256 = br.reference_execution_scope_sha256
+            WHERE br.status = 'audit_blocked'
+              AND br.failure_reason = 'provider boundary uncertainty: AuthError'
+              AND br.provider_job_id IS NULL AND br.app_identity IS NULL
+              AND br.submitted_at IS NULL AND br.settlement_pending_at IS NULL"""
+        ).fetchall()
+    if len(rows) != 1:
+        raise ReferenceOrchestratorError("unique pre-identity reservation is unavailable")
+    return dict(rows[0])
+
+
+def capture_workspace_zero_billing(
+    root: Path,
+    *,
+    query_start: str,
+    query_end: str,
+    runner: Any | None = None,
+) -> Mapping[str, object]:
+    """Capture one explicit, complete, unfiltered, canonical empty workspace report."""
+    root = root.resolve()
+    start = _utc(query_start, "query start")
+    end = _utc(query_end, "query end")
+    if (
+        start >= end
+        or any((start.minute, start.second, start.microsecond))
+        or any((end.minute, end.second, end.microsecond))
+    ):
+        raise ReferenceOrchestratorError("billing interval must contain complete UTC hours")
+    database = ResultsDatabase(confine_results_db(root, DATABASE_PATH))
+    row = _original_preidentity_row(database)
+    latest_boundary = max(
+        _utc(str(row["heartbeat_at"]), "stored heartbeat_at"),
+        _utc(str(row["updated_at"]), "stored updated_at"),
+    )
+    completeness_delay = int(row["billing_completeness_delay_seconds"])
+    if (
+        start > _utc(str(row["consumed_at"]), "original consumed_at")
+        or end
+        < latest_boundary + timedelta(seconds=int(REFERENCE_RESOURCES["timeout_seconds"]))
+        or datetime.now(UTC) < end + timedelta(seconds=completeness_delay)
+    ):
+        raise ReferenceOrchestratorError(
+            "billing interval does not cover a complete settled window"
+        )
+    try:
+        authority_bytes = (root / DEFAULT_BILLING_AUTHORITY).read_bytes()
+        authority = json.loads(authority_bytes)
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ReferenceOrchestratorError("billing authority is unavailable") from exc
+    if (
+        not isinstance(authority, Mapping)
+        or _sha(authority_bytes) != row["billing_authority_sha256"]
+        or authority.get("authoritative_report_identity_sha256")
+        != row["authoritative_report_identity_sha256"]
+        or authority.get("billing_completeness_delay_seconds") != completeness_delay
+    ):
+        raise ReferenceOrchestratorError("billing authority lineage drift")
+    auth = verify_workspace_auth(root, runner=runner, write_latest=False)
+    raw_report = _run_modal_cli(
+        [
+            "billing",
+            "report",
+            "--start",
+            start.isoformat().replace("+00:00", "Z"),
+            "--end",
+            end.isoformat().replace("+00:00", "Z"),
+            "--resolution",
+            "h",
+            "--show-resources",
+            "--json",
+        ],
+        runner=runner,
+    )
+    if raw_report != CANONICAL_EMPTY_REPORT:
+        raise ReferenceOrchestratorError(
+            "workspace billing report is not the exact canonical zero snapshot"
+        )
+    # Recheck the selected local profile after the provider response.
+    after = verify_workspace_auth(root, runner=runner, write_latest=False)
+    if after["workspace_scope_sha256"] != auth["workspace_scope_sha256"]:
+        raise ReferenceOrchestratorError("Modal workspace changed during billing capture")
+    acquired_at = datetime.now(UTC).isoformat()
+    report = raw_report
+    receipt = {
+        "actual_cost_usd": "0",
+        "acquired_at": acquired_at,
+        "all_environments": True,
+        "all_resources": True,
+        "authenticated_workspace_scope_sha256": auth["workspace_scope_sha256"],
+        "auth_binding_sha256": auth["binding_sha256"],
+        "pre_auth_receipt_sha256": auth["receipt_sha256"],
+        "post_auth_receipt_sha256": after["receipt_sha256"],
+        "authoritative_report_identity_sha256": row["authoritative_report_identity_sha256"],
+        "billing_authority_sha256": row["billing_authority_sha256"],
+        "billing_method_sha256": authority["attribution_method_sha256"],
+        "completeness_delay_seconds": completeness_delay,
+        "currency": "USD",
+        "failure_code": "auth_before_provider_identity",
+        "filters": [],
+        "kind": WORKSPACE_ZERO_RECEIPT_KIND,
+        "original_execution_scope_sha256": row["reference_execution_scope_sha256"],
+        "pagination_complete": True,
+        "provider": "modal",
+        "query_end": end.isoformat(),
+        "query_start": start.isoformat(),
+        "recovery_authority_sha256": REFERENCE_RECOVERY_AUTHORITY_SHA256,
+        "report_sha256": _sha(report),
+        "report_size_bytes": len(report),
+        "reservation_id": row["reservation_id"],
+        "row_count": 0,
+        "schema_version": 1,
+    }
+    receipt_bytes = canonical_bytes(receipt)
+    try:
+        atomic_write(root, WORKSPACE_ZERO_REPORT_PATH, report, replace=True)
+        atomic_write(root, WORKSPACE_ZERO_RECEIPT_PATH, receipt_bytes, replace=True)
+    except SafeFileError as exc:
+        raise ReferenceOrchestratorError("workspace-zero evidence path is unsafe") from exc
+    return {
+        "provider_contacted": False,
+        "provider_read_only_contacted": True,
+        "receipt_sha256": _sha(receipt_bytes),
+        "report_sha256": _sha(report),
+        "workspace_scope_sha256": auth["workspace_scope_sha256"],
+    }
+
+
+def settle_workspace_zero(root: Path) -> Mapping[str, object]:
+    """Settle from local byte snapshots only; this path has no adapter import."""
+    root = root.resolve()
+    database = ResultsDatabase(confine_results_db(root, DATABASE_PATH))
+    database.initialize()
+    row = _original_preidentity_row(database)
+    receipt_bytes = (root / WORKSPACE_ZERO_RECEIPT_PATH).read_bytes()
+    report_bytes = (root / WORKSPACE_ZERO_REPORT_PATH).read_bytes()
+    try:
+        receipt = json.loads(receipt_bytes)
+        pre_auth_receipt_bytes = (
+            root / auth_receipt_path(str(receipt["pre_auth_receipt_sha256"]))
+        ).read_bytes()
+        post_auth_receipt_bytes = (
+            root / auth_receipt_path(str(receipt["post_auth_receipt_sha256"]))
+        ).read_bytes()
+        _utc(str(receipt["query_start"]), "query start")
+        _utc(str(receipt["query_end"]), "query end")
+        _utc(str(receipt["acquired_at"]), "acquired_at")
+        authority_path = root / DEFAULT_BILLING_AUTHORITY
+        authority_bytes = authority_path.read_bytes()
+        authority = json.loads(authority_bytes)
+    except (OSError, KeyError, TypeError, json.JSONDecodeError) as exc:
+        raise ReferenceOrchestratorError("workspace-zero evidence is unavailable") from exc
+    if (
+        not isinstance(authority, Mapping)
+        or _sha(authority_bytes) != row["billing_authority_sha256"]
+    ):
+        raise ReferenceOrchestratorError("billing authority lineage drift")
+    entitlement_sha256 = database.settle_reference_preidentity_zero(
+        receipt_bytes,
+        report_bytes,
+        pre_auth_receipt_bytes=pre_auth_receipt_bytes,
+        post_auth_receipt_bytes=post_auth_receipt_bytes,
+        billing_authority_bytes=authority_bytes,
+        authority_root=root,
+        occurred_at=datetime.now(UTC).isoformat(),
+    )
+    return {
+        "actual_cost_usd": "0",
+        "entitlement_sha256": entitlement_sha256,
+        "original_reservation_id": row["reservation_id"],
+        "provider_contacted": False,
+        "settlement_receipt_sha256": _sha(receipt_bytes),
+    }
+
+
+def materialize_recovery_authority(root: Path) -> Mapping[str, str]:
+    """Create the ignored canonical recovery authority without provider contact."""
+    root = root.resolve()
+    content = canonical_bytes(build_reference_recovery_authority())
+    output = root / RECOVERY_AUTHORITY_PATH
+    try:
+        if output.exists():
+            if output.read_bytes() != content:
+                raise ReferenceOrchestratorError("recovery authority is immutable")
+        else:
+            atomic_write(root, RECOVERY_AUTHORITY_PATH, content, replace=False)
+        validated = validate_reference_recovery_authority(root)
+    except (SafeFileError, ReferenceAuthorityError) as exc:
+        raise ReferenceOrchestratorError("recovery authority path is unsafe") from exc
+    if validated != REFERENCE_RECOVERY_AUTHORITY_SHA256:
+        raise ReferenceOrchestratorError("recovery authority lineage drift")
+    return {"recovery_authority_sha256": validated}
+
+
+def reference_status(root: Path) -> Mapping[str, object]:
+    """Report only authority state and sanitized cost; never prepare or submit."""
+    database = ResultsDatabase(confine_results_db(root.resolve(), DATABASE_PATH))
+    with database.connect_readonly() as connection:
+        version_row = connection.execute("SELECT max(version) FROM schema_info").fetchone()
+        if version_row is None or version_row[0] != SCHEMA_VERSION:
+            return {
+                "configured_context_tokens": 262144,
+                "provider_contacted": False,
+                "proven_useful_context_tokens": None,
+                "schema_upgrade_required": True,
+            }
+        original = connection.execute(
+            """SELECT ras.consumed_at, br.reservation_id, br.status,
+                br.provider_actual_cost_usd, br.settlement_mode
+            FROM reference_authority_slots AS ras
+            JOIN budget_reservations AS br
+              ON br.reference_execution_scope_sha256 = ras.execution_scope_sha256
+            ORDER BY br.created_at LIMIT 1"""
+        ).fetchone()
+        entitlements = connection.execute(
+            "SELECT entitlement_sha256, state FROM reference_replacement_entitlements LIMIT 2"
+        ).fetchall()
+    if len(entitlements) > 1:
+        raise ReferenceOrchestratorError("multiple replacement entitlements are invalid")
+    entitlement = None if not entitlements else entitlements[0]
+    return {
+        "configured_context_tokens": 262144,
+        "original": None
+        if original is None
+        else {
+            "actual_cost_usd": original["provider_actual_cost_usd"],
+            "reservation_id": original["reservation_id"],
+            "settlement_mode": original["settlement_mode"],
+            "slot_consumed": original["consumed_at"] is not None,
+            "status": original["status"],
+        },
+        "provider_contacted": False,
+        "proven_useful_context_tokens": None,
+        "replacement": None
+        if entitlement is None
+        else {
+            "entitlement_sha256": entitlement["entitlement_sha256"],
+            "state": entitlement["state"],
+        },
+    }
+
+
+def _replacement_binding(
+    database: ResultsDatabase, *, execution_scope_sha256: str
+) -> Mapping[str, str]:
+    with database.connect_readonly() as connection:
+        rows = connection.execute(
+            """SELECT rre.entitlement_sha256, rre.state,
+                rre.original_execution_scope_sha256,
+                rps.authenticated_workspace_scope_sha256, rps.auth_binding_sha256
+            FROM reference_replacement_entitlements AS rre
+            JOIN reference_preidentity_settlements AS rps
+              ON rps.settlement_sha256 = rre.settlement_sha256
+            LIMIT 2"""
+        ).fetchall()
+    if len(rows) != 1:
+        raise ReferenceOrchestratorError("reference replacement entitlement is unavailable")
+    entitlement = rows[0]
+    if (
+        entitlement["state"] != "available"
+        or entitlement["original_execution_scope_sha256"] != execution_scope_sha256
+    ):
+        raise ReferenceOrchestratorError("reference replacement entitlement is unavailable")
+    return {
+        "entitlement_sha256": str(entitlement["entitlement_sha256"]),
+        "workspace_scope_sha256": str(
+            entitlement["authenticated_workspace_scope_sha256"]
+        ),
+        "auth_binding_sha256": str(entitlement["auth_binding_sha256"]),
+    }
 
 
 def _manifest_identity(provenance: Mapping[str, object]) -> str:
@@ -130,9 +699,7 @@ def _manifest_identity(provenance: Mapping[str, object]) -> str:
         if not isinstance(item, dict) or not isinstance(item.get("local_content"), dict):
             raise ReferenceOrchestratorError("provenance manifest identity is incomplete")
         item["local_content"].pop("reused", None)
-    reproduced = _sha(
-        json.dumps(identity_manifest, sort_keys=True, separators=(",", ":")).encode()
-    )
+    reproduced = _sha(json.dumps(identity_manifest, sort_keys=True, separators=(",", ":")).encode())
     if declared != reproduced:
         raise ReferenceOrchestratorError("provenance manifest identity drift")
     return reproduced
@@ -196,9 +763,7 @@ def refresh_local_config(root: Path) -> ReferenceJobConfig:
         str(item["fixture_id"]): (fixture_root / f"{item['fixture_id']}.json").read_bytes()
         for item in evaluation_raw["fixtures"]
     }
-    evaluation = validate_pending_evaluation_lock(
-        evaluation_raw, fixture_bytes=fixture_bytes
-    )
+    evaluation = validate_pending_evaluation_lock(evaluation_raw, fixture_bytes=fixture_bytes)
     evaluation_lock_canonical_sha256 = evaluation.sha256
     source_metadata = _read_json(
         root / str(current.authority_files["source_shard_metadata_path"]),
@@ -242,7 +807,7 @@ def refresh_local_config(root: Path) -> ReferenceJobConfig:
     raw["inputs"]["provenance_manifest_sha256"] = provenance_sha
     raw["approval_artifact_path"] = None
     encoded = yaml.safe_dump(raw, sort_keys=False, allow_unicode=False).encode("utf-8")
-    _write_atomic(path, encoded)
+    _write_atomic(root, path, encoded)
     return load_reference_job_config(path, root=root)
 
 
@@ -278,23 +843,24 @@ def _source_artifacts(root: Path, config: ReferenceJobConfig) -> list[dict[str, 
     ):
         raise ReferenceOrchestratorError("source identity does not match immutable provenance")
     expected_prefix = f"/{identifier}/resolve/{revision}/"
-    by_name = {
-        item.get("path"): item for item in files if isinstance(item, Mapping)
-    }
+    by_name = {item.get("path"): item for item in files if isinstance(item, Mapping)}
     index = by_name.get("model.safetensors.index.json")
     if not isinstance(index, Mapping) or not isinstance(index.get("http"), Mapping):
         raise ReferenceOrchestratorError("source index origin is unavailable")
     index_url = str(index["http"].get("requested_url"))
     parsed_index = urlsplit(index_url)
-    if parsed_index.query or parsed_index.fragment or not parsed_index.path.endswith(
-        "/model.safetensors.index.json"
-    ) or (
-        parsed_index.scheme != "https"
-        or parsed_index.hostname not in REFERENCE_IMMUTABLE_ORIGIN_HOSTS
-        or parsed_index.username is not None
-        or parsed_index.password is not None
-        or parsed_index.port not in (None, 443)
-        or parsed_index.path != expected_prefix + "model.safetensors.index.json"
+    if (
+        parsed_index.query
+        or parsed_index.fragment
+        or not parsed_index.path.endswith("/model.safetensors.index.json")
+        or (
+            parsed_index.scheme != "https"
+            or parsed_index.hostname not in REFERENCE_IMMUTABLE_ORIGIN_HOSTS
+            or parsed_index.username is not None
+            or parsed_index.password is not None
+            or parsed_index.port not in (None, 443)
+            or parsed_index.path != expected_prefix + "model.safetensors.index.json"
+        )
     ):
         raise ReferenceOrchestratorError("source index origin is not immutable and query-free")
     base_path = parsed_index.path.rsplit("/", 1)[0] + "/"
@@ -481,6 +1047,8 @@ def validate_reproduced_request(
 
 
 def _capability(root: Path, config: ReferenceJobConfig, request: bytes) -> ReferenceModalCapability:
+    from lowbit_lab.reference_modal_adapter import ReferenceModalCapability
+
     evaluation_path = Path(str(config.authority_files["evaluation_lock_path"]))
     evaluation_lock_file_bytes = (root / evaluation_path).read_bytes()
     evaluation = json.loads(evaluation_lock_file_bytes)
@@ -535,7 +1103,7 @@ def prepare(root: Path) -> tuple[ReferenceJobConfig, bytes, ReferenceModalCapabi
     root = root.resolve()
     config = refresh_local_config(root)
     request = build_bootstrap_request(root, config)
-    _write_atomic(root / REQUEST_PATH, request)
+    _write_atomic(root, root / REQUEST_PATH, request)
     request_sha = _sha(request)
     image_sha = _sha((root / IMAGE_LOCK_PATH).read_bytes())
     provider_sha = _sha((root / PROVIDER_CAPABILITY_PATH).read_bytes())
@@ -558,18 +1126,37 @@ def prepare(root: Path) -> tuple[ReferenceJobConfig, bytes, ReferenceModalCapabi
     return config, request, _capability(root, config, request)
 
 
+def prepare_replacement(
+    root: Path,
+) -> tuple[ReferenceJobConfig, bytes, ReferenceModalCapability, Mapping[str, str]]:
+    """Prepare the deterministic graph and require an available, same-scope child slot."""
+    root = root.resolve()
+    config, request, capability = prepare(root)
+    database = ResultsDatabase(confine_results_db(root, DATABASE_PATH))
+    binding = _replacement_binding(
+        database, execution_scope_sha256=config.reference_execution_scope_sha256
+    )
+    _validate_fresh_auth_receipt(
+        root, expected_workspace_scope_sha256=binding["workspace_scope_sha256"]
+    )
+    return config, request, capability, binding
+
+
 def _watchdog_ready() -> None:
-    if (
-        os.name == "nt"
-        or not all(hasattr(signal, name) for name in ("SIGALRM", "ITIMER_REAL", "setitimer"))
+    if os.name == "nt" or not all(
+        hasattr(signal, name) for name in ("SIGALRM", "ITIMER_REAL", "setitimer")
     ):
         raise ReferenceOrchestratorError("paid execution requires the WSL/Linux watchdog")
 
 
-def execute(root: Path, *, confirm_request_sha256: str) -> Mapping[str, object]:
+def execute(
+    root: Path, *, confirm_request_sha256: str, replacement: bool = False
+) -> Mapping[str, object]:
     """Reserve once and cross the existing adapter boundary after fresh local checks."""
     root = root.resolve()
     _watchdog_ready()
+    if provider_environment_overrides_present():
+        raise ReferenceOrchestratorError("ambient provider environment override is forbidden")
     config, request, unreserved = prepare(root)
     request_sha = _sha(request)
     if confirm_request_sha256 != request_sha:
@@ -586,6 +1173,16 @@ def execute(root: Path, *, confirm_request_sha256: str) -> Mapping[str, object]:
     observe_topology(root / REQUEST_PATH)
     database = ResultsDatabase(confine_results_db(root, DATABASE_PATH))
     database.initialize()
+    replacement_binding: Mapping[str, str] | None = None
+    if replacement:
+        replacement_binding = _replacement_binding(
+            database, execution_scope_sha256=config.reference_execution_scope_sha256
+        )
+        verify_workspace_auth(root)
+        _validate_fresh_auth_receipt(
+            root,
+            expected_workspace_scope_sha256=replacement_binding["workspace_scope_sha256"],
+        )
     now = datetime.now(UTC)
     expires = now + timedelta(hours=1)
     reservation_id = str(uuid.uuid4())
@@ -603,13 +1200,13 @@ def execute(root: Path, *, confirm_request_sha256: str) -> Mapping[str, object]:
     )
     approval_digest = canonical_sha256(
         {
-            "action": "u8_reference_once",
+            "action": "u8_reference_replacement_once" if replacement else "u8_reference_once",
             "challenge_sha256": config.challenge_sha256,
             "packet_sha256": packet_sha,
             "standing_authority_sha256": REFERENCE_AUTHORITY_SHA256,
         }
     )
-    database.reserve_reference_run(
+    reserve_arguments: dict[str, object] = dict(
         reservation_id=reservation_id,
         attempt_id=attempt_id,
         run_id=run_id,
@@ -642,7 +1239,30 @@ def execute(root: Path, *, confirm_request_sha256: str) -> Mapping[str, object]:
         attempt_config_path=CONFIG_PATH.as_posix(),
         attempt_raw_config_sha256=_sha((root / CONFIG_PATH).read_bytes()),
     )
-    capability = replace(unreserved, reservation_id=reservation_id, owner_id=owner_id)
+    if replacement_binding is not None:
+        reserve_arguments.update(
+            replacement_entitlement_sha256=replacement_binding["entitlement_sha256"],
+            recovery_authority_sha256=REFERENCE_RECOVERY_AUTHORITY_SHA256,
+            recovery_authority_path=RECOVERY_AUTHORITY_PATH,
+        )
+    database.reserve_reference_run(**reserve_arguments)
+    capability = replace(
+        unreserved,
+        reservation_id=reservation_id,
+        owner_id=owner_id,
+        replacement_entitlement_sha256=(
+            None if replacement_binding is None else replacement_binding["entitlement_sha256"]
+        ),
+        recovery_authority_sha256=(
+            None if replacement_binding is None else REFERENCE_RECOVERY_AUTHORITY_SHA256
+        ),
+        replacement_workspace_scope_sha256=(
+            None if replacement_binding is None else replacement_binding["workspace_scope_sha256"]
+        ),
+        replacement_auth_binding_sha256=(
+            None if replacement_binding is None else replacement_binding["auth_binding_sha256"]
+        ),
+    )
     try:
         return submit_reference(capability)
     except Exception:
@@ -660,8 +1280,19 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--root", type=Path, default=Path("."))
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("prepare")
+    sub.add_parser("status")
+    sub.add_parser("auth-bind")
+    sub.add_parser("recovery-authority")
+    sub.add_parser("auth-verify")
+    capture = sub.add_parser("billing-capture")
+    capture.add_argument("--query-start", required=True)
+    capture.add_argument("--query-end", required=True)
+    sub.add_parser("settle-preidentity-zero")
+    sub.add_parser("prepare-replacement")
     live = sub.add_parser("execute")
     live.add_argument("--confirm-request-sha256", required=True)
+    replacement = sub.add_parser("execute-replacement")
+    replacement.add_argument("--confirm-request-sha256", required=True)
     return parser
 
 
@@ -683,7 +1314,70 @@ def main(argv: list[str] | None = None) -> int:
                 }
             )
             return 0
-        result = execute(args.root, confirm_request_sha256=args.confirm_request_sha256)
+        if command == "status":
+            emit({"ok": True, **reference_status(args.root)})
+            return 0
+        if command == "auth-bind":
+            emit(
+                {
+                    "ok": True,
+                    "provider_contacted": False,
+                    **bind_workspace_auth(args.root),
+                }
+            )
+            return 0
+        if command == "recovery-authority":
+            emit(
+                {
+                    "ok": True,
+                    "provider_contacted": False,
+                    **materialize_recovery_authority(args.root),
+                }
+            )
+            return 0
+        if command == "auth-verify":
+            emit(
+                {
+                    "ok": True,
+                    "provider_contacted": False,
+                    **verify_workspace_auth(args.root),
+                }
+            )
+            return 0
+        if command == "billing-capture":
+            emit(
+                {
+                    "ok": True,
+                    **capture_workspace_zero_billing(
+                        args.root,
+                        query_start=args.query_start,
+                        query_end=args.query_end,
+                    ),
+                }
+            )
+            return 0
+        if command == "settle-preidentity-zero":
+            emit({"ok": True, **settle_workspace_zero(args.root)})
+            return 0
+        if command == "prepare-replacement":
+            config, request, _, binding = prepare_replacement(args.root)
+            emit(
+                {
+                    "configured_context_tokens": 262144,
+                    "entitlement_sha256": binding["entitlement_sha256"],
+                    "execution_scope_sha256": config.reference_execution_scope_sha256,
+                    "ok": True,
+                    "provider_contacted": False,
+                    "proven_useful_context_tokens": None,
+                    "request_sha256": _sha(request),
+                }
+            )
+            return 0
+        result = execute(
+            args.root,
+            confirm_request_sha256=args.confirm_request_sha256,
+            replacement=command == "execute-replacement",
+        )
         emit({"ok": True, "provider_contacted": True, "result": result})
         return 0
     except Exception as exc:

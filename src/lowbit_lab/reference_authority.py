@@ -15,6 +15,8 @@ from lowbit_lab.constants import (
     REFERENCE_BOOTSTRAP_STATEMENT_SHA256,
     REFERENCE_CUMULATIVE_CAP_USD,
     REFERENCE_INCREMENTAL_CAP_USD,
+    REFERENCE_RECOVERY_AUTHORITY_SHA256,
+    REFERENCE_RECOVERY_STATEMENT_SHA256,
     REFERENCE_SIGNED_CDN_AUTHORITY_SHA256,
     REFERENCE_SIGNED_CDN_MERGE_COMMIT,
     REFERENCE_SIGNED_CDN_STATEMENT_SHA256,
@@ -35,6 +37,8 @@ BOOTSTRAP_STATEMENT_PATH = Path("configs/local/reference-bootstrap-statement.txt
 BOOTSTRAP_AUTHORITY_PATH = Path("configs/local/reference-bootstrap-authority.json")
 SIGNED_CDN_STATEMENT_PATH = Path("configs/local/reference-signed-cdn-statement.txt")
 SIGNED_CDN_AUTHORITY_PATH = Path("configs/local/reference-signed-cdn-authority.json")
+RECOVERY_STATEMENT_PATH = Path("configs/local/reference-recovery-standing-authority.txt")
+RECOVERY_AUTHORITY_PATH = Path("configs/local/reference-recovery-authority.json")
 CONTROLLING_PLANS = {
     "original_reference_baseline": (
         Path("docs/plans/local/2026-08-21-2358-feat-full-weight-baseline-plan.md"),
@@ -163,6 +167,49 @@ def _expected_signed_cdn_authority() -> dict[str, Any]:
         "caller_headers_or_credentials_authorized": False,
         "retries_authorized": False,
         "additional_provider_actions_authorized": False,
+    }
+
+
+def build_reference_recovery_authority() -> dict[str, Any]:
+    """Return the closed target-neutral recovery capability authorized by the human grant."""
+    return {
+        "schema_version": 1,
+        "kind": "reference_preidentity_recovery_authority",
+        "statement_sha256": REFERENCE_RECOVERY_STATEMENT_SHA256,
+        "parent_signed_cdn_authority_sha256": REFERENCE_SIGNED_CDN_AUTHORITY_SHA256,
+        "action_classes": [
+            "zero_spend_phase1",
+            "preidentity_zero_settlement",
+            "u8_reference_replacement_once",
+        ],
+        "settlement_mode": "workspace_zero_preidentity",
+        "failure_code": "auth_before_provider_identity",
+        "provider": "modal",
+        "original_u8_slot_remains_consumed": True,
+        "replacement_u8_slots": 1,
+        "replacement_retry_slots": 0,
+        "incremental_u8_cap_usd": str(REFERENCE_INCREMENTAL_CAP_USD),
+        "cumulative_lab_cap_usd": str(REFERENCE_CUMULATIVE_CAP_USD),
+        "settlement_actual_cost_usd": "0",
+        "currency": "USD",
+        "gpu": "A100-80GB:1",
+        "max_concurrent_containers": 1,
+        "timeout_seconds": 2700,
+        "provider_retries": 0,
+        "application_retries": 0,
+        "configured_context_tokens": 262144,
+        "proven_useful_context_tokens": None,
+        "exact_workspace_zero_evidence_required": True,
+        "provider_identity_must_be_absent": True,
+        "authoritative_billing_settlement_required": True,
+        "weights_remote_public_retrieval_authorized": True,
+        "local_weight_transfer_authorized": False,
+        "private_data_authorized": False,
+        "user_payloads_authorized": False,
+        "secrets_mounts_volumes_schedules_authorized": False,
+        "destructive_cleanup_authorized": False,
+        "candidate_conversion_training_promotion_authorized": False,
+        "u9_proposal_only": True,
     }
 
 
@@ -372,3 +419,50 @@ def validate_reference_signed_cdn_authority(
     if authority != expected or sha256_json(authority) != REFERENCE_SIGNED_CDN_AUTHORITY_SHA256:
         raise ReferenceAuthorityError("signed CDN authority boundary has drifted")
     return REFERENCE_SIGNED_CDN_AUTHORITY_SHA256
+
+
+def validate_reference_recovery_authority(
+    root: Path,
+    authority_path: Path = RECOVERY_AUTHORITY_PATH,
+) -> str:
+    """Validate the pre-identity settlement grant without broadening its parent."""
+    validate_reference_signed_cdn_authority(root, SIGNED_CDN_AUTHORITY_PATH)
+    root = root.resolve(strict=True)
+    expected_path = _confined_path(root, RECOVERY_AUTHORITY_PATH, "recovery authority")
+    resolved_path = (
+        authority_path.resolve()
+        if authority_path.is_absolute()
+        else (root / authority_path).resolve()
+    )
+    if resolved_path != expected_path:
+        raise ReferenceAuthorityError("recovery authority path is fixed")
+
+    statement = _read(
+        _confined_path(root, RECOVERY_STATEMENT_PATH, "recovery authority statement"),
+        "recovery authority statement",
+    )
+    if (
+        statement.startswith(b"\xef\xbb\xbf")
+        or hashlib.sha256(statement).hexdigest() != REFERENCE_RECOVERY_STATEMENT_SHA256
+    ):
+        raise ReferenceAuthorityError("recovery authority statement bytes have drifted")
+    try:
+        statement.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as exc:
+        raise ReferenceAuthorityError("recovery authority statement is not UTF-8") from exc
+
+    authority_bytes = _read(resolved_path, "recovery authority")
+    try:
+        authority = json.loads(
+            authority_bytes.decode("utf-8", errors="strict"),
+            object_pairs_hook=_reject_duplicate_keys,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ReferenceAuthorityError("recovery authority is not valid UTF-8 JSON") from exc
+    expected = build_reference_recovery_authority()
+    canonical_bytes = (canonical_json(expected) + "\n").encode("utf-8")
+    if authority_bytes != canonical_bytes:
+        raise ReferenceAuthorityError("recovery authority raw bytes are not canonical")
+    if authority != expected or sha256_json(authority) != REFERENCE_RECOVERY_AUTHORITY_SHA256:
+        raise ReferenceAuthorityError("recovery authority boundary has drifted")
+    return REFERENCE_RECOVERY_AUTHORITY_SHA256

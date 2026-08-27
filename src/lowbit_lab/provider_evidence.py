@@ -155,6 +155,15 @@ def inspect_modal_sdk() -> dict[str, object]:
     version = distribution.version
     if version != EXPECTED_MODAL_VERSION:
         raise ProviderEvidenceError("installed Modal SDK version does not match the pin")
+    module_path = Path(str(getattr(modal, "__file__", ""))).resolve()
+    distribution_python_files = {
+        distribution.locate_file(item).resolve()
+        for item in distribution.files or ()
+        if Path(str(item).replace("\\", "/")).suffix == ".py"
+        and Path(str(item).replace("\\", "/")).parts[:1] == ("modal",)
+    }
+    if module_path not in distribution_python_files:
+        raise ProviderEvidenceError("imported Modal SDK is outside the pinned distribution")
 
     image_id = _public_property(modal.Image, "object_id", "image identity")
     app_id = _public_property(modal.App, "app_id", "app identity")

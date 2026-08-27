@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -92,6 +93,15 @@ def test_local_sdk_inspection_binds_public_identity_lifecycle_without_client() -
     assert surfaces["image"]["available_at"] == "after_build_inside_initialized_app_before_spawn"
     assert surfaces["app"]["identity_field"] == "app_id"
     assert surfaces["call"]["lifecycle_method"] == "modal.Function.spawn"
+
+
+def test_local_sdk_inspection_rejects_shadow_module(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    shadow = SimpleNamespace(__file__=str(tmp_path / "modal.py"))
+    monkeypatch.setattr(provider_evidence.importlib, "import_module", lambda name: shadow)
+    with pytest.raises(ProviderEvidenceError, match="outside the pinned distribution"):
+        inspect_modal_sdk()
 
 
 def test_receipt_reproduces_from_settled_itemized_evidence(capability) -> None:

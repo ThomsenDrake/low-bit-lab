@@ -1039,10 +1039,11 @@ def test_u8_submission_primitives_are_absent() -> None:
             assert sorted(violations) == [
                 "App",
                 "modal",
-                "modal._serialization",
-                "modal._vendor",
-                "modal._vendor",
-                "spawn",
+                    "modal._serialization",
+                    "modal._vendor",
+                    "modal._vendor",
+                    "modal.config",
+                    "spawn",
             ], path
             source = path.read_text(encoding="utf-8")
             assert source.count("modal.App(") == 1

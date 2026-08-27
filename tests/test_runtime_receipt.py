@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 import lowbit_lab.runtime_receipt as runtime_receipt
+import lowbit_lab.safe_files as safe_files
 
 
 def _observe(*, root: Path, lock: object) -> dict[str, object]:
@@ -95,13 +96,13 @@ def test_generator_does_not_overwrite_destination_created_during_publish(
     output = tmp_path / "receipt.json"
     monkeypatch.setattr(runtime_receipt, "load_runtime_lock", lambda *_a, **_k: SimpleNamespace())
     monkeypatch.setattr(runtime_receipt, "observe_installed_environment", _observe)
-    real_link = runtime_receipt.os.link
+    real_link = safe_files.os.link
 
     def racing_link(source: Path, destination: Path) -> None:
         destination.write_bytes(b"racer")
         real_link(source, destination)
 
-    monkeypatch.setattr(runtime_receipt.os, "link", racing_link)
+    monkeypatch.setattr(safe_files.os, "link", racing_link)
     with pytest.raises(runtime_receipt.RuntimeReceiptError, match="already exists"):
         runtime_receipt.generate_runtime_receipt(
             root=tmp_path, runtime_lock_path=lock_path, output_path=output
