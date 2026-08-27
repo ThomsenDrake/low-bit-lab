@@ -24,6 +24,7 @@ from lowbit_lab.config import SHA256_RE
 from lowbit_lab.constants import (
     REFERENCE_AUTHORITY_SHA256,
     REFERENCE_BOOTSTRAP_AUTHORITY_SHA256,
+    REFERENCE_RECOVERY_AUTHORITY_SHA256,
 )
 from lowbit_lab.db import DatabaseError, ResultsDatabase
 from lowbit_lab.evaluation_lock import EvaluationLockError, validate_pending_evaluation_lock
@@ -40,6 +41,11 @@ from lowbit_lab.reference_harness import (
     ReferenceHarnessError,
     validate_execution_identity,
     validate_reference_manifest_bytes,
+)
+from lowbit_lab.reference_provider_auth import (
+    OFFICIAL_MODAL_SERVER_URL,
+    auth_receipt_path,
+    provider_environment_overrides_present,
 )
 from lowbit_lab.reference_transport import TOPOLOGY_EVIDENCE_PATH, validate_topology_evidence
 
@@ -90,6 +96,10 @@ class ReferenceModalCapability:
     fixture_bytes: Mapping[str, bytes]
     execution_identity: Mapping[str, str]
     image_lock: Mapping[str, object]
+    replacement_entitlement_sha256: str | None = None
+    recovery_authority_sha256: str | None = None
+    replacement_workspace_scope_sha256: str | None = None
+    replacement_auth_binding_sha256: str | None = None
 
 
 @dataclass(frozen=True)
@@ -563,6 +573,69 @@ def _audit_block(
     )
 
 
+def _mark_submission_pending(
+    database: ResultsDatabase,
+    capability: ReferenceModalCapability,
+    occurred_at: str,
+    *,
+    replacement_auth_receipt_bytes: bytes | None = None,
+) -> None:
+    """Consume either the original slot or its one replacement at the same boundary."""
+    replacement_entitlement_sha256 = getattr(capability, "replacement_entitlement_sha256", None)
+    if replacement_entitlement_sha256 is None:
+        database.mark_reference_submission_pending(
+            capability.reservation_id,
+            owner_id=capability.owner_id,
+            standing_authority_sha256=REFERENCE_AUTHORITY_SHA256,
+            bootstrap_authority_sha256=REFERENCE_BOOTSTRAP_AUTHORITY_SHA256,
+            authority_root=capability.authority_root,
+            occurred_at=occurred_at,
+        )
+        return
+    recovery_authority_sha256 = getattr(capability, "recovery_authority_sha256", None)
+    if recovery_authority_sha256 != REFERENCE_RECOVERY_AUTHORITY_SHA256:
+        raise ReferenceModalError("replacement recovery authority is invalid")
+    database.mark_reference_replacement_submission_pending(
+        capability.reservation_id,
+        entitlement_sha256=replacement_entitlement_sha256,
+        owner_id=capability.owner_id,
+        recovery_authority_sha256=recovery_authority_sha256,
+        auth_receipt_bytes=replacement_auth_receipt_bytes or b"",
+        auth_binding_sha256=str(getattr(capability, "replacement_auth_binding_sha256", "")),
+        workspace_scope_sha256=str(
+            getattr(capability, "replacement_workspace_scope_sha256", "")
+        ),
+        authority_root=capability.authority_root,
+        occurred_at=occurred_at,
+    )
+
+
+def _validate_modal_sdk_boundary(capability: ReferenceModalCapability) -> None:
+    """Reproduce the audited SDK identity immediately before one-shot consumption."""
+    try:
+        request = validate_bootstrap_request_bytes(capability.bootstrap_request_bytes)
+        request_raw = json.loads(request.canonical_json)
+        image = validate_image_lock(capability.image_lock)
+        validate_provider_capability_receipt(
+            capability.root / capability.provider_capability_path,
+            expected_sha256=str(request_raw["provider_capability"]["receipt_sha256"]),
+            image_recipe_sha256=image.recipe_sha256,
+            billing_authority_path=capability.root / capability.billing_authority_path,
+            billing_receipt_path=capability.root / capability.billing_receipt_path,
+            billing_report_path=capability.root / capability.billing_report_path,
+        )
+        from modal.config import DEFAULT_SERVER_URL, config
+
+        if (
+            DEFAULT_SERVER_URL != OFFICIAL_MODAL_SERVER_URL
+            or config.get("server_url", use_env=False) != OFFICIAL_MODAL_SERVER_URL
+            or config.get("override_headers", use_env=False) not in (None, {})
+        ):
+            raise ReferenceModalError("provider profile transport is unsupported")
+    except Exception as exc:
+        raise ReferenceModalError("provider SDK boundary identity drift") from exc
+
+
 def submit_reference(capability: ReferenceModalCapability) -> dict[str, object]:
     """The only U8 provider call path. Callers must already hold a reservation."""
     canonical_db_path = capability.root.resolve() / "results/local/reference.sqlite"
@@ -612,14 +685,44 @@ def submit_reference(capability: ReferenceModalCapability) -> dict[str, object]:
         raise ReferenceModalError("deterministic remote contract gate failed") from exc
 
     started = time.monotonic()
+    boundary_auth_receipt_bytes: bytes | None = None
+    if getattr(capability, "replacement_entitlement_sha256", None) is not None:
+        # Re-authenticate after the final slow deterministic preflight and bind the
+        # fresh receipt at the exact entitlement-consumption boundary.
+        from lowbit_lab.reference_orchestrator import (
+            _validate_fresh_auth_receipt,
+            verify_workspace_auth,
+        )
+
+        try:
+            if provider_environment_overrides_present():
+                raise ReferenceModalError("ambient provider environment override is forbidden")
+            auth = verify_workspace_auth(capability.root)
+            expected_scope = capability.replacement_workspace_scope_sha256
+            if auth["workspace_scope_sha256"] != expected_scope:
+                raise ReferenceModalError("replacement workspace authentication drift")
+            if auth["binding_sha256"] != capability.replacement_auth_binding_sha256:
+                raise ReferenceModalError("replacement auth binding drift")
+            _validate_fresh_auth_receipt(
+                capability.root, expected_workspace_scope_sha256=str(expected_scope)
+            )
+            receipt_sha256 = str(auth["receipt_sha256"])
+            boundary_auth_receipt_bytes = (
+                capability.root / auth_receipt_path(receipt_sha256)
+            ).read_bytes()
+            if _sha(boundary_auth_receipt_bytes) != receipt_sha256:
+                raise ReferenceModalError("replacement auth receipt bytes drift")
+        except Exception as exc:
+            raise ReferenceModalError("replacement boundary authentication failed") from exc
+    if provider_environment_overrides_present():
+        raise ReferenceModalError("ambient provider environment override is forbidden")
+    _validate_modal_sdk_boundary(capability)
     submission_pending_at = datetime.now(UTC).isoformat()
-    database.mark_reference_submission_pending(
-        capability.reservation_id,
-        owner_id=capability.owner_id,
-        standing_authority_sha256=REFERENCE_AUTHORITY_SHA256,
-        bootstrap_authority_sha256=REFERENCE_BOOTSTRAP_AUTHORITY_SHA256,
-        authority_root=capability.authority_root,
-        occurred_at=submission_pending_at,
+    _mark_submission_pending(
+        database,
+        capability,
+        submission_pending_at,
+        replacement_auth_receipt_bytes=boundary_auth_receipt_bytes,
     )
 
     def provider_deadline_expired(signum: int, frame: object) -> None:

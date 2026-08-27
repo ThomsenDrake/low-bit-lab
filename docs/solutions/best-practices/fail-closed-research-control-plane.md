@@ -272,6 +272,33 @@ boundary. Define shared closed field sets once, keep a populated production-shap
 fixture at the atomic consumer, and reproduce the exact production transaction against a disposable
 database copy before paid use.
 
+Pre-identity provider failures need a distinct settlement contract, not a fabricated identity or a
+relaxed ordinary receipt. When authoritative workspace billing is the only available evidence,
+accept it only for exact zero over a complete unfiltered interval, preserving and hashing the exact
+provider report bytes, bound to the authenticated
+workspace, original reservation and scope, failure class, and exact report bytes. Preserve the
+consumed action and mint any explicitly authorized replacement as a separate one-shot entitlement
+in the same transaction. Settlement truth, retry authority, and budget reuse then remain independent
+auditable facts.
+
+Hash claims are insufficient when the claimed evidence bytes are available locally. Preserve
+before/after authentication receipts content-addressably, pass their exact bytes into the database
+authority boundary, and recompute schema, scope, binding, timestamp, and digest inside the same
+transaction that consumes one-shot authority. The durable consumption timestamp must follow the
+validated authentication timestamp.
+
+Database migrations in an unknown-state control plane should fingerprint the complete deployed
+source schema before DDL: ordered column metadata plus normalized table, index, and trigger SQL.
+Allow only explicitly reproduced historical fingerprints, compare every copied cell by stable key,
+and reject missing, extra, or altered objects before mutation.
+
+Provider-local authentication is not isolated if ambient process configuration can redirect
+transport or imports. Reject proxy, custom TLS, Python import, and every provider-prefixed environment
+key by presence without reading values. Strip the same keys from child environments, verify the
+provider profile uses the frozen official endpoint with no override headers, run read-only CLIs with
+isolated/no-bytecode interpreter flags, and reproduce the pinned SDK identity immediately before
+consuming paid authority.
+
 ## Why This Matters
 
 These invariants make silent policy drift, config mutation, preflight failure loss, and concurrent overspend observable or impossible. They also let later agents resume from durable state without inheriting hidden judgment from an earlier session.

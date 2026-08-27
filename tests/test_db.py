@@ -10,14 +10,25 @@ import pytest
 from lowbit_lab.constants import (
     REFERENCE_AUTHORITY_SHA256,
     REFERENCE_BOOTSTRAP_AUTHORITY_SHA256,
+    REFERENCE_RECOVERY_AUTHORITY_SHA256,
 )
-from lowbit_lab.db import SCHEMA_VERSION, DatabaseError, ResultsDatabase
+from lowbit_lab.db import (
+    SCHEMA_VERSION,
+    DatabaseError,
+    ResultsDatabase,
+    _committed_provider_cost,
+)
 from lowbit_lab.reference_authority import (
     AUTHORITY_PATH,
     BOOTSTRAP_AUTHORITY_PATH,
     BOOTSTRAP_STATEMENT_PATH,
     CONTROLLING_PLANS,
+    RECOVERY_AUTHORITY_PATH,
+    RECOVERY_STATEMENT_PATH,
+    SIGNED_CDN_AUTHORITY_PATH,
+    SIGNED_CDN_STATEMENT_PATH,
     STATEMENT_PATH,
+    build_reference_recovery_authority,
 )
 from lowbit_lab.reference_contract import (
     APPROVED_PROVIDER_AMENDMENT_PATH,
@@ -31,6 +42,7 @@ from lowbit_lab.reference_contract import (
     REFERENCE_GATE_FIELDS,
     reference_execution_scope_sha256,
 )
+from lowbit_lab.reference_settlement import AUTH_METHOD_SHA256, CANONICAL_EMPTY_REPORT
 
 
 def _authority_root(database: ResultsDatabase) -> Path:
@@ -41,13 +53,31 @@ def _authority_root(database: ResultsDatabase) -> Path:
         AUTHORITY_PATH,
         BOOTSTRAP_STATEMENT_PATH,
         BOOTSTRAP_AUTHORITY_PATH,
+        SIGNED_CDN_STATEMENT_PATH,
+        SIGNED_CDN_AUTHORITY_PATH,
+        RECOVERY_STATEMENT_PATH,
+        RECOVERY_AUTHORITY_PATH,
     ]
     relative_paths.extend(path for path, _ in CONTROLLING_PLANS.values())
     for relative_path in relative_paths:
         destination = root / relative_path
         destination.parent.mkdir(parents=True, exist_ok=True)
         if not destination.exists():
-            destination.write_bytes((repository / relative_path).read_bytes())
+            source = repository / relative_path
+            if relative_path == RECOVERY_AUTHORITY_PATH and not source.exists():
+                destination.write_text(
+                    json.dumps(
+                        build_reference_recovery_authority(),
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        ensure_ascii=True,
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                    newline="\n",
+                )
+            else:
+                destination.write_bytes(source.read_bytes())
     return root
 
 
@@ -407,6 +437,8 @@ def _reserve(
     standing_authority_sha256: str = REFERENCE_AUTHORITY_SHA256,
     bootstrap_authority_sha256: str = REFERENCE_BOOTSTRAP_AUTHORITY_SHA256,
     standing_setup: bool = False,
+    replacement_entitlement_sha256: str | None = None,
+    approval_expires_at: str = "2026-08-22T01:00:00+00:00",
 ) -> None:
     if settled_smoke_actual_usd is not None:
         with database.connect_readonly() as connection:
@@ -528,7 +560,7 @@ def _reserve(
             database.attach_reference_approval(
                 challenge_sha256=challenge,
                 approval_digest=approval,
-                expires_at="2026-08-22T01:00:00+00:00",
+                expires_at=approval_expires_at,
             )
         database.create_attempt(
             attempt_id=f"attempt-{suffix}",
@@ -565,9 +597,15 @@ def _reserve(
         bootstrap_authority_sha256=bootstrap_authority_sha256,
         authority_root=_authority_root(database),
         standing_packet_sha256="c" * 64 if standing_setup else None,
-        approval_expires_at="2026-08-22T01:00:00+00:00" if standing_setup else None,
+        approval_expires_at=approval_expires_at if standing_setup else None,
         attempt_config_path="configs/local/reference.yaml" if standing_setup else None,
         attempt_raw_config_sha256="a" * 64 if standing_setup else None,
+        replacement_entitlement_sha256=replacement_entitlement_sha256,
+        recovery_authority_sha256=(
+            REFERENCE_RECOVERY_AUTHORITY_SHA256
+            if replacement_entitlement_sha256 is not None
+            else None
+        ),
     )
 
 
@@ -617,12 +655,12 @@ def test_standing_reference_setup_rolls_back_with_failed_reservation(tmp_path: P
 def _downgrade_v9_to_v8(path: Path) -> None:
     with sqlite3.connect(path) as connection:
         connection.execute("DROP TABLE reference_authority_slots")
-        connection.execute("UPDATE schema_info SET version = 8 WHERE version IN (10, 11, 12)")
+        connection.execute("UPDATE schema_info SET version = 8 WHERE version IN (10, 11, 12, 13)")
 
 
 def _downgrade_v10_to_v9(path: Path) -> None:
     with sqlite3.connect(path) as connection:
-        connection.execute("UPDATE schema_info SET version = 9 WHERE version IN (10, 11, 12)")
+        connection.execute("UPDATE schema_info SET version = 9 WHERE version IN (10, 11, 12, 13)")
 
 
 def _submit(database: ResultsDatabase, reservation_id: str, *, lease: str) -> None:
@@ -1470,7 +1508,7 @@ def _acquire_controller_cycle(
     )
 
 
-def test_v6_to_v7_migration_adds_controller_cycles(tmp_path: Path) -> None:
+def test_corrupt_v6_without_budget_ledger_fails_closed(tmp_path: Path) -> None:
     path = tmp_path / "legacy-v6.sqlite"
     import sqlite3
 
@@ -1480,14 +1518,28 @@ def test_v6_to_v7_migration_adds_controller_cycles(tmp_path: Path) -> None:
         )
         connection.execute("INSERT INTO schema_info VALUES (6, '2026-08-23T00:00:00+00:00')")
     database = ResultsDatabase(path)
-    database.initialize()
-    database.initialize()
-    assert _acquire_controller_cycle(database, "cycle-after-migration") == 1
+    with pytest.raises(DatabaseError, match="ledger is missing"):
+        database.initialize()
     with database.connect() as connection:
-        assert (
-            connection.execute("SELECT max(version) FROM schema_info").fetchone()[0]
-            == SCHEMA_VERSION
+        assert connection.execute("SELECT max(version) FROM schema_info").fetchone()[0] == 12
+
+
+def test_corrupt_v11_without_budget_ledger_fails_closed(tmp_path: Path) -> None:
+    path = tmp_path / "legacy-v11-missing-budget.sqlite"
+    import sqlite3
+
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "CREATE TABLE schema_info (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
         )
+        connection.execute("INSERT INTO schema_info VALUES (11, '2026-08-23T00:00:00+00:00')")
+    with pytest.raises(DatabaseError, match="ledger is missing"):
+        ResultsDatabase(path).initialize()
+    with sqlite3.connect(path) as connection:
+        assert connection.execute("SELECT max(version) FROM schema_info").fetchone()[0] == 12
+        assert connection.execute(
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='budget_reservations'"
+        ).fetchone()[0] == 0
 
 
 def test_controller_cycle_lifecycle_commits_artifact_with_fencing(tmp_path: Path) -> None:
@@ -2060,3 +2112,480 @@ def test_reference_reservation_rejects_smoke_actual_above_exact_cumulative_cap(
     with pytest.raises(DatabaseError, match="cumulative"):
         _reserve(database, suffix="over-total")
     assert database.reference_u8_slot(REFERENCE_AUTHORITY_SHA256)["state"] == "available"
+
+
+_ZERO_BILLING_AUTHORITY_BYTES = json.dumps(
+    {
+        "attribution_method_sha256": "2" * 64,
+        "authoritative_report_identity_sha256": "1" * 64,
+        "billing_completeness_delay_seconds": 3600,
+    },
+    sort_keys=True,
+    separators=(",", ":"),
+).encode()
+
+
+def _preidentity_evidence(suffix: str) -> tuple[bytes, bytes, bytes, bytes, bytes]:
+    execution_scope = reference_execution_scope_sha256(
+            source_revision="d" * 40,
+            weight_inventory_sha256="1" * 64,
+            evaluation_lock_sha256="4" * 64,
+            formula_authority_sha256="5" * 64,
+            formula_approval_sha256="8" * 64,
+            trust_override_sha256="3" * 64,
+    )
+    report = CANONICAL_EMPTY_REPORT
+    def auth_receipt(*, authenticated_at: str, nonce: str) -> bytes:
+        value = {
+            "authenticated_at": authenticated_at,
+            "binding_sha256": "6" * 64,
+            "kind": "reference_modal_workspace_auth_receipt",
+            "method_sha256": AUTH_METHOD_SHA256,
+            "provider": "modal",
+            "schema_version": 1,
+            "verification_nonce_sha256": nonce,
+            "workspace_scope_sha256": "8" * 64,
+        }
+        return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+
+    pre_auth = auth_receipt(
+        authenticated_at="2026-08-22T01:59:00+00:00", nonce="7" * 64
+    )
+    post_auth = auth_receipt(
+        authenticated_at="2026-08-22T01:59:30+00:00", nonce="9" * 64
+    )
+    receipt = {
+        "actual_cost_usd": "0",
+        "acquired_at": "2026-08-22T02:00:00+00:00",
+        "all_environments": True,
+        "all_resources": True,
+        "authenticated_workspace_scope_sha256": "8" * 64,
+        "auth_binding_sha256": "6" * 64,
+        "pre_auth_receipt_sha256": hashlib.sha256(pre_auth).hexdigest(),
+        "post_auth_receipt_sha256": hashlib.sha256(post_auth).hexdigest(),
+        "authoritative_report_identity_sha256": "1" * 64,
+        "billing_authority_sha256": hashlib.sha256(_ZERO_BILLING_AUTHORITY_BYTES).hexdigest(),
+        "billing_method_sha256": "2" * 64,
+        "completeness_delay_seconds": 3600,
+        "currency": "USD",
+        "failure_code": "auth_before_provider_identity",
+        "filters": [],
+        "kind": "reference_workspace_zero_billing_evidence",
+        "original_execution_scope_sha256": execution_scope,
+        "pagination_complete": True,
+        "provider": "modal",
+        "query_end": "2026-08-22T01:00:00+00:00",
+        "query_start": "2026-08-22T00:00:00+00:00",
+        "recovery_authority_sha256": REFERENCE_RECOVERY_AUTHORITY_SHA256,
+        "report_sha256": hashlib.sha256(report).hexdigest(),
+        "report_size_bytes": len(report),
+        "reservation_id": f"reservation-{suffix}",
+        "row_count": 0,
+        "schema_version": 1,
+    }
+    return (
+        json.dumps(receipt, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode(),
+        report,
+        _ZERO_BILLING_AUTHORITY_BYTES,
+        pre_auth,
+        post_auth,
+    )
+
+
+def _audit_block_preidentity(database: ResultsDatabase, suffix: str) -> None:
+    def bind_billing(raw: dict[str, object]) -> None:
+        provider = raw["provider"]
+        assert isinstance(provider, dict)
+        provider["billing_authority_sha256"] = hashlib.sha256(
+            _ZERO_BILLING_AUTHORITY_BYTES
+        ).hexdigest()
+
+    _reserve(database, suffix=suffix, mutate_config=bind_billing)
+    database.mark_reference_submission_pending(
+        f"reservation-{suffix}",
+        owner_id="owner",
+        standing_authority_sha256=REFERENCE_AUTHORITY_SHA256,
+        bootstrap_authority_sha256=REFERENCE_BOOTSTRAP_AUTHORITY_SHA256,
+        authority_root=_authority_root(database),
+        occurred_at="2026-08-22T00:00:30+00:00",
+    )
+    database.mark_reference_audit_blocked(
+        f"reservation-{suffix}",
+        owner_id="owner",
+        reason="provider boundary uncertainty: AuthError",
+        occurred_at="2026-08-22T00:01:00+00:00",
+    )
+
+
+def _settle_preidentity(database: ResultsDatabase, suffix: str) -> str:
+    receipt, report, authority, pre_auth, post_auth = _preidentity_evidence(suffix)
+    return database.settle_reference_preidentity_zero(
+        receipt,
+        report,
+        pre_auth_receipt_bytes=pre_auth,
+        post_auth_receipt_bytes=post_auth,
+        billing_authority_bytes=authority,
+        authority_root=_authority_root(database),
+        occurred_at="2026-08-22T02:00:00+00:00",
+    )
+
+
+def test_preidentity_zero_settlement_is_atomic_and_preserves_original_slot(
+    tmp_path: Path,
+) -> None:
+    database = ResultsDatabase(tmp_path / "preidentity.sqlite")
+    database.initialize()
+    _audit_block_preidentity(database, "preidentity")
+    original_slot = database.reference_u8_slot(REFERENCE_AUTHORITY_SHA256)
+
+    entitlement_sha256 = _settle_preidentity(database, "preidentity")
+
+    reservation = database.get_reservation("reservation-preidentity")
+    assert reservation["status"] == "settled"
+    assert reservation["settlement_mode"] == "workspace_zero_preidentity"
+    assert reservation["provider_actual_cost_usd"] == "0"
+    assert reservation["provider_job_id"] is None
+    assert reservation["app_identity"] is None
+    assert reservation["failure_reason"] == "provider boundary uncertainty: AuthError"
+    run = database.get_run("run-preidentity")
+    assert run["status"] == "failed"
+    assert run["failure_reason"] == "provider boundary uncertainty: AuthError"
+    assert database.reference_u8_slot(REFERENCE_AUTHORITY_SHA256) == original_slot
+    entitlement = database.reference_replacement_entitlement()
+    assert entitlement is not None
+    assert entitlement["entitlement_sha256"] == entitlement_sha256
+    assert entitlement["state"] == "available"
+    assert database.spend_totals(1)[0] == "0"
+
+
+def test_preidentity_zero_settlement_rejects_sentinel_provider_identity(tmp_path: Path) -> None:
+    database = ResultsDatabase(tmp_path / "preidentity-sentinel.sqlite")
+    database.initialize()
+    _audit_block_preidentity(database, "sentinel")
+    with database.connect() as connection:
+        connection.execute(
+            "UPDATE budget_reservations SET app_identity = 'preidentity-sentinel' "
+            "WHERE reservation_id = 'reservation-sentinel'"
+        )
+    with pytest.raises(DatabaseError, match="sentinel identity"):
+        _settle_preidentity(database, "sentinel")
+    assert database.get_reservation("reservation-sentinel")["status"] == "audit_blocked"
+    assert database.reference_replacement_entitlement() is None
+
+
+def test_preidentity_transaction_revalidates_exact_report_bytes(tmp_path: Path) -> None:
+    database = ResultsDatabase(tmp_path / "preidentity-bytes.sqlite")
+    database.initialize()
+    _audit_block_preidentity(database, "bytes")
+    receipt, report, authority, pre_auth, post_auth = _preidentity_evidence("bytes")
+    value = json.loads(receipt)
+    value["report_size_bytes"] = 99
+    altered_receipt = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+    with pytest.raises(DatabaseError, match="evidence validation"):
+        database.settle_reference_preidentity_zero(
+            altered_receipt,
+            report,
+            pre_auth_receipt_bytes=pre_auth,
+            post_auth_receipt_bytes=post_auth,
+            billing_authority_bytes=authority,
+            authority_root=_authority_root(database),
+            occurred_at="2026-08-22T02:00:00+00:00",
+        )
+    assert database.get_reservation("reservation-bytes")["status"] == "audit_blocked"
+
+
+def test_preidentity_transaction_rejects_billing_authority_drift(tmp_path: Path) -> None:
+    database = ResultsDatabase(tmp_path / "preidentity-authority.sqlite")
+    database.initialize()
+    _audit_block_preidentity(database, "authority")
+    receipt, report, _, pre_auth, post_auth = _preidentity_evidence("authority")
+    with pytest.raises(DatabaseError, match="authority"):
+        database.settle_reference_preidentity_zero(
+            receipt,
+            report,
+            pre_auth_receipt_bytes=pre_auth,
+            post_auth_receipt_bytes=post_auth,
+            billing_authority_bytes=b"{}",
+            authority_root=_authority_root(database),
+            occurred_at="2026-08-22T02:00:00+00:00",
+        )
+    assert database.get_reservation("reservation-authority")["status"] == "audit_blocked"
+
+
+def test_preidentity_settlement_rolls_back_if_entitlement_insert_fails(tmp_path: Path) -> None:
+    database = ResultsDatabase(tmp_path / "preidentity-rollback.sqlite")
+    database.initialize()
+    _audit_block_preidentity(database, "rollback")
+    with database.connect() as connection:
+        connection.execute(
+            """CREATE TRIGGER reject_replacement BEFORE INSERT
+            ON reference_replacement_entitlements
+            BEGIN SELECT RAISE(ABORT, 'test rollback'); END"""
+        )
+    with pytest.raises(sqlite3.IntegrityError, match="test rollback"):
+        _settle_preidentity(database, "rollback")
+    assert database.get_reservation("reservation-rollback")["status"] == "audit_blocked"
+    with database.connect_readonly() as connection:
+        assert connection.execute(
+            "SELECT count(*) FROM reference_preidentity_settlements"
+        ).fetchone()[0] == 0
+    assert database.reference_replacement_entitlement() is None
+
+
+def test_preidentity_settlement_replay_and_race_have_one_winner(tmp_path: Path) -> None:
+    path = tmp_path / "preidentity-race.sqlite"
+    database = ResultsDatabase(path)
+    database.initialize()
+    _audit_block_preidentity(database, "race-zero")
+    def settle(_: int) -> str:
+        try:
+            _settle_preidentity(ResultsDatabase(path), "race-zero")
+        except DatabaseError as exc:
+            return str(exc)
+        return "ok"
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        outcomes = list(executor.map(settle, (1, 2)))
+    assert outcomes.count("ok") == 1
+    assert sum("audit-blocked" in item for item in outcomes) == 1
+    assert database.reference_replacement_entitlement()["state"] == "available"
+
+
+def test_replacement_entitlement_consumes_once_at_final_boundary(tmp_path: Path) -> None:
+    path = tmp_path / "replacement.sqlite"
+    database = ResultsDatabase(path)
+    database.initialize()
+    _audit_block_preidentity(database, "replacement-original")
+    entitlement_sha256 = _settle_preidentity(database, "replacement-original")
+    replacement_auth_receipt_bytes = _preidentity_evidence("replacement-auth")[4]
+    _reserve(
+        database,
+        suffix="replacement-child",
+        replacement_entitlement_sha256=entitlement_sha256,
+        started_at="2026-08-22T02:01:00+00:00",
+        lease_expires_at="2026-08-22T02:10:00+00:00",
+        approval_expires_at="2026-08-22T03:00:00+00:00",
+    )
+    assert database.reference_replacement_entitlement()["state"] == "available"
+    with database.connect_readonly() as connection:
+        assert format(_committed_provider_cost(connection), "f") == "4.00270969"
+
+    def consume(_: int) -> str:
+        try:
+            ResultsDatabase(path).mark_reference_replacement_submission_pending(
+                "reservation-replacement-child",
+                entitlement_sha256=entitlement_sha256,
+                owner_id="owner",
+                recovery_authority_sha256=REFERENCE_RECOVERY_AUTHORITY_SHA256,
+                auth_receipt_bytes=replacement_auth_receipt_bytes,
+                auth_binding_sha256="6" * 64,
+                workspace_scope_sha256="8" * 64,
+                authority_root=_authority_root(database),
+                occurred_at="2026-08-22T02:02:00+00:00",
+            )
+        except DatabaseError as exc:
+            return str(exc)
+        return "ok"
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        outcomes = list(executor.map(consume, (1, 2)))
+    assert outcomes.count("ok") == 1
+    assert sum("not ready" in item for item in outcomes) == 1
+    entitlement = database.reference_replacement_entitlement()
+    assert entitlement["state"] == "consumed"
+    assert entitlement["replacement_reservation_id"] == "reservation-replacement-child"
+    assert database.get_reservation("reservation-replacement-child")["status"] == (
+        "submission_pending"
+    )
+    assert database.reference_u8_slot(REFERENCE_AUTHORITY_SHA256)["state"] == "consumed"
+
+
+def test_replacement_boundary_revalidates_exact_auth_receipt_bytes(tmp_path: Path) -> None:
+    database = ResultsDatabase(tmp_path / "replacement-auth.sqlite")
+    database.initialize()
+    _audit_block_preidentity(database, "replacement-auth-original")
+    entitlement_sha256 = _settle_preidentity(database, "replacement-auth-original")
+    _reserve(
+        database,
+        suffix="replacement-auth-child",
+        replacement_entitlement_sha256=entitlement_sha256,
+        started_at="2026-08-22T02:01:00+00:00",
+        lease_expires_at="2026-08-22T02:10:00+00:00",
+        approval_expires_at="2026-08-22T03:00:00+00:00",
+    )
+    with pytest.raises(DatabaseError, match="auth receipt"):
+        database.mark_reference_replacement_submission_pending(
+            "reservation-replacement-auth-child",
+            entitlement_sha256=entitlement_sha256,
+            owner_id="owner",
+            recovery_authority_sha256=REFERENCE_RECOVERY_AUTHORITY_SHA256,
+            auth_receipt_bytes=b"{}",
+            auth_binding_sha256="6" * 64,
+            workspace_scope_sha256="8" * 64,
+            authority_root=_authority_root(database),
+            occurred_at="2026-08-22T02:02:00+00:00",
+        )
+    assert database.reference_replacement_entitlement()["state"] == "available"
+
+
+def test_v12_to_v13_migration_preserves_rows_and_adds_recovery_tables(tmp_path: Path) -> None:
+    path = tmp_path / "v12.sqlite"
+    database = ResultsDatabase(path)
+    database.initialize()
+    _reserve(database, suffix="v12-preserved")
+    with database.connect() as connection:
+        connection.execute("PRAGMA foreign_keys = OFF")
+        connection.execute("DROP TABLE reference_replacement_entitlements")
+        connection.execute("DROP TABLE reference_preidentity_settlements")
+        connection.execute("DROP INDEX budget_reservations_active_experiment")
+        connection.execute("DROP INDEX budget_reservations_reference_scope")
+        connection.execute("ALTER TABLE budget_reservations RENAME TO budget_reservations_v13")
+        connection.execute(
+            """CREATE TABLE budget_reservations (
+                reservation_id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL UNIQUE REFERENCES experiments(run_id) ON DELETE RESTRICT,
+                experiment_id TEXT NOT NULL,
+                reference_execution_scope_sha256 TEXT
+                    CHECK(reference_execution_scope_sha256 IS NULL
+                          OR length(reference_execution_scope_sha256) = 64),
+                trust_override_sha256 TEXT
+                    CHECK(trust_override_sha256 IS NULL OR length(trust_override_sha256) = 64),
+                phase INTEGER NOT NULL CHECK(phase = 1),
+                status TEXT NOT NULL CHECK(status IN (
+                    'reserved', 'submission_pending', 'submitted', 'settlement_pending',
+                    'settled', 'released', 'failed', 'audit_blocked'
+                )),
+                requested_cost_usd TEXT NOT NULL,
+                provider_actual_cost_usd TEXT,
+                provider_job_id TEXT UNIQUE,
+                app_identity TEXT,
+                provider_image_identity TEXT,
+                billing_authority_sha256 TEXT,
+                authoritative_report_identity_sha256 TEXT,
+                billing_completeness_delay_seconds INTEGER,
+                submitted_at TEXT,
+                settlement_pending_at TEXT,
+                idempotency_key TEXT NOT NULL UNIQUE,
+                settlement_identity TEXT UNIQUE,
+                owner_id TEXT NOT NULL,
+                lease_expires_at TEXT NOT NULL,
+                heartbeat_at TEXT NOT NULL,
+                failure_reason TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                CHECK((status = 'settled' AND provider_actual_cost_usd IS NOT NULL
+                       AND settlement_identity IS NOT NULL) OR status != 'settled'),
+                CHECK((status IN ('submitted', 'settlement_pending', 'settled')
+                       AND provider_job_id IS NOT NULL AND app_identity IS NOT NULL)
+                      OR status NOT IN ('submitted', 'settlement_pending', 'settled')),
+                CHECK(reference_execution_scope_sha256 IS NULL
+                      OR (provider_job_id IS NULL AND submitted_at IS NULL)
+                      OR provider_image_identity IS NOT NULL),
+                CHECK(reference_execution_scope_sha256 IS NULL OR
+                      (billing_authority_sha256 IS NOT NULL
+                       AND authoritative_report_identity_sha256 IS NOT NULL
+                       AND billing_completeness_delay_seconds > 0)),
+                CHECK(reference_execution_scope_sha256 IS NULL
+                      OR status NOT IN ('submitted', 'settlement_pending', 'settled')
+                      OR submitted_at IS NOT NULL),
+                CHECK(reference_execution_scope_sha256 IS NULL
+                      OR status NOT IN ('settlement_pending', 'settled')
+                      OR settlement_pending_at IS NOT NULL)
+            )"""
+        )
+        v12_columns = (
+            "reservation_id, run_id, experiment_id, reference_execution_scope_sha256, "
+            "trust_override_sha256, phase, status, requested_cost_usd, "
+            "provider_actual_cost_usd, provider_job_id, app_identity, "
+            "provider_image_identity, billing_authority_sha256, "
+            "authoritative_report_identity_sha256, billing_completeness_delay_seconds, "
+            "submitted_at, settlement_pending_at, idempotency_key, settlement_identity, "
+            "owner_id, lease_expires_at, heartbeat_at, failure_reason, created_at, updated_at"
+        )
+        connection.execute(
+            f"INSERT INTO budget_reservations ({v12_columns}) "
+            f"SELECT {v12_columns} FROM budget_reservations_v13"
+        )
+        connection.execute("DROP TABLE budget_reservations_v13")
+        connection.execute(
+            """CREATE UNIQUE INDEX budget_reservations_active_experiment
+            ON budget_reservations(experiment_id)
+            WHERE status IN (
+                'reserved', 'submission_pending', 'submitted', 'settlement_pending',
+                'audit_blocked'
+            )"""
+        )
+        connection.execute(
+            """CREATE INDEX budget_reservations_reference_scope
+            ON budget_reservations(reference_execution_scope_sha256, status)"""
+        )
+        connection.execute(
+            """CREATE TRIGGER reference_provider_image_insert
+            BEFORE INSERT ON budget_reservations
+            WHEN NEW.reference_execution_scope_sha256 IS NOT NULL
+             AND (NEW.provider_job_id IS NOT NULL OR NEW.submitted_at IS NOT NULL)
+             AND NEW.provider_image_identity IS NULL
+            BEGIN
+                SELECT RAISE(ABORT, 'reference provider image identity required');
+            END"""
+        )
+        connection.execute(
+            """CREATE TRIGGER reference_provider_image_update
+            BEFORE UPDATE ON budget_reservations
+            WHEN NEW.reference_execution_scope_sha256 IS NOT NULL
+             AND (NEW.provider_job_id IS NOT NULL OR NEW.submitted_at IS NOT NULL)
+             AND NEW.provider_image_identity IS NULL
+            BEGIN
+                SELECT RAISE(ABORT, 'reference provider image identity required');
+            END"""
+        )
+        connection.execute("DELETE FROM schema_info WHERE version = 13")
+        connection.execute(
+            "INSERT INTO schema_info(version, applied_at) VALUES (12, '2026-08-26T00:00:00Z')"
+        )
+    ResultsDatabase(path).initialize()
+    with ResultsDatabase(path).connect_readonly() as connection:
+        assert connection.execute("SELECT max(version) FROM schema_info").fetchone()[0] == 13
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+        assert connection.execute(
+            "SELECT count(*) FROM provider_smoke_reservations"
+        ).fetchone()[0] == 1
+        assert connection.execute(
+            "SELECT count(*) FROM budget_reservations"
+        ).fetchone()[0] == 1
+        tables = {
+            row[0]
+            for row in connection.execute(
+                """SELECT name FROM sqlite_master WHERE type = 'table'
+                AND name IN (
+                    'reference_preidentity_settlements',
+                    'reference_replacement_entitlements'
+                )"""
+            )
+        }
+        columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(budget_reservations)")
+        }
+    assert tables == {
+        "reference_preidentity_settlements",
+        "reference_replacement_entitlements",
+    }
+    assert "settlement_mode" in columns
+
+
+def test_v12_migration_rejects_unknown_schema_before_ddl(tmp_path: Path) -> None:
+    path = tmp_path / "unknown-v12.sqlite"
+    database = ResultsDatabase(path)
+    database.initialize()
+    with database.connect() as connection:
+        connection.execute("DELETE FROM schema_info WHERE version = 13")
+        connection.execute(
+            "INSERT INTO schema_info(version, applied_at) VALUES (12, '2026-08-26T00:00:00Z')"
+        )
+    with pytest.raises(DatabaseError, match="shape is unknown"):
+        ResultsDatabase(path).initialize()
+    with ResultsDatabase(path).connect_readonly() as connection:
+        assert connection.execute("SELECT max(version) FROM schema_info").fetchone()[0] == 12
+        assert "settlement_mode" in {
+            row[1] for row in connection.execute("PRAGMA table_info(budget_reservations)")
+        }

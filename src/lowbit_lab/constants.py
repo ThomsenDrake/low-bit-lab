@@ -49,3 +49,12 @@ REFERENCE_SIGNED_REDIRECT_POLICY = (
     ("us.aws.cdn.hf.co", "/xet-bridge-us/"),
 )
 REFERENCE_IMMUTABLE_ORIGIN_HOSTS = ("huggingface.co",)
+
+# Independently frozen recovery authority. The statement remains ignored and
+# local; tracked code records only its digest and a closed target-neutral shape.
+REFERENCE_RECOVERY_STATEMENT_SHA256 = (
+    "f905a9ba67df04a20ea60d8f56821d2512ea48f6dcc4717ced3d0aecf2e7246e"
+)
+REFERENCE_RECOVERY_AUTHORITY_SHA256 = (
+    "3a4a1c03a682e7726199f6e701396f1b7b00c7237328d281bb611716979c9e68"
+)

@@ -9,6 +9,7 @@ import yaml
 
 import lowbit_lab.reference_orchestrator as orchestrator
 from lowbit_lab.reference_modal_adapter import ReferenceModalCapability
+from lowbit_lab.reference_provider_auth import MODAL_AUTH_OVERRIDE_KEYS, auth_receipt_path
 
 
 def _capability(root: Path) -> ReferenceModalCapability:
@@ -120,7 +121,7 @@ def test_source_artifacts_use_query_free_origins_and_complete_inventory(tmp_path
                 "local_content": {"sha256": f"{index + 1:064x}", "size_bytes": 10 + index},
             }
             for index, name in enumerate(sorted(orchestrator._SOURCE_FILES))
-        ]
+        ],
     }
     identity = json.loads(json.dumps(provenance))
     provenance["manifest_sha256"] = orchestrator._sha(
@@ -134,7 +135,7 @@ def test_source_artifacts_use_query_free_origins_and_complete_inventory(tmp_path
                 "content_sha256": "f" * 64,
                 "size_bytes": 123,
             }
-        ]
+        ],
     }
     (tmp_path / "artifacts").mkdir()
     (tmp_path / "artifacts/provenance.json").write_text(json.dumps(provenance))
@@ -147,7 +148,7 @@ def test_source_artifacts_use_query_free_origins_and_complete_inventory(tmp_path
         authority_files={
             "provenance_manifest_path": "artifacts/provenance.json",
             "weight_inventory_path": "artifacts/inventory.json",
-        }
+        },
     )
 
     artifacts = orchestrator._source_artifacts(tmp_path, config)
@@ -251,7 +252,7 @@ def test_refresh_local_config_reproduces_stale_authority_hashes(
             "source_shard_metadata_path": "artifacts/shards.json",
             "weight_inventory_path": "artifacts/inventory.json",
             "runtime_receipt_path": "artifacts/receipt.json",
-        }
+        },
     )
     provenance = {
         "files": [
@@ -342,9 +343,7 @@ def test_refresh_local_config_rejects_frozen_evaluation_drift(
     inventory = SimpleNamespace(source_revision="1" * 40, index_tensor_bytes=55)
     changed = SimpleNamespace(sha256="2" * 64, context=SimpleNamespace(configured_tokens=262144))
     with pytest.raises(orchestrator.ReferenceOrchestratorError, match="identity drift"):
-        orchestrator._validate_frozen_inputs(
-            frozen, inventory, changed, "f" * 64, "3" * 64
-        )
+        orchestrator._validate_frozen_inputs(frozen, inventory, changed, "f" * 64, "3" * 64)
 
 
 def test_capability_canonicalizes_verified_local_evaluation_lock(tmp_path: Path) -> None:
@@ -384,6 +383,7 @@ def test_capability_canonicalizes_verified_local_evaluation_lock(tmp_path: Path)
     observed: dict[str, object] = {}
 
     with pytest.MonkeyPatch.context() as monkeypatch:
+
         def validate_provider(*_args: object, **kwargs: object) -> dict[str, object]:
             observed.update(kwargs)
             return {"provider_environment": "validated-environment"}
@@ -435,9 +435,7 @@ def test_prepare_writes_only_ignored_request_and_does_not_touch_database(
 def test_paid_request_reproduction_rejects_artifact_drift(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(
-        orchestrator, "build_bootstrap_request", lambda root, config: b"expected"
-    )
+    monkeypatch.setattr(orchestrator, "build_bootstrap_request", lambda root, config: b"expected")
     with pytest.raises(orchestrator.ReferenceOrchestratorError, match="local provenance"):
         orchestrator.validate_reproduced_request(tmp_path, SimpleNamespace(), b"changed")
 
@@ -508,9 +506,7 @@ def test_execute_reserves_once_then_hands_closed_capability_to_adapter(
             calls.append(("reserve", kwargs["requested_cost_usd"]))
 
     monkeypatch.setattr(orchestrator, "_watchdog_ready", lambda: None)
-    monkeypatch.setattr(
-        orchestrator, "prepare", lambda root: (config, request, unreserved)
-    )
+    monkeypatch.setattr(orchestrator, "prepare", lambda root: (config, request, unreserved))
     monkeypatch.setattr(orchestrator, "observe_topology", lambda path: calls.append("topology"))
     monkeypatch.setattr(orchestrator, "ResultsDatabase", FakeDatabase)
     monkeypatch.setattr(orchestrator, "confine_results_db", lambda root, path: root / path)
@@ -523,9 +519,7 @@ def test_execute_reserves_once_then_hands_closed_capability_to_adapter(
         lambda capability: calls.append(("submit", capability)) or {"status": "settlement_pending"},
     )
 
-    result = orchestrator.execute(
-        tmp_path, confirm_request_sha256=orchestrator._sha(request)
-    )
+    result = orchestrator.execute(tmp_path, confirm_request_sha256=orchestrator._sha(request))
 
     assert result == {"status": "settlement_pending"}
     assert calls.count("topology") == 2
@@ -549,3 +543,294 @@ def test_cli_failure_is_sanitized(tmp_path: Path, capsys: pytest.CaptureFixture[
         "ok": False,
         "provider_contacted": False,
     }
+
+
+def _write_auth_fixture(root: Path, profile: str = "private-profile-name") -> None:
+    workspace_scope = orchestrator._sha(profile.encode())
+    config = root / orchestrator.CONFIG_PATH
+    config.parent.mkdir(parents=True, exist_ok=True)
+    config.write_text(
+        "provider:\n  workspace_scope_sha256: '" + workspace_scope + "'\n",
+        encoding="utf-8",
+    )
+    binding = {
+        "kind": "reference_modal_workspace_auth_binding",
+        "workspace_identity_sha256": workspace_scope,
+        "provider": "modal",
+        "schema_version": 1,
+        "workspace_scope_sha256": workspace_scope,
+    }
+    path = root / orchestrator.AUTH_BINDING_PATH
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(orchestrator.canonical_bytes(binding))
+
+
+def _write_billing_authority_fixture(root: Path) -> str:
+    path = root / orchestrator.DEFAULT_BILLING_AUTHORITY
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "attribution_method_sha256": "b" * 64,
+                "authoritative_report_identity_sha256": "e" * 64,
+                "billing_completeness_delay_seconds": 3600,
+            }
+        ),
+        encoding="utf-8",
+    )
+    return orchestrator._sha(path.read_bytes())
+
+
+def test_auth_receipt_never_persists_profile_display_value(tmp_path: Path) -> None:
+    profile = "private-profile-name"
+    _write_auth_fixture(tmp_path, profile)
+
+    def runner(*args: object, **kwargs: object) -> SimpleNamespace:
+        stdout = json.dumps(
+            [{"active": True, "workspace_name": profile}]
+        ).encode()
+        return SimpleNamespace(returncode=0, stdout=stdout, stderr=b"")
+
+    receipt = orchestrator.verify_workspace_auth(tmp_path, runner=runner)
+
+    persisted = (tmp_path / orchestrator.AUTH_RECEIPT_PATH).read_bytes()
+    assert profile.encode() not in persisted
+    assert "profile" not in json.loads(persisted)
+    assert receipt["workspace_scope_sha256"] == orchestrator._sha(profile.encode())
+
+
+def test_workspace_probe_accepts_pinned_modal_shape_and_strips_auth_overrides(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile = "private-profile-name"
+    for key in (
+        "MODAL_TOKEN_ID",
+        "MODAL_TOKEN_SECRET",
+        "MODAL_PROFILE",
+        "MODAL_CONFIG_PATH",
+        "MODAL_ENVIRONMENT",
+    ):
+        monkeypatch.setenv(key, "must-not-be-read")
+
+    def runner(command: list[str], **kwargs: object) -> SimpleNamespace:
+        if "-c" in command:
+            return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+        assert command[1:4] == ["-I", "-B", "-m"]
+        assert command[-4:] == ["modal", "profile", "list", "--json"]
+        environment = kwargs["env"]
+        assert isinstance(environment, dict)
+        assert not any(key in environment for key in MODAL_AUTH_OVERRIDE_KEYS)
+        assert kwargs["shell"] is False
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps([{"active": True, "workspace": profile}]).encode(),
+            stderr=b"",
+        )
+
+    assert orchestrator._current_workspace_digest(runner=runner) == orchestrator._sha(
+        profile.encode()
+    )
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "HTTPS_PROXY",
+        "SSL_CERT_FILE",
+        "PYTHONPATH",
+        "MODAL_SERVER_URL",
+        "MODAL_OVERRIDE_HEADERS",
+        "MODAL_FUTURE_SETTING",
+    ],
+)
+def test_workspace_auth_rejects_transport_or_import_override_before_cli(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, key: str
+) -> None:
+    _write_auth_fixture(tmp_path)
+    monkeypatch.setenv(key, "must-not-be-read")
+    called = False
+
+    def runner(*args: object, **kwargs: object) -> SimpleNamespace:
+        nonlocal called
+        called = True
+        return SimpleNamespace(returncode=0, stdout=b"[]", stderr=b"")
+
+    with pytest.raises(orchestrator.ReferenceOrchestratorError, match="override"):
+        orchestrator.verify_workspace_auth(tmp_path, runner=runner)
+    assert called is False
+    assert not (tmp_path / orchestrator.AUTH_RECEIPT_PATH).exists()
+
+
+def test_workspace_auth_binding_cannot_be_rebound(tmp_path: Path) -> None:
+    config = tmp_path / orchestrator.CONFIG_PATH
+    config.parent.mkdir(parents=True, exist_ok=True)
+    config.write_text(
+        "provider:\n  workspace_scope_sha256: '" + orchestrator._sha(b"first-profile") + "'\n",
+        encoding="utf-8",
+    )
+
+    def runner_for(profile: str) -> object:
+        return lambda *args, **kwargs: SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps([{"active": True, "workspace_name": profile}]).encode(),
+            stderr=b"",
+        )
+
+    orchestrator.bind_workspace_auth(tmp_path, runner=runner_for("first-profile"))
+    with pytest.raises(orchestrator.ReferenceOrchestratorError, match="immutable|mismatch"):
+        orchestrator.bind_workspace_auth(tmp_path, runner=runner_for("second-profile"))
+
+    persisted = (tmp_path / orchestrator.AUTH_BINDING_PATH).read_bytes()
+    assert b"first-profile" not in persisted
+    assert b"second-profile" not in persisted
+
+
+def test_paid_execute_rejects_ambient_modal_auth_override_before_preparation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    events: list[str] = []
+    monkeypatch.setenv("MODAL_PROFILE", "must-not-be-read")
+    monkeypatch.setattr(orchestrator, "_watchdog_ready", lambda: None)
+    monkeypatch.setattr(
+        orchestrator,
+        "prepare",
+        lambda root: events.append("prepared"),
+    )
+    with pytest.raises(orchestrator.ReferenceOrchestratorError, match="override"):
+        orchestrator.execute(tmp_path, confirm_request_sha256="0" * 64, replacement=True)
+    assert events == []
+
+
+@pytest.mark.parametrize("report", [orchestrator.CANONICAL_EMPTY_REPORT + b"\n", b"[ ]", b"{}"])
+def test_billing_capture_rejects_noncanonical_provider_bytes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    report: bytes,
+) -> None:
+    profile = "private-profile-name"
+    _write_auth_fixture(tmp_path, profile)
+    authority_sha256 = _write_billing_authority_fixture(tmp_path)
+    monkeypatch.setattr(orchestrator, "ResultsDatabase", lambda path: object())
+    monkeypatch.setattr(
+        orchestrator,
+        "_original_preidentity_row",
+        lambda database: {
+            "reservation_id": "reservation",
+            "reference_execution_scope_sha256": "c" * 64,
+            "billing_authority_sha256": authority_sha256,
+            "authoritative_report_identity_sha256": "e" * 64,
+            "billing_completeness_delay_seconds": 3600,
+            "consumed_at": "2026-08-26T18:30:00+00:00",
+            "heartbeat_at": "2026-08-26T19:00:00+00:00",
+            "updated_at": "2026-08-26T19:00:00+00:00",
+        },
+    )
+
+    def runner(command: list[str], **kwargs: object) -> SimpleNamespace:
+        stdout = (
+            json.dumps([{"active": True, "workspace_name": profile}]).encode()
+            if "profile" in command
+            else report
+        )
+        return SimpleNamespace(returncode=0, stdout=stdout, stderr=b"")
+
+    with pytest.raises(orchestrator.ReferenceOrchestratorError, match="canonical zero"):
+        orchestrator.capture_workspace_zero_billing(
+            tmp_path,
+            query_start="2026-08-26T18:00:00Z",
+            query_end="2026-08-26T22:00:00Z",
+            runner=runner,
+        )
+
+    assert not (tmp_path / orchestrator.WORKSPACE_ZERO_REPORT_PATH).exists()
+
+
+def test_billing_capture_persists_exact_provider_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    profile = "private-profile-name"
+    _write_auth_fixture(tmp_path, profile)
+    authority_sha256 = _write_billing_authority_fixture(tmp_path)
+    monkeypatch.setattr(orchestrator, "ResultsDatabase", lambda path: object())
+    monkeypatch.setattr(
+        orchestrator,
+        "_original_preidentity_row",
+        lambda database: {
+            "reservation_id": "reservation",
+            "reference_execution_scope_sha256": "c" * 64,
+            "billing_authority_sha256": authority_sha256,
+            "authoritative_report_identity_sha256": "e" * 64,
+            "billing_completeness_delay_seconds": 3600,
+            "consumed_at": "2026-08-26T18:30:00+00:00",
+            "heartbeat_at": "2026-08-26T19:00:00+00:00",
+            "updated_at": "2026-08-26T19:00:00+00:00",
+        },
+    )
+
+    def runner(command: list[str], **kwargs: object) -> SimpleNamespace:
+        stdout = (
+            json.dumps([{"active": True, "workspace_name": profile}]).encode()
+            if "profile" in command
+            else orchestrator.CANONICAL_EMPTY_REPORT
+        )
+        return SimpleNamespace(returncode=0, stdout=stdout, stderr=b"")
+
+    result = orchestrator.capture_workspace_zero_billing(
+        tmp_path,
+        query_start="2026-08-26T18:00:00Z",
+        query_end="2026-08-26T22:00:00Z",
+        runner=runner,
+    )
+
+    assert (
+        tmp_path / orchestrator.WORKSPACE_ZERO_REPORT_PATH
+    ).read_bytes() == orchestrator.CANONICAL_EMPTY_REPORT
+    assert result["provider_contacted"] is False
+    assert result["provider_read_only_contacted"] is True
+    assert (
+        profile.encode() not in (tmp_path / orchestrator.WORKSPACE_ZERO_RECEIPT_PATH).read_bytes()
+    )
+    billing_receipt = json.loads(
+        (tmp_path / orchestrator.WORKSPACE_ZERO_RECEIPT_PATH).read_bytes()
+    )
+    pre = tmp_path / auth_receipt_path(
+        billing_receipt["pre_auth_receipt_sha256"]
+    )
+    post = tmp_path / auth_receipt_path(
+        billing_receipt["post_auth_receipt_sha256"]
+    )
+    assert pre.is_file() and post.is_file() and pre != post
+    assert orchestrator._sha(pre.read_bytes()) == billing_receipt["pre_auth_receipt_sha256"]
+    assert orchestrator._sha(post.read_bytes()) == billing_receipt["post_auth_receipt_sha256"]
+
+
+def test_local_settlement_source_has_no_submission_adapter_import() -> None:
+    import inspect
+
+    source = inspect.getsource(orchestrator.settle_workspace_zero)
+    assert "reference_modal_adapter" not in source
+    assert "submit_reference" not in source
+
+
+def test_recovery_authority_materialization_is_create_once_and_offline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        orchestrator,
+        "build_reference_recovery_authority",
+        lambda: {"kind": "test-recovery-authority", "schema_version": 1},
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "validate_reference_recovery_authority",
+        lambda root: orchestrator.REFERENCE_RECOVERY_AUTHORITY_SHA256,
+    )
+    first = orchestrator.materialize_recovery_authority(tmp_path)
+    second = orchestrator.materialize_recovery_authority(tmp_path)
+    assert first == second == {
+        "recovery_authority_sha256": orchestrator.REFERENCE_RECOVERY_AUTHORITY_SHA256
+    }
+    output = tmp_path / orchestrator.RECOVERY_AUTHORITY_PATH
+    output.write_bytes(output.read_bytes() + b" ")
+    with pytest.raises(orchestrator.ReferenceOrchestratorError, match="immutable"):
+        orchestrator.materialize_recovery_authority(tmp_path)

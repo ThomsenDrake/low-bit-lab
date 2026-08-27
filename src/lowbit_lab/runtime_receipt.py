@@ -3,10 +3,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import os
-import stat as stat_module
 import sys
-import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +13,7 @@ from lowbit_lab.runtime import (
     load_runtime_lock,
     observe_installed_environment,
 )
+from lowbit_lab.safe_files import SafeFileError, atomic_write, confined_output
 
 
 class RuntimeReceiptError(RuntimeError):
@@ -30,63 +28,25 @@ def _confined(root: Path, path: Path, label: str) -> Path:
     return candidate
 
 
-def _confined_output(root: Path, path: Path) -> Path:
-    resolved_root = root.resolve(strict=True)
-    candidate = Path(os.path.abspath(path if path.is_absolute() else resolved_root / path))
-    if not candidate.is_relative_to(resolved_root):
-        raise RuntimeReceiptError("runtime receipt output is outside the repository")
-    current = candidate
-    while current != resolved_root:
-        try:
-            metadata = current.lstat()
-        except FileNotFoundError:
-            pass
-        else:
-            if stat_module.S_ISLNK(metadata.st_mode) or (
-                os.name == "nt"
-                and getattr(metadata, "st_file_attributes", 0)
-                & stat_module.FILE_ATTRIBUTE_REPARSE_POINT
-            ):
-                raise RuntimeReceiptError("runtime receipt output contains a filesystem alias")
-        current = current.parent
-    if not candidate.resolve().is_relative_to(resolved_root):
-        raise RuntimeReceiptError("runtime receipt output is outside the repository")
-    return candidate
-
-
 def generate_runtime_receipt(
     *, root: Path, runtime_lock_path: Path, output_path: Path, replace: bool = False
 ) -> dict[str, Any]:
     root = root.resolve(strict=True)
     lock_path = _confined(root, runtime_lock_path, "runtime lock")
-    output = _confined_output(root, output_path)
+    try:
+        output = confined_output(root, output_path)
+    except SafeFileError as exc:
+        raise RuntimeReceiptError(str(exc).replace("evidence", "runtime receipt")) from exc
     existed_before = output.exists()
     if existed_before and not replace:
         raise RuntimeReceiptError("runtime receipt output already exists")
     lock = load_runtime_lock(lock_path, root=root)
     receipt = observe_installed_environment(root=root, lock=lock)
     content = (json.dumps(receipt, indent=2, sort_keys=True, ensure_ascii=True) + "\n").encode()
-    output.parent.mkdir(parents=True, exist_ok=True)
-    temporary: Path | None = None
     try:
-        with tempfile.NamedTemporaryFile(dir=output.parent, delete=False) as handle:
-            temporary = Path(handle.name)
-            handle.write(content)
-            handle.flush()
-            os.fsync(handle.fileno())
-        _confined_output(root, output)
-        if replace:
-            os.replace(temporary, output)
-        else:
-            try:
-                os.link(temporary, output)
-            except FileExistsError as exc:
-                raise RuntimeReceiptError("runtime receipt output already exists") from exc
-            temporary.unlink()
-        temporary = None
-    finally:
-        if temporary is not None:
-            temporary.unlink(missing_ok=True)
+        atomic_write(root, output, content, replace=replace)
+    except SafeFileError as exc:
+        raise RuntimeReceiptError(str(exc).replace("evidence", "runtime receipt")) from exc
     tree = receipt["package_tree"]
     return {
         "file_count": tree["file_count"],

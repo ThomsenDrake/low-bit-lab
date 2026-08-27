@@ -1,12 +1,17 @@
+import hashlib
 import json
 from pathlib import Path
 
 import pytest
 
+from lowbit_lab.constants import REFERENCE_RECOVERY_AUTHORITY_SHA256
+from lowbit_lab.handoff import canonical_json
 from lowbit_lab.reference_authority import (
     ACTION_CLASSES,
     BOOTSTRAP_AUTHORITY_PATH,
     BOOTSTRAP_STATEMENT_PATH,
+    RECOVERY_AUTHORITY_PATH,
+    RECOVERY_STATEMENT_PATH,
     REFERENCE_AUTHORITY_SHA256,
     REFERENCE_BOOTSTRAP_AUTHORITY_SHA256,
     REFERENCE_SIGNED_CDN_AUTHORITY_SHA256,
@@ -15,8 +20,10 @@ from lowbit_lab.reference_authority import (
     ReferenceAuthorityError,
     authorize_reference_action,
     authorize_reference_bootstrap_action,
+    build_reference_recovery_authority,
     validate_reference_authority,
     validate_reference_bootstrap_authority,
+    validate_reference_recovery_authority,
     validate_reference_signed_cdn_authority,
 )
 
@@ -58,6 +65,19 @@ def _copy_signed_cdn_authority_inputs(root: Path) -> Path:
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination.write_bytes(source.read_bytes())
     return root / SIGNED_CDN_AUTHORITY_PATH
+
+
+def _copy_recovery_authority_inputs(root: Path) -> Path:
+    _copy_signed_cdn_authority_inputs(root)
+    repository = Path(__file__).resolve().parents[1]
+    statement = root / RECOVERY_STATEMENT_PATH
+    statement.parent.mkdir(parents=True, exist_ok=True)
+    statement.write_bytes((repository / RECOVERY_STATEMENT_PATH).read_bytes())
+    authority = root / RECOVERY_AUTHORITY_PATH
+    authority.write_bytes(
+        (canonical_json(build_reference_recovery_authority()) + "\n").encode("utf-8")
+    )
+    return authority
 
 
 def test_exact_authority_accepts_all_closed_action_classes(tmp_path: Path) -> None:
@@ -234,3 +254,70 @@ def test_signed_cdn_authority_drift_fails(
     )
     with pytest.raises(ReferenceAuthorityError, match="signed CDN authority"):
         validate_reference_signed_cdn_authority(tmp_path, authority_path)
+
+
+def test_exact_recovery_authority_is_separate_narrow_and_statement_bound(
+    tmp_path: Path,
+) -> None:
+    authority_path = _copy_recovery_authority_inputs(tmp_path)
+    assert (
+        validate_reference_recovery_authority(tmp_path, authority_path)
+        == REFERENCE_RECOVERY_AUTHORITY_SHA256
+    )
+    authority = json.loads(authority_path.read_text(encoding="utf-8"))
+    assert authority["original_u8_slot_remains_consumed"] is True
+    assert authority["replacement_u8_slots"] == 1
+    assert authority["replacement_retry_slots"] == 0
+    assert authority["action_classes"] == [
+        "zero_spend_phase1",
+        "preidentity_zero_settlement",
+        "u8_reference_replacement_once",
+    ]
+    assert authority["settlement_actual_cost_usd"] == "0"
+    assert authority["configured_context_tokens"] == 262144
+    assert authority["proven_useful_context_tokens"] is None
+
+    statement = tmp_path / RECOVERY_STATEMENT_PATH
+    assert hashlib.sha256(statement.read_bytes()).hexdigest() == authority["statement_sha256"]
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("replacement_u8_slots", 2),
+        ("replacement_retry_slots", 1),
+        ("incremental_u8_cap_usd", "4.01"),
+        ("failure_code", "generic_auth_error"),
+        ("settlement_actual_cost_usd", "0.00"),
+        ("private_data_authorized", True),
+    ),
+)
+def test_recovery_authority_rejects_semantic_or_byte_drift(
+    tmp_path: Path, field: str, value: object
+) -> None:
+    authority_path = _copy_recovery_authority_inputs(tmp_path)
+    authority = json.loads(authority_path.read_text(encoding="utf-8"))
+    authority[field] = value
+    authority_path.write_text(
+        json.dumps(authority, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ReferenceAuthorityError, match="recovery authority"):
+        validate_reference_recovery_authority(tmp_path, authority_path)
+
+
+def test_recovery_authority_requires_unchanged_parent_and_exact_statement(
+    tmp_path: Path,
+) -> None:
+    authority_path = _copy_recovery_authority_inputs(tmp_path)
+    (tmp_path / RECOVERY_STATEMENT_PATH).write_bytes(
+        (tmp_path / RECOVERY_STATEMENT_PATH).read_bytes() + b"\n"
+    )
+    with pytest.raises(ReferenceAuthorityError, match="recovery authority statement"):
+        validate_reference_recovery_authority(tmp_path, authority_path)
+
+    authority_path = _copy_recovery_authority_inputs(tmp_path)
+    parent = tmp_path / SIGNED_CDN_AUTHORITY_PATH
+    parent.write_bytes(parent.read_bytes().replace(b'"max_redirects":5', b'"max_redirects":4'))
+    with pytest.raises(ReferenceAuthorityError, match="signed CDN authority"):
+        validate_reference_recovery_authority(tmp_path, authority_path)

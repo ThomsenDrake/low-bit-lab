@@ -170,3 +170,50 @@ Unknown billing or provider state after any future submission must become `audit
 never release reusable budget. Provider authentication is not broader authority. U9 remains
 proposal-only, and candidate conversion, training, numeric-threshold approval, and promotion remain
 unauthorized.
+
+## Recover an authentication failure before provider identity
+
+Use this path only when the reservation is `audit_blocked` with the exact sanitized AuthError class
+and every provider identity field is absent. Never invent an app, job, image, or call identity.
+
+1. From the isolated WSL environment, verify Modal authentication using the read-only recovery
+   command. Durable evidence contains only a workspace-scope digest, never credential material or a
+   workspace display name.
+2. Capture an explicit unfiltered workspace billing interval composed only of complete UTC hours.
+   It must cover the original consumed boundary through the latest durable boundary plus 2,700
+   seconds and be acquired only after the billing-completeness delay.
+3. Inspect status and settle locally. Settlement must not import the remote adapter. Exact WSL CLI
+   bytes `[]` followed by LF are the only accepted report; incomplete, filtered, mismatched,
+   nonzero, or ambiguous evidence
+   leaves the reservation audit-blocked.
+4. Confirm the original slot remains consumed and exactly one replacement entitlement is available.
+   Regenerate every normal U8 gate from merged main before replacement execution.
+
+The replacement is consumed atomically immediately before provider contact. Every failure after
+that boundary consumes it permanently. There is no second replacement and no retry. Configured
+context remains 262,144 tokens; proven-useful context remains unknown until validated remote
+evaluation evidence demonstrates usefulness.
+
+Run the recovery only from the repository-isolated WSL environment, with proxy, custom-TLS,
+Python-import, and Modal-auth override variables absent. Materialize the ignored authority, bind and
+verify the provider-local workspace, capture complete hourly evidence, then settle locally:
+
+```bash
+uv run --extra remote lowbit-reference-u8 --root . recovery-authority
+uv run --extra remote lowbit-reference-u8 --root . auth-bind
+uv run --extra remote lowbit-reference-u8 --root . auth-verify
+uv run --extra remote lowbit-reference-u8 --root . billing-capture \
+  --query-start <complete-hour-UTC-start> --query-end <complete-hour-UTC-end>
+uv run --extra remote lowbit-reference-u8 --root . settle-preidentity-zero
+uv run --extra remote lowbit-reference-u8 --root . status
+uv run --extra remote lowbit-reference-u8 --root . prepare-replacement
+```
+
+The final command reports a fresh request SHA-256 without reserving or contacting Modal. Only when
+every output is successful and status reports one available replacement may the single paid action
+run, once:
+
+```bash
+uv run --extra remote lowbit-reference-u8 --root . execute-replacement \
+  --confirm-request-sha256 <exact-prepare-replacement-request-sha256>
+```

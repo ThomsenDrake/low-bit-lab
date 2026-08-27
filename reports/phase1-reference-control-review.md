@@ -225,6 +225,38 @@ Independent report-only review found no actionable projection, simplicity, platf
 budget issues. End-to-end timing review found and fixed the stale-topology window; focused tests now
 assert the final observation occurs after preflight and before database initialization.
 
+## 2026-08-27 pre-identity settlement amendment review
+
+- Reproducibility and experiment lineage: exact workspace scope, billing authority and method, UTC
+  interval, report bytes, reservation, execution scope, and failure class are bound. The original
+  consumed authority and failure history remain immutable.
+- Modal-credit safety and failure containment: only exact unfiltered WSL CLI `[]` plus LF evidence settles
+  at USD 0. Settlement and creation of one replacement entitlement are atomic; replacement has no
+  reset or retry path and retains the USD 4.00 incremental ceiling.
+- Local RTX 5080 compatibility: settlement is local SQLite work and changes no CUDA, driver,
+  allocator, or fixed A100-80GB envelope behavior.
+- Security and private-data handling: credentials and workspace display names are excluded; only a
+  workspace-scope digest and ignored exact billing evidence are durable.
+- Research-loop support: reconciliation needs no fabricated provider identity and replacement reruns
+  every deterministic gate. Configured 262,144 context remains distinct from proven usefulness.
+
+This review is rerun after implementation and full verification; the section fixes the acceptance
+boundary and does not claim that provider execution succeeded.
+
+Final report-only review found and fixed three paid-boundary defects before any provider action.
+The v12 migration now accepts only two frozen schema fingerprints (fresh and deployed incremental),
+compares every copied cell, and rejects missing ledgers plus extra or altered schema objects.
+Authentication
+receipts are content-addressed and their exact bytes are revalidated inside the entitlement
+transaction; consumption time cannot precede authentication. Provider commands run under isolated
+Python, ambient proxy/TLS/import overrides and every `MODAL_*` key are rejected without reading
+values. The profile must use the frozen official endpoint with no override headers, and the Modal
+module must resolve inside the pinned distribution before one-shot consumption. Independent
+migration and security re-reviews report no actionable findings. Final local verification passed:
+628 tests passed with 3 explicitly skipped, Ruff passed, diff validation passed, and the publication
+scan found zero issues across 416 sources. Browser testing is not applicable because this change has
+no browser surface or route.
+
 The first post-fix final topology refresh stopped before reservation but erased its own sanitized
 failure class. A follow-up keeps the observer fail-closed while exposing only a frozen transport code
 and numeric artifact ordinal. Raw connection exceptions, URLs, hosts, paths, signed queries, headers,

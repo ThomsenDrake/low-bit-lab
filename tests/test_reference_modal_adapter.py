@@ -134,11 +134,15 @@ def test_fresh_preflight_consumes_flat_validated_provider_environment(
     monkeypatch.setattr(modal_job, "load_reference_job_config", lambda *_a, **_k: config)
     monkeypatch.setattr(modal_job, "plan_reference_bootstrap_preview", lambda *_a, **_k: preview)
     monkeypatch.setattr(orchestrator, "validate_reproduced_request", lambda *_a, **_k: None)
-    monkeypatch.setattr(runtime, "runtime_metadata", lambda _r: {
-        "git_dirty": False,
-        "git_commit": "4" * 40,
-        "control_plane_sha256": "6" * 64,
-    })
+    monkeypatch.setattr(
+        runtime,
+        "runtime_metadata",
+        lambda _r: {
+            "git_dirty": False,
+            "git_commit": "4" * 40,
+            "control_plane_sha256": "6" * 64,
+        },
+    )
     monkeypatch.setattr(adapter, "validate_bootstrap_request_bytes", lambda _b: request)
     monkeypatch.setattr(
         adapter,
@@ -558,6 +562,7 @@ def test_fake_modal_persists_image_then_call_identity_and_uses_one_spawn(
     monkeypatch.setattr(adapter, "validate_bootstrap_request_bytes", lambda value: object())
     monkeypatch.setattr(adapter, "validate_remote_contract_bytes", lambda value: {})
     monkeypatch.setattr(adapter, "build_remote_contract", lambda *args, **kwargs: b"contract")
+    monkeypatch.setattr(adapter, "_validate_modal_sdk_boundary", lambda capability: None)
     monkeypatch.setattr(
         adapter, "_serialized_remote_callable", lambda: (lambda value: {}, b"blob", ())
     )
@@ -765,6 +770,7 @@ def test_watchdog_install_failure_after_boundary_is_audit_blocked(
         ),
     )
     monkeypatch.setattr(adapter, "build_remote_contract", lambda *args, **kwargs: b"contract")
+    monkeypatch.setattr(adapter, "_validate_modal_sdk_boundary", lambda capability: None)
     capability = SimpleNamespace(
         root=tmp_path,
         config_path=Path("config.yaml"),
@@ -835,6 +841,7 @@ def test_audit_block_persistence_failure_is_fatal(
         ),
     )
     monkeypatch.setattr(adapter, "build_remote_contract", lambda *args, **kwargs: b"contract")
+    monkeypatch.setattr(adapter, "_validate_modal_sdk_boundary", lambda capability: None)
     monkeypatch.setitem(sys.modules, "modal", SimpleNamespace())
     capability = adapter.ReferenceModalCapability(
         db_path=tmp_path / "results/local/reference.sqlite",
@@ -859,3 +866,101 @@ def test_audit_block_persistence_failure_is_fatal(
     )
     with pytest.raises(ReferenceModalError, match="could not be durably audit-blocked"):
         adapter.submit_reference(capability)
+
+
+def test_replacement_boundary_consumes_entitlement_instead_of_original_slot(
+    tmp_path: Path,
+) -> None:
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    class FakeDatabase:
+        def mark_reference_submission_pending(self, *args: object, **kwargs: object) -> None:
+            calls.append(("original", kwargs))
+
+        def mark_reference_replacement_submission_pending(
+            self, *args: object, **kwargs: object
+        ) -> None:
+            calls.append(("replacement", kwargs))
+
+    capability = SimpleNamespace(
+        reservation_id="replacement-reservation",
+        owner_id="owner",
+        authority_root=tmp_path,
+        replacement_entitlement_sha256="a" * 64,
+        recovery_authority_sha256=adapter.REFERENCE_RECOVERY_AUTHORITY_SHA256,
+    )
+
+    adapter._mark_submission_pending(FakeDatabase(), capability, "2026-08-27T02:00:00+00:00")
+
+    assert [name for name, _ in calls] == ["replacement"]
+    assert calls[0][1]["entitlement_sha256"] == "a" * 64
+
+
+@pytest.mark.parametrize(
+    "override_key",
+    [
+        "MODAL_TOKEN_ID",
+        "MODAL_SERVER_URL",
+        "MODAL_OVERRIDE_HEADERS",
+        "MODAL_FUTURE_SETTING",
+        "HTTPS_PROXY",
+        "PYTHONPATH",
+    ],
+)
+def test_replacement_boundary_rejects_ambient_modal_override_before_consumption(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, override_key: str
+) -> None:
+    events: list[str] = []
+
+    class FakeDatabase:
+        def __init__(self, path: Path) -> None:
+            pass
+
+        def create_attempt(self, *args: object, **kwargs: object) -> None:
+            events.append("received")
+
+        def get_reservation(self, reservation_id: str) -> dict[str, str]:
+            return {
+                "run_id": "run-one",
+                "owner_id": "owner",
+                "reference_execution_scope_sha256": "scope",
+            }
+
+        def get_run(self, run_id: str) -> dict[str, str]:
+            return {"config_sha256": "config"}
+
+        def link_attempt(self, *args: object, **kwargs: object) -> None:
+            events.append("linked")
+
+        def mark_reference_replacement_submission_pending(
+            self, *args: object, **kwargs: object
+        ) -> None:
+            events.append("pending")
+
+    monkeypatch.setenv(override_key, "must-not-be-read")
+    monkeypatch.setattr(adapter, "ResultsDatabase", FakeDatabase)
+    monkeypatch.setattr(adapter, "_local_deadline_signal", lambda: FakeDeadlineSignal())
+    monkeypatch.setattr(
+        adapter,
+        "validate_reference_preflight",
+        lambda capability: adapter.FreshDeterministicEvidence(
+            provider_environment="low-bit-lab",
+            execution_identity={},
+            config_sha256="config",
+            reference_execution_scope_sha256="scope",
+        ),
+    )
+    monkeypatch.setattr(adapter, "build_remote_contract", lambda *args, **kwargs: b"contract")
+    capability = SimpleNamespace(
+        root=tmp_path,
+        config_path=Path("config.yaml"),
+        reservation_id="reservation",
+        owner_id="owner",
+        authority_root=tmp_path,
+        replacement_entitlement_sha256="a" * 64,
+        replacement_workspace_scope_sha256="8" * 64,
+        replacement_auth_binding_sha256="6" * 64,
+    )
+    with pytest.raises(ReferenceModalError, match="boundary authentication failed"):
+        adapter.submit_reference(capability)
+    assert events == ["received", "linked"]
