@@ -64,7 +64,7 @@ def _authority_root(database: ResultsDatabase) -> Path:
         destination.parent.mkdir(parents=True, exist_ok=True)
         if not destination.exists():
             source = repository / relative_path
-            if relative_path == RECOVERY_AUTHORITY_PATH and not source.exists():
+            if relative_path == RECOVERY_AUTHORITY_PATH:
                 destination.write_text(
                     json.dumps(
                         build_reference_recovery_authority(),
