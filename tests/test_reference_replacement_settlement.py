@@ -54,10 +54,18 @@ def _auth(nonce: str, authenticated_at: str = "2026-08-27T17:00:30+00:00") -> by
     )
 
 
-def _evidence() -> tuple[bytes, bytes, bytes, bytes, bytes]:
+def _evidence(*, billing_only: bool = False) -> tuple[bytes, bytes, bytes, bytes, bytes]:
     app_id = "ap-" + "A" * 22
-    app = canonical_bytes(
+    app_value = (
         {
+            "app_id": app_id,
+            "identity_source": "authoritative_filtered_billing_report",
+            "kind": "reference_replacement_billing_app_identity",
+            "recent_app_listing": "not_returned",
+            "schema_version": 2,
+        }
+        if billing_only
+        else {
             "app_id": app_id,
             "created_at": "2026-08-27T14:28:16+00:00",
             "kind": APP_KIND,
@@ -67,6 +75,7 @@ def _evidence() -> tuple[bytes, bytes, bytes, bytes, bytes]:
             "running_tasks": 0,
         }
     )
+    app = canonical_bytes(app_value)
     report = canonical_bytes(
         {
             "kind": REPORT_KIND,
@@ -148,6 +157,18 @@ def test_complete_replacement_evidence_binds_app_cost_and_bytes() -> None:
     evidence = _validate(_evidence())
     assert evidence.app_id == "ap-" + "A" * 22
     assert evidence.actual_cost_usd == "0.375"
+
+
+def test_billing_only_app_identity_avoids_fabricated_lifecycle_claims() -> None:
+    parts = _evidence(billing_only=True)
+    evidence = _validate(parts)
+    app = json.loads(parts[1])
+    assert evidence.app_id == "ap-" + "A" * 22
+    assert app["recent_app_listing"] == "not_returned"
+    assert "state" not in app
+    assert "running_tasks" not in app
+    assert "created_at" not in app
+    assert "stopped_at" not in app
 
 
 @pytest.mark.parametrize("mutation", ["cost", "app", "window", "early", "lineage"])

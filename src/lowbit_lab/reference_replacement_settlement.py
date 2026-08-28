@@ -18,6 +18,7 @@ from lowbit_lab.reference_settlement import (
 )
 
 APP_KIND = "reference_replacement_stopped_app_evidence"
+BILLING_APP_KIND = "reference_replacement_billing_app_identity"
 REPORT_KIND = "reference_replacement_filtered_billing_report"
 RECEIPT_KIND = "reference_replacement_billing_settlement"
 _APP_ID_RE = re.compile(r"ap-[A-Za-z0-9]{22}")
@@ -29,6 +30,13 @@ _APP_FIELDS = {
     "state",
     "stopped_at",
     "running_tasks",
+}
+_BILLING_APP_FIELDS = {
+    "app_id",
+    "identity_source",
+    "kind",
+    "recent_app_listing",
+    "schema_version",
 }
 _REPORT_FIELDS = {"kind", "rows", "schema_version"}
 _ROW_FIELDS = {"cost", "interval_start", "object_id", "resource"}
@@ -75,12 +83,19 @@ def canonical_bytes(value: object) -> bytes:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()
 
 
-def _closed(content: bytes, fields: set[str], label: str) -> Mapping[str, object]:
+def _canonical_mapping(content: bytes, label: str) -> Mapping[str, object]:
     try:
         value = json.loads(content)
     except (UnicodeError, json.JSONDecodeError) as exc:
         raise ReplacementSettlementError(f"{label} is not valid JSON") from exc
-    if not isinstance(value, Mapping) or set(value) != fields or canonical_bytes(value) != content:
+    if not isinstance(value, Mapping) or canonical_bytes(value) != content:
+        raise ReplacementSettlementError(f"{label} schema or bytes drift")
+    return value
+
+
+def _closed(content: bytes, fields: set[str], label: str) -> Mapping[str, object]:
+    value = _canonical_mapping(content, label)
+    if set(value) != fields:
         raise ReplacementSettlementError(f"{label} schema or bytes drift")
     return value
 
@@ -138,7 +153,13 @@ def validate_replacement_settlement(
     validated_at: datetime,
 ) -> ReplacementSettlementEvidence:
     receipt = _closed(receipt_bytes, _RECEIPT_FIELDS, "replacement receipt")
-    app = _closed(app_evidence_bytes, _APP_FIELDS, "app evidence")
+    app = _canonical_mapping(app_evidence_bytes, "app evidence")
+    billing_only_app = (
+        app.get("schema_version") == 2 and app.get("kind") == BILLING_APP_KIND
+    )
+    expected_app_fields = _BILLING_APP_FIELDS if billing_only_app else _APP_FIELDS
+    if set(app) != expected_app_fields:
+        raise ReplacementSettlementError("app evidence schema or bytes drift")
     report = _closed(filtered_report_bytes, _REPORT_FIELDS, "filtered billing report")
     if (
         type(receipt["schema_version"]) is not int
@@ -147,8 +168,17 @@ def validate_replacement_settlement(
         or receipt["schema_version"] != 1
         or receipt["kind"] != RECEIPT_KIND
         or receipt["provider"] != "modal"
-        or app["schema_version"] != 1
-        or app["kind"] != APP_KIND
+        or (
+            not billing_only_app
+            and (app["schema_version"] != 1 or app["kind"] != APP_KIND)
+        )
+        or (
+            billing_only_app
+            and (
+                app["identity_source"] != "authoritative_filtered_billing_report"
+                or app["recent_app_listing"] != "not_returned"
+            )
+        )
         or report["schema_version"] != 1
         or report["kind"] != REPORT_KIND
     ):
@@ -210,19 +240,20 @@ def validate_replacement_settlement(
     app_id = app["app_id"]
     if not isinstance(app_id, str) or _APP_ID_RE.fullmatch(app_id) is None:
         raise ReplacementSettlementError("app identity is invalid")
-    created = _time(app["created_at"], "app created_at")
-    stopped = _time(app["stopped_at"], "app stopped_at")
-    if (
-        app["state"] != "stopped"
-        or type(app["running_tasks"]) is not int
-        or app["running_tasks"] != 0
-        or created < action_consumed_at
-        or stopped < created
-        or stopped > action_consumed_at + timedelta(seconds=maximum_action_seconds)
-    ):
-        raise ReplacementSettlementError("stopped app evidence is inconsistent")
+    if not billing_only_app:
+        created = _time(app["created_at"], "app created_at")
+        stopped = _time(app["stopped_at"], "app stopped_at")
+        if (
+            app["state"] != "stopped"
+            or type(app["running_tasks"]) is not int
+            or app["running_tasks"] != 0
+            or created < action_consumed_at
+            or stopped < created
+            or stopped > action_consumed_at + timedelta(seconds=maximum_action_seconds)
+        ):
+            raise ReplacementSettlementError("stopped app evidence is inconsistent")
     rows = report["rows"]
-    if not isinstance(rows, list):
+    if not isinstance(rows, list) or (billing_only_app and not rows):
         raise ReplacementSettlementError("filtered billing rows are invalid")
     total = Decimal("0")
     for row in rows:
