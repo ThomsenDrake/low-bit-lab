@@ -951,13 +951,14 @@ def test_replacement_capture_filters_private_workspace_rows(
             "authenticated_workspace_identity_sha256": "2" * 64,
         },
     )
-    monkeypatch.setattr(
-        orchestrator,
-        "load_reference_job_config",
-        lambda path: SimpleNamespace(
+    def load_config(path: Path, *, root: Path) -> SimpleNamespace:
+        assert path == tmp_path / orchestrator.CONFIG_PATH
+        assert root == tmp_path
+        return SimpleNamespace(
             provider={"environment": "low-bit-lab", "environment_scope_sha256": "d" * 64}
-        ),
-    )
+        )
+
+    monkeypatch.setattr(orchestrator, "load_reference_job_config", load_config)
     auth_count = 0
 
     def auth(*args: object, **kwargs: object) -> dict[str, str]:

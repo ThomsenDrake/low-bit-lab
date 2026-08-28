@@ -817,7 +817,7 @@ def capture_replacement_billing(
         or datetime.now(UTC) < end + timedelta(seconds=delay)
     ):
         raise ReferenceOrchestratorError("replacement billing interval is incomplete")
-    config = load_reference_job_config(root / CONFIG_PATH)
+    config = load_reference_job_config(root / CONFIG_PATH, root=root)
     environment = str(config.provider["environment"])
     environment_scope_sha256 = str(config.provider["environment_scope_sha256"])
     try:
