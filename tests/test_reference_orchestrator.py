@@ -396,8 +396,31 @@ def test_capability_canonicalizes_verified_local_evaluation_lock(tmp_path: Path)
 
     with pytest.MonkeyPatch.context() as monkeypatch:
 
-        def validate_provider(*_args: object, **kwargs: object) -> dict[str, object]:
-            observed.update(kwargs)
+        monkeypatch.setattr(
+            orchestrator,
+            "validate_bootstrap_request_bytes",
+            lambda content: SimpleNamespace(canonical_json=content.decode()),
+        )
+
+        def validate_provider(
+            path: Path,
+            *,
+            expected_sha256: str,
+            image_recipe_sha256: str,
+            billing_authority_path: Path,
+            billing_receipt_path: Path,
+            billing_report_path: Path,
+        ) -> dict[str, object]:
+            observed.update(
+                {
+                    "path": path,
+                    "expected_sha256": expected_sha256,
+                    "image_recipe_sha256": image_recipe_sha256,
+                    "billing_authority_path": billing_authority_path,
+                    "billing_receipt_path": billing_receipt_path,
+                    "billing_report_path": billing_report_path,
+                }
+            )
             return {"provider_environment": "validated-environment"}
 
         monkeypatch.setattr(
@@ -410,6 +433,7 @@ def test_capability_canonicalizes_verified_local_evaluation_lock(tmp_path: Path)
     assert capability.evaluation_lock_bytes == orchestrator.canonical_bytes(evaluation)
     assert capability.evaluation_lock_bytes != evaluation_path.read_bytes()
     assert capability.provider_environment == "validated-environment"
+    assert observed["path"] == provider_path
     assert observed["expected_sha256"] == "6" * 64
     assert observed["image_recipe_sha256"] == "5" * 64
 
@@ -602,6 +626,51 @@ def test_cli_failure_is_sanitized(tmp_path: Path, capsys: pytest.CaptureFixture[
         "error": "ReferenceOrchestratorError",
         "ok": False,
         "provider_contacted": False,
+    }
+
+
+@pytest.mark.parametrize("contacted", (False, True))
+def test_replacement_capture_cli_reports_read_only_provider_contact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    contacted: bool,
+) -> None:
+    def capture(
+        root: Path,
+        *,
+        query_start: str,
+        query_end: str,
+        runner: object | None = None,
+    ) -> dict[str, object]:
+        assert callable(runner)
+        if contacted:
+            runner([], check=False)
+        raise orchestrator.ReferenceOrchestratorError("capture failed")
+
+    monkeypatch.setattr(orchestrator, "capture_replacement_billing", capture)
+    monkeypatch.setattr(orchestrator.subprocess, "run", lambda *args, **kwargs: object())
+    assert (
+        orchestrator.main(
+            [
+                "--root",
+                str(tmp_path),
+                "billing-capture-replacement",
+                "--query-start",
+                "2026-08-26T14:00:00Z",
+                "--query-end",
+                "2026-08-26T16:00:00Z",
+            ]
+        )
+        == 1
+    )
+    output = json.loads(capsys.readouterr().err)
+    assert output == {
+        "command": "billing-capture-replacement",
+        "error": "ReferenceOrchestratorError",
+        "ok": False,
+        "provider_contacted": False,
+        "provider_read_only_contacted": contacted,
     }
 
 
@@ -933,6 +1002,24 @@ def test_replacement_capture_filters_private_workspace_rows(
 ) -> None:
     authority_sha256 = _write_billing_authority_fixture(tmp_path)
     app_id = "ap-" + "A" * 22
+    config_sha256 = "7" * 64
+    request_bytes = json.dumps(
+        {
+            "image_lock": {"recipe_sha256": "5" * 64},
+            "provider_capability": {"receipt_sha256": "6" * 64},
+        }
+    ).encode()
+    standing_packet_sha256 = orchestrator.canonical_sha256(
+        {
+            "bootstrap_authority_sha256": orchestrator.REFERENCE_BOOTSTRAP_AUTHORITY_SHA256,
+            "config_sha256": config_sha256,
+            "request_sha256": orchestrator._sha(request_bytes),
+            "signed_cdn_authority_sha256": (
+                orchestrator.REFERENCE_SIGNED_CDN_AUTHORITY_SHA256
+            ),
+            "standing_authority_sha256": orchestrator.REFERENCE_AUTHORITY_SHA256,
+        }
+    )
     monkeypatch.setattr(orchestrator, "ResultsDatabase", lambda path: object())
     monkeypatch.setattr(
         orchestrator,
@@ -949,20 +1036,61 @@ def test_replacement_capture_filters_private_workspace_rows(
             "auth_binding_sha256": "b" * 64,
             "original_workspace_scope_sha256": "1" * 64,
             "authenticated_workspace_identity_sha256": "2" * 64,
+            "standing_packet_sha256": standing_packet_sha256,
         },
     )
+
     def load_config(path: Path, *, root: Path) -> SimpleNamespace:
         assert path == tmp_path / orchestrator.CONFIG_PATH
         assert root == tmp_path
         return SimpleNamespace(
-            provider={"environment": "low-bit-lab", "environment_scope_sha256": "d" * 64}
+            provider={"environment_scope_sha256": "d" * 64}, sha256=config_sha256
         )
 
     monkeypatch.setattr(orchestrator, "load_reference_job_config", load_config)
+    request_path = tmp_path / orchestrator.REQUEST_PATH
+    request_path.parent.mkdir(parents=True, exist_ok=True)
+    request_path.write_bytes(request_bytes)
+    monkeypatch.setattr(
+        orchestrator,
+        "validate_bootstrap_request_bytes",
+        lambda content: SimpleNamespace(canonical_json=content.decode()),
+    )
+    observed_provider: dict[str, object] = {}
+
+    def validate_provider(
+        path: Path,
+        *,
+        expected_sha256: str,
+        image_recipe_sha256: str,
+        billing_authority_path: Path,
+        billing_receipt_path: Path,
+        billing_report_path: Path,
+    ) -> dict[str, object]:
+        observed_provider.update(
+            {
+                "path": path,
+                "expected_sha256": expected_sha256,
+                "image_recipe_sha256": image_recipe_sha256,
+                "billing_authority_path": billing_authority_path,
+                "billing_receipt_path": billing_receipt_path,
+                "billing_report_path": billing_report_path,
+            }
+        )
+        return {"provider_environment": "low-bit-lab"}
+
+    monkeypatch.setattr(
+        orchestrator, "validate_provider_capability_receipt", validate_provider
+    )
     auth_count = 0
 
-    def auth(*args: object, **kwargs: object) -> dict[str, str]:
+    def auth(
+        root: Path, *, runner: object | None = None, write_latest: bool = True
+    ) -> dict[str, str]:
         nonlocal auth_count
+        assert root == tmp_path
+        assert runner is None
+        assert write_latest is False
         auth_count += 1
         return {
             "authenticated_workspace_identity_sha256": "2" * 64,
@@ -971,6 +1099,7 @@ def test_replacement_capture_filters_private_workspace_rows(
         }
 
     monkeypatch.setattr(orchestrator, "verify_workspace_auth", auth)
+    observed_commands: list[list[str]] = []
     app_rows = [
         {
             "app_id": app_id,
@@ -1007,13 +1136,17 @@ def test_replacement_capture_filters_private_workspace_rows(
             "resource": "cpu",
         },
     ]
-    monkeypatch.setattr(
-        orchestrator,
-        "_run_modal_cli",
-        lambda command, runner=None: json.dumps(
-            app_rows if command[0] == "app" else billing_rows
-        ).encode(),
-    )
+    def modal_runner(
+        rows: list[dict[str, object]], apps: list[dict[str, object]] = app_rows
+    ):
+        def run(arguments: list[str], *, runner: object | None = None) -> bytes:
+            assert runner is None
+            observed_commands.append(arguments)
+            return json.dumps(apps if arguments[0] == "app" else rows).encode()
+
+        return run
+
+    monkeypatch.setattr(orchestrator, "_run_modal_cli", modal_runner(billing_rows))
 
     result = orchestrator.capture_replacement_billing(
         tmp_path,
@@ -1022,12 +1155,39 @@ def test_replacement_capture_filters_private_workspace_rows(
     )
 
     assert result["actual_cost_usd"] == "0.01"
+    assert observed_commands == [
+        ["app", "list", "--env", "low-bit-lab", "--json"],
+        [
+            "billing",
+            "report",
+            "--start",
+            "2026-08-26T14:00:00Z",
+            "--end",
+            "2026-08-26T16:00:00Z",
+            "--resolution",
+            "h",
+            "--show-resources",
+            "--json",
+        ],
+    ]
     persisted = (tmp_path / orchestrator.REPLACEMENT_REPORT_PATH).read_bytes()
     app_evidence = json.loads((tmp_path / orchestrator.REPLACEMENT_APP_EVIDENCE_PATH).read_bytes())
     receipt = json.loads((tmp_path / orchestrator.REPLACEMENT_RECEIPT_PATH).read_bytes())
     assert app_evidence["running_tasks"] == 0
     assert "tasks" not in app_evidence
     assert receipt["environment_scope_sha256"] == "d" * 64
+    assert observed_provider["path"] == tmp_path / orchestrator.PROVIDER_CAPABILITY_PATH
+    assert observed_provider["expected_sha256"] == "6" * 64
+    assert observed_provider["image_recipe_sha256"] == "5" * 64
+    assert observed_provider["billing_authority_path"] == (
+        tmp_path / orchestrator.DEFAULT_BILLING_AUTHORITY
+    )
+    assert observed_provider["billing_receipt_path"] == (
+        tmp_path / orchestrator.DEFAULT_BILLING_RECEIPT
+    )
+    assert observed_provider["billing_report_path"] == (
+        tmp_path / orchestrator.DEFAULT_BILLING_REPORT
+    )
     assert b"private-project-name" not in persisted
     assert b"9.99" not in persisted
     assert json.loads(persisted)["rows"] == [
@@ -1039,15 +1199,10 @@ def test_replacement_capture_filters_private_workspace_rows(
         }
     ]
     for field, value in (("cost", 0.01), ("resource", 1), ("resource", "")):
+        observed_commands.clear()
         drifted_rows = [dict(row) for row in billing_rows]
         drifted_rows[0][field] = value
-        monkeypatch.setattr(
-            orchestrator,
-            "_run_modal_cli",
-            lambda command, runner=None, rows=drifted_rows: json.dumps(
-                app_rows if command[0] == "app" else rows
-            ).encode(),
-        )
+        monkeypatch.setattr(orchestrator, "_run_modal_cli", modal_runner(drifted_rows))
         with pytest.raises(orchestrator.ReferenceOrchestratorError, match="type drift"):
             orchestrator.capture_replacement_billing(
                 tmp_path,
@@ -1056,19 +1211,124 @@ def test_replacement_capture_filters_private_workspace_rows(
             )
     ambiguous_rows = [dict(row) for row in billing_rows]
     ambiguous_rows.append({**billing_rows[0], "object_id": "ap-" + "C" * 22})
-    monkeypatch.setattr(
-        orchestrator,
-        "_run_modal_cli",
-        lambda command, runner=None: json.dumps(
-            app_rows if command[0] == "app" else ambiguous_rows
-        ).encode(),
-    )
+    monkeypatch.setattr(orchestrator, "_run_modal_cli", modal_runner(ambiguous_rows))
+    observed_commands.clear()
     with pytest.raises(orchestrator.ReferenceOrchestratorError, match="ambiguous"):
         orchestrator.capture_replacement_billing(
             tmp_path,
             query_start="2026-08-26T14:00:00Z",
             query_end="2026-08-26T16:00:00Z",
         )
+
+    duplicate_apps = [dict(app_rows[0]), {**app_rows[0], "app_id": "ap-" + "D" * 22}]
+    observed_commands.clear()
+    monkeypatch.setattr(
+        orchestrator, "_run_modal_cli", modal_runner(billing_rows, duplicate_apps)
+    )
+    with pytest.raises(
+        orchestrator.ReferenceOrchestratorError, match="unique stopped replacement app"
+    ):
+        orchestrator.capture_replacement_billing(
+            tmp_path,
+            query_start="2026-08-26T14:00:00Z",
+            query_end="2026-08-26T16:00:00Z",
+        )
+    assert observed_commands == [["app", "list", "--env", "low-bit-lab", "--json"]]
+
+
+def test_replacement_capture_rejects_local_lineage_before_provider_contact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_sha256 = "7" * 64
+    request_bytes = json.dumps(
+        {
+            "image_lock": {"recipe_sha256": "5" * 64},
+            "provider_capability": {"receipt_sha256": "6" * 64},
+        }
+    ).encode()
+    request_path = tmp_path / orchestrator.REQUEST_PATH
+    request_path.parent.mkdir(parents=True)
+    request_path.write_bytes(request_bytes)
+    monkeypatch.setattr(orchestrator, "ResultsDatabase", lambda path: object())
+    row = {
+        "billing_completeness_delay_seconds": 3600,
+        "consumed_at": "2026-08-26T14:27:54+00:00",
+        "heartbeat_at": "2026-08-26T14:29:27+00:00",
+        "standing_packet_sha256": "0" * 64,
+    }
+    monkeypatch.setattr(orchestrator, "_replacement_audit_row", lambda database: row)
+    monkeypatch.setattr(
+        orchestrator,
+        "load_reference_job_config",
+        lambda path, *, root: SimpleNamespace(
+            provider={"environment_scope_sha256": "d" * 64}, sha256=config_sha256
+        ),
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "validate_bootstrap_request_bytes",
+        lambda content: SimpleNamespace(canonical_json=content.decode()),
+    )
+    capability_drift = False
+
+    def validate_provider(
+        path: Path,
+        *,
+        expected_sha256: str,
+        image_recipe_sha256: str,
+        billing_authority_path: Path,
+        billing_receipt_path: Path,
+        billing_report_path: Path,
+    ) -> dict[str, object]:
+        if capability_drift:
+            raise ValueError("capability drift")
+        return {"provider_environment": "low-bit-lab"}
+
+    monkeypatch.setattr(
+        orchestrator, "validate_provider_capability_receipt", validate_provider
+    )
+
+    def forbid_auth(
+        root: Path, *, runner: object | None = None, write_latest: bool = True
+    ) -> dict[str, object]:
+        raise AssertionError("workspace authentication must not start")
+
+    def forbid_modal(arguments: list[str], *, runner: object | None = None) -> bytes:
+        raise AssertionError("Modal CLI must not be contacted")
+
+    monkeypatch.setattr(orchestrator, "verify_workspace_auth", forbid_auth)
+    monkeypatch.setattr(orchestrator, "_run_modal_cli", forbid_modal)
+    with pytest.raises(orchestrator.ReferenceOrchestratorError, match="packet lineage drift"):
+        orchestrator.capture_replacement_billing(
+            tmp_path,
+            query_start="2026-08-26T14:00:00Z",
+            query_end="2026-08-26T16:00:00Z",
+        )
+
+    row["standing_packet_sha256"] = orchestrator.canonical_sha256(
+        {
+            "bootstrap_authority_sha256": orchestrator.REFERENCE_BOOTSTRAP_AUTHORITY_SHA256,
+            "config_sha256": config_sha256,
+            "request_sha256": orchestrator._sha(request_bytes),
+            "signed_cdn_authority_sha256": (
+                orchestrator.REFERENCE_SIGNED_CDN_AUTHORITY_SHA256
+            ),
+            "standing_authority_sha256": orchestrator.REFERENCE_AUTHORITY_SHA256,
+        }
+    )
+    capability_drift = True
+    with pytest.raises(ValueError, match="capability drift"):
+        orchestrator.capture_replacement_billing(
+            tmp_path,
+            query_start="2026-08-26T14:00:00Z",
+            query_end="2026-08-26T16:00:00Z",
+        )
+    for path in (
+        orchestrator.REPLACEMENT_APP_EVIDENCE_PATH,
+        orchestrator.REPLACEMENT_REPORT_PATH,
+        orchestrator.REPLACEMENT_RECEIPT_PATH,
+    ):
+        assert not (tmp_path / path).exists()
 
 
 def test_local_settlement_source_has_no_submission_adapter_import() -> None:

@@ -50,6 +50,23 @@ Mocks at this boundary must preserve the production call signature, including ke
 authority arguments. A permissive one-argument mock can hide an integration failure that occurs
 before authentication and all provider reads.
 
+Keep plaintext provider identifiers out of tracked target-neutral configuration. When a read-only
+billing query needs an environment name, resolve it transiently from the ignored provider-capability
+receipt after reproducing that receipt from the canonical bootstrap request's exact capability and
+image-recipe hashes. Continue to persist only the environment-scope digest. Tests must omit the
+nonexistent plaintext config field so this boundary cannot silently regress.
+
+An ignored request cannot be its own historical authority. Before using its capability receipt for
+post-failure provider attribution, recompute the standing packet from the exact request hash,
+canonical config hash, and frozen authority hashes, then compare it with the packet persisted when
+the consumed reservation was created. This reuses pre-submission lineage to reject coordinated
+ignored-evidence drift without retroactively rewriting the experiment config.
+
+Track read-only provider contact separately from paid execution contact. A failed app or billing
+query must still report that the provider read boundary was attempted, while keeping paid execution
+contact false. Lock the exact read-only command sequence and invocation count in tests so an added
+retry, broadened query, or missing environment selector cannot hide behind response-only mocks.
+
 ## Applicability
 
 This pattern resolves accounting after prelaunch provider rejection. It does not prove the function
