@@ -756,7 +756,8 @@ def _replacement_audit_row(database: ResultsDatabase) -> Mapping[str, Any]:
                 br.billing_completeness_delay_seconds, br.heartbeat_at,
                 rre.entitlement_sha256, rre.consumed_at,
                 rps.auth_binding_sha256, rws.original_workspace_scope_sha256,
-                rws.authenticated_workspace_identity_sha256
+                rws.authenticated_workspace_identity_sha256,
+                rac.packet_sha256 AS standing_packet_sha256
             FROM budget_reservations AS br
             JOIN reference_replacement_entitlements AS rre
               ON rre.replacement_reservation_id = br.reservation_id
@@ -764,6 +765,7 @@ def _replacement_audit_row(database: ResultsDatabase) -> Mapping[str, Any]:
               ON rps.settlement_sha256 = rre.settlement_sha256
             JOIN reference_workspace_scope_reconciliations AS rws
               ON rws.authority_sha256 = rre.workspace_reconciliation_authority_sha256
+            JOIN reference_approval_challenges AS rac ON rac.run_id = br.run_id
             WHERE br.status = 'audit_blocked'
               AND br.failure_reason = ?
               AND br.provider_job_id IS NULL AND br.app_identity IS NULL
@@ -784,6 +786,22 @@ def _provider_json(raw: bytes, label: str) -> list[Mapping[str, object]]:
     if not isinstance(value, list) or not all(isinstance(row, Mapping) for row in value):
         raise ReferenceOrchestratorError(f"{label} schema drift")
     return value
+
+
+def _validated_provider_capability(
+    root: Path, request_bytes: bytes
+) -> Mapping[str, object]:
+    """Reproduce provider evidence bound to one canonical bootstrap request."""
+    validated_request = validate_bootstrap_request_bytes(request_bytes)
+    request = json.loads(validated_request.canonical_json)
+    return validate_provider_capability_receipt(
+        root / PROVIDER_CAPABILITY_PATH,
+        expected_sha256=str(request["provider_capability"]["receipt_sha256"]),
+        image_recipe_sha256=str(request["image_lock"]["recipe_sha256"]),
+        billing_authority_path=root / DEFAULT_BILLING_AUTHORITY,
+        billing_receipt_path=root / DEFAULT_BILLING_RECEIPT,
+        billing_report_path=root / DEFAULT_BILLING_REPORT,
+    )
 
 
 def capture_replacement_billing(
@@ -818,7 +836,20 @@ def capture_replacement_billing(
     ):
         raise ReferenceOrchestratorError("replacement billing interval is incomplete")
     config = load_reference_job_config(root / CONFIG_PATH, root=root)
-    environment = str(config.provider["environment"])
+    request_bytes = (root / REQUEST_PATH).read_bytes()
+    provider = _validated_provider_capability(root, request_bytes)
+    expected_packet_sha256 = canonical_sha256(
+        {
+            "bootstrap_authority_sha256": REFERENCE_BOOTSTRAP_AUTHORITY_SHA256,
+            "config_sha256": config.sha256,
+            "request_sha256": _sha(request_bytes),
+            "signed_cdn_authority_sha256": REFERENCE_SIGNED_CDN_AUTHORITY_SHA256,
+            "standing_authority_sha256": REFERENCE_AUTHORITY_SHA256,
+        }
+    )
+    if expected_packet_sha256 != row["standing_packet_sha256"]:
+        raise ReferenceOrchestratorError("replacement request packet lineage drift")
+    environment = str(provider["provider_environment"])
     environment_scope_sha256 = str(config.provider["environment_scope_sha256"])
     try:
         authority = verify_provider_billing_authority(
@@ -1525,16 +1556,7 @@ def _capability(root: Path, config: ReferenceJobConfig, request: bytes) -> Refer
         for item in evaluation["fixtures"]
     }
     image = json.loads((root / IMAGE_LOCK_PATH).read_text(encoding="utf-8"))
-    request_value = json.loads(request)
-    provider_path = root / PROVIDER_CAPABILITY_PATH
-    provider = validate_provider_capability_receipt(
-        provider_path,
-        expected_sha256=str(request_value["provider_capability"]["receipt_sha256"]),
-        image_recipe_sha256=str(request_value["image_lock"]["recipe_sha256"]),
-        billing_authority_path=root / DEFAULT_BILLING_AUTHORITY,
-        billing_receipt_path=root / DEFAULT_BILLING_RECEIPT,
-        billing_report_path=root / DEFAULT_BILLING_REPORT,
-    )
+    provider = _validated_provider_capability(root, request)
     identity = {
         "weight_inventory_sha256": str(config.inputs["weight_inventory_sha256"]),
         "provenance_manifest_sha256": str(config.inputs["provenance_manifest_sha256"]),
@@ -1795,6 +1817,7 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     command = None
+    provider_read_only_contacted = False
     try:
         args = _parser().parse_args(argv)
         command = args.command
@@ -1863,6 +1886,11 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 0
         if command == "billing-capture-replacement":
+            def track_read_only_provider_call(*args: object, **kwargs: object) -> object:
+                nonlocal provider_read_only_contacted
+                provider_read_only_contacted = True
+                return subprocess.run(*args, **kwargs)
+
             emit(
                 {
                     "ok": True,
@@ -1870,6 +1898,7 @@ def main(argv: list[str] | None = None) -> int:
                         args.root,
                         query_start=args.query_start,
                         query_end=args.query_end,
+                        runner=track_read_only_provider_call,
                     ),
                 }
             )
@@ -1902,17 +1931,17 @@ def main(argv: list[str] | None = None) -> int:
         emit({"ok": True, "provider_contacted": True, "result": result})
         return 0
     except Exception as exc:
-        emit(
-            {
-                "command": command,
-                "error": type(exc).__name__,
-                "ok": False,
-                "provider_contacted": (
-                    "unknown" if isinstance(exc, ReferenceProviderStateUnknown) else False
-                ),
-            },
-            stream=sys.stderr,
-        )
+        failure: dict[str, object] = {
+            "command": command,
+            "error": type(exc).__name__,
+            "ok": False,
+            "provider_contacted": (
+                "unknown" if isinstance(exc, ReferenceProviderStateUnknown) else False
+            ),
+        }
+        if command == "billing-capture-replacement":
+            failure["provider_read_only_contacted"] = provider_read_only_contacted
+        emit(failure, stream=sys.stderr)
         return 1
 
 
