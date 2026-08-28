@@ -46,6 +46,10 @@ actual cost, settlement digest, and an exact compare-and-set terminal run transi
 result is still a failed action, not a successful experiment. An over-cap result must be durably
 recorded before raising a budget failure. Neither result restores one-shot authority.
 
+Mocks at this boundary must preserve the production call signature, including keyword-only root or
+authority arguments. A permissive one-argument mock can hide an integration failure that occurs
+before authentication and all provider reads.
+
 ## Applicability
 
 This pattern resolves accounting after prelaunch provider rejection. It does not prove the function
