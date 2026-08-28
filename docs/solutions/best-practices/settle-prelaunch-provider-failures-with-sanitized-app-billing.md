@@ -76,6 +76,13 @@ was the identity source; do not record created, stopped, task-count, or state fi
 matching rows, multiple app IDs, malformed IDs, timestamp type drift, or any report inconsistency
 before persisting evidence. Keep the action terminally failed even after its exact cost is settled.
 
+Provider machine-readable output may intentionally serialize a UTC value without its offset. Bind
+any exception to the pinned client and the exact command boundary: the official Modal billing API
+returns UTC intervals, while its JSON formatter removes UTC `tzinfo` when no timezone override is
+requested. Normalize only the exact offset-free `YYYY-MM-DDTHH:MM:SS` billing form at that boundary,
+persist an explicit `+00:00`, and keep the general timestamp validator strict. Reject dates, missing
+seconds, spaces, non-UTC offsets, malformed strings, and non-string values.
+
 ## Applicability
 
 This pattern resolves accounting after prelaunch provider rejection. It does not prove the function
