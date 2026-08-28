@@ -24,6 +24,34 @@ def _merged_main_gate(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(orchestrator, "_require_merged_clean_main", lambda root: "f" * 40)
 
 
+@pytest.mark.parametrize(
+    "value",
+    ["2026-08-27T14:00:00", "2026-08-27T14:00:00Z", "2026-08-27T14:00:00+00:00"],
+)
+def test_modal_billing_interval_normalizes_exact_utc_forms(value: str) -> None:
+    assert orchestrator._parse_modal_billing_interval(value).isoformat() == (
+        "2026-08-27T14:00:00+00:00"
+    )
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "2026-08-27",
+        "2026-08-27T14:00",
+        "2026-08-27 14:00:00",
+        "2026-08-27 14:00:00+00:00",
+        "2026-08-27T14:00:00+0000",
+        "2026-08-27T14:00:00.000000+00:00",
+        "2026-08-27T10:00:00-04:00",
+        "not-a-time",
+    ],
+)
+def test_modal_billing_interval_rejects_format_or_timezone_drift(value: str) -> None:
+    with pytest.raises(orchestrator.ReferenceOrchestratorError):
+        orchestrator._parse_modal_billing_interval(value)
+
+
 def _capability(root: Path) -> ReferenceModalCapability:
     return ReferenceModalCapability(
         db_path=root / orchestrator.DATABASE_PATH,
@@ -1123,7 +1151,7 @@ def test_replacement_capture_filters_private_workspace_rows(
             "cost": "0.01",
             "description": "low-bit-lab-reference-u8",
             "environment": "low-bit-lab",
-            "interval_start": "2026-08-26T14:00:00+00:00",
+            "interval_start": "2026-08-26T14:00:00",
             "object_id": app_id,
             "resource": "cpu",
         },

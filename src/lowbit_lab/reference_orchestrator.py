@@ -201,6 +201,24 @@ def _utc(value: str, label: str) -> datetime:
     return parsed.astimezone(UTC)
 
 
+def _parse_modal_billing_interval(value: str) -> datetime:
+    """Parse Modal billing time, treating only exact offset-free seconds as UTC."""
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ReferenceOrchestratorError("billing interval is invalid") from exc
+    if parsed.tzinfo is None:
+        if len(value) != 19 or parsed.isoformat(timespec="seconds") != value:
+            raise ReferenceOrchestratorError("billing interval format drift")
+        return parsed.replace(tzinfo=UTC)
+    if parsed.utcoffset() != timedelta(0):
+        raise ReferenceOrchestratorError("billing interval must be UTC")
+    explicit_utc = parsed.isoformat(timespec="seconds")
+    if value not in {explicit_utc, explicit_utc.removesuffix("+00:00") + "Z"}:
+        raise ReferenceOrchestratorError("billing interval format drift")
+    return parsed.astimezone(UTC)
+
+
 def _root_json(root: Path, relative: Path, label: str) -> Mapping[str, Any]:
     if relative.is_absolute() or ".." in relative.parts:
         raise ReferenceOrchestratorError(f"{label} path is invalid")
@@ -946,7 +964,7 @@ def capture_replacement_billing(
             raise ReferenceOrchestratorError("replacement billing cost is invalid") from exc
         if not cost.is_finite() or cost < 0 or cost.as_tuple().exponent < -10:
             raise ReferenceOrchestratorError("replacement billing cost is invalid")
-        interval = _utc(str(item["interval_start"]), "billing interval")
+        interval = _parse_modal_billing_interval(item["interval_start"])
         if interval < start or interval >= end:
             raise ReferenceOrchestratorError("replacement billing interval drift")
         if app is not None and item["object_id"] != app["app_id"]:
