@@ -91,6 +91,9 @@ from lowbit_lab.reference_replacement_settlement import (
     APP_KIND as REPLACEMENT_APP_KIND,
 )
 from lowbit_lab.reference_replacement_settlement import (
+    BILLING_APP_KIND as REPLACEMENT_BILLING_APP_KIND,
+)
+from lowbit_lab.reference_replacement_settlement import (
     RECEIPT_KIND as REPLACEMENT_SETTLEMENT_KIND,
 )
 from lowbit_lab.reference_replacement_settlement import (
@@ -112,6 +115,7 @@ from lowbit_lab.runtime import (
 )
 from lowbit_lab.safe_files import SafeFileError, atomic_write
 
+_MODAL_APP_ID_RE = re.compile(r"ap-[A-Za-z0-9]{22}")
 CONFIG_PATH = Path("configs/local/reference.yaml")
 REQUEST_PATH = Path("reports/local/u8-bootstrap-request.json")
 IMAGE_LOCK_PATH = Path("configs/local/reference-image-lock.json")
@@ -870,26 +874,39 @@ def capture_replacement_billing(
         ["app", "list", "--env", environment, "--json"], runner=runner
     )
     app_rows = _provider_json(app_raw, "provider app list")
+    target_app_rows = [
+        item for item in app_rows if item.get("description") == REFERENCE_APP_NAME
+    ]
     candidates = [
         item
-        for item in app_rows
+        for item in target_app_rows
         if set(item) == {"app_id", "created_at", "description", "state", "stopped_at", "tasks"}
-        and item["description"] == REFERENCE_APP_NAME
         and item["state"] == "stopped"
         and item["tasks"] == "0"
         and consumed
         <= _utc(str(item["created_at"]), "app created_at")
         <= consumed + timedelta(seconds=int(REFERENCE_RESOURCES["timeout_seconds"]))
     ]
-    if len(candidates) != 1:
+    if len(candidates) > 1:
         raise ReferenceOrchestratorError("unique stopped replacement app is unavailable")
-    app = candidates[0]
-    created = _utc(str(app["created_at"]), "app created_at")
-    stopped = _utc(str(app["stopped_at"]), "app stopped_at")
-    if stopped < created or stopped > consumed + timedelta(
-        seconds=int(REFERENCE_RESOURCES["timeout_seconds"])
-    ):
-        raise ReferenceOrchestratorError("replacement app timing drift")
+    app = None if not candidates else candidates[0]
+    if app is not None:
+        created = _utc(str(app["created_at"]), "app created_at")
+        stopped = _utc(str(app["stopped_at"]), "app stopped_at")
+        if stopped < created or stopped > consumed + timedelta(
+            seconds=int(REFERENCE_RESOURCES["timeout_seconds"])
+        ):
+            raise ReferenceOrchestratorError("replacement app timing drift")
+        app_id = str(app["app_id"])
+        app_value = {
+            "app_id": app_id,
+            "created_at": created.isoformat(),
+            "kind": REPLACEMENT_APP_KIND,
+            "schema_version": 1,
+            "state": "stopped",
+            "stopped_at": stopped.isoformat(),
+            "running_tasks": 0,
+        }
     billing_raw = _run_modal_cli(
         [
             "billing",
@@ -909,21 +926,16 @@ def capture_replacement_billing(
     filtered: list[dict[str, object]] = []
     total = Decimal("0")
     for item in billing_rows:
-        if (
-            item.get("description") == REFERENCE_APP_NAME
-            and item.get("object_id") != app["app_id"]
-        ):
-            raise ReferenceOrchestratorError("replacement billing app identity is ambiguous")
-        if item.get("object_id") != app["app_id"]:
+        if item.get("description") != REFERENCE_APP_NAME:
             continue
-        if set(item) != REPORT_FIELDS or (
-            item["description"] != REFERENCE_APP_NAME
-            or item["environment"] != environment
-        ):
+        if set(item) != REPORT_FIELDS or item["environment"] != environment:
             raise ReferenceOrchestratorError("replacement billing attribution drift")
         if (
             type(item["cost"]) is not str
             or not item["cost"]
+            or type(item["interval_start"]) is not str
+            or type(item["object_id"]) is not str
+            or _MODAL_APP_ID_RE.fullmatch(item["object_id"]) is None
             or type(item["resource"]) is not str
             or not item["resource"]
         ):
@@ -937,15 +949,33 @@ def capture_replacement_billing(
         interval = _utc(str(item["interval_start"]), "billing interval")
         if interval < start or interval >= end:
             raise ReferenceOrchestratorError("replacement billing interval drift")
+        if app is not None and item["object_id"] != app["app_id"]:
+            raise ReferenceOrchestratorError("replacement billing app identity is ambiguous")
         total += cost
         filtered.append(
             {
                 "cost": item["cost"],
                 "interval_start": interval.isoformat(),
-                "object_id": app["app_id"],
+                "object_id": item["object_id"],
                 "resource": item["resource"],
             }
         )
+    if app is None:
+        billing_app_ids = {item["object_id"] for item in filtered}
+        if len(billing_app_ids) != 1:
+            raise ReferenceOrchestratorError(
+                "unique replacement billing app identity is unavailable"
+            )
+        app_id = next(iter(billing_app_ids))
+        if any(item.get("app_id") == app_id for item in target_app_rows):
+            raise ReferenceOrchestratorError("listed replacement app is ineligible")
+        app_value = {
+            "app_id": app_id,
+            "identity_source": "authoritative_filtered_billing_report",
+            "kind": REPLACEMENT_BILLING_APP_KIND,
+            "recent_app_listing": "not_returned",
+            "schema_version": 2,
+        }
     post_auth = verify_workspace_auth(root, runner=runner, write_latest=False)
     if (
         pre_auth["authenticated_workspace_identity_sha256"]
@@ -956,17 +986,7 @@ def capture_replacement_billing(
         or post_auth["binding_sha256"] != row["auth_binding_sha256"]
     ):
         raise ReferenceOrchestratorError("Modal workspace changed during replacement capture")
-    app_evidence = canonical_bytes(
-        {
-            "app_id": app["app_id"],
-            "created_at": created.isoformat(),
-            "kind": REPLACEMENT_APP_KIND,
-            "schema_version": 1,
-            "state": "stopped",
-            "stopped_at": stopped.isoformat(),
-            "running_tasks": 0,
-        }
-    )
+    app_evidence = canonical_bytes(app_value)
     report = canonical_bytes(
         {"kind": REPLACEMENT_REPORT_KIND, "rows": filtered, "schema_version": 1}
     )
@@ -1009,7 +1029,7 @@ def capture_replacement_billing(
         _write_atomic(root, path, content)
     return {
         "actual_cost_usd": str(total),
-        "app_identity_sha256": _sha(str(app["app_id"]).encode()),
+        "app_identity_sha256": _sha(app_id.encode()),
         "provider_read_only_contacted": True,
         "receipt_sha256": _sha(receipt),
     }

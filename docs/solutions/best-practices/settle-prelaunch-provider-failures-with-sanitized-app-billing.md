@@ -67,6 +67,15 @@ query must still report that the provider read boundary was attempted, while kee
 contact false. Lock the exact read-only command sequence and invocation count in tests so an added
 retry, broadened query, or missing environment selector cannot hide behind response-only mocks.
 
+Provider lifecycle listings and billing reports can have different retention windows. When the
+recent-app listing no longer returns an eligible app, use a separate closed evidence variant rather
+than populating lifecycle fields from assumptions. The fallback may bind identity only when the
+complete authoritative billing report contains at least one matching row and exactly one valid app
+ID across all matching rows. Record that the recent listing did not return the app and that billing
+was the identity source; do not record created, stopped, task-count, or state fields. Reject empty
+matching rows, multiple app IDs, malformed IDs, timestamp type drift, or any report inconsistency
+before persisting evidence. Keep the action terminally failed even after its exact cost is settled.
+
 ## Applicability
 
 This pattern resolves accounting after prelaunch provider rejection. It does not prove the function

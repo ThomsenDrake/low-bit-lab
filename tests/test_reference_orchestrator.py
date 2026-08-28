@@ -1170,6 +1170,7 @@ def test_replacement_capture_filters_private_workspace_rows(
             "--json",
         ],
     ]
+
     persisted = (tmp_path / orchestrator.REPLACEMENT_REPORT_PATH).read_bytes()
     app_evidence = json.loads((tmp_path / orchestrator.REPLACEMENT_APP_EVIDENCE_PATH).read_bytes())
     receipt = json.loads((tmp_path / orchestrator.REPLACEMENT_RECEIPT_PATH).read_bytes())
@@ -1198,7 +1199,14 @@ def test_replacement_capture_filters_private_workspace_rows(
             "resource": "cpu",
         }
     ]
-    for field, value in (("cost", 0.01), ("resource", 1), ("resource", "")):
+    for field, value in (
+        ("cost", 0.01),
+        ("interval_start", 1),
+        ("object_id", 1),
+        ("object_id", "invalid"),
+        ("resource", 1),
+        ("resource", ""),
+    ):
         observed_commands.clear()
         drifted_rows = [dict(row) for row in billing_rows]
         drifted_rows[0][field] = value
@@ -1234,6 +1242,76 @@ def test_replacement_capture_filters_private_workspace_rows(
             query_end="2026-08-26T16:00:00Z",
         )
     assert observed_commands == [["app", "list", "--env", "low-bit-lab", "--json"]]
+
+    observed_commands.clear()
+    monkeypatch.setattr(orchestrator, "_run_modal_cli", modal_runner(billing_rows, []))
+    billing_only = orchestrator.capture_replacement_billing(
+        tmp_path,
+        query_start="2026-08-26T14:00:00Z",
+        query_end="2026-08-26T16:00:00Z",
+    )
+    app_evidence = json.loads(
+        (tmp_path / orchestrator.REPLACEMENT_APP_EVIDENCE_PATH).read_bytes()
+    )
+    assert billing_only["actual_cost_usd"] == "0.01"
+    assert app_evidence == {
+        "app_id": app_id,
+        "identity_source": "authoritative_filtered_billing_report",
+        "kind": "reference_replacement_billing_app_identity",
+        "recent_app_listing": "not_returned",
+        "schema_version": 2,
+    }
+    assert observed_commands == [
+        ["app", "list", "--env", "low-bit-lab", "--json"],
+        [
+            "billing",
+            "report",
+            "--start",
+            "2026-08-26T14:00:00Z",
+            "--end",
+            "2026-08-26T16:00:00Z",
+            "--resolution",
+            "h",
+            "--show-resources",
+            "--json",
+        ],
+    ]
+
+    for rows in (
+        [],
+        [billing_rows[0], {**billing_rows[0], "object_id": "ap-" + "C" * 22}],
+    ):
+        monkeypatch.setattr(orchestrator, "_run_modal_cli", modal_runner(rows, []))
+        with pytest.raises(
+            orchestrator.ReferenceOrchestratorError,
+            match="unique replacement billing app identity is unavailable",
+        ):
+            orchestrator.capture_replacement_billing(
+                tmp_path,
+                query_start="2026-08-26T14:00:00Z",
+                query_end="2026-08-26T16:00:00Z",
+            )
+
+    for field, value in (
+        ("state", "running"),
+        ("tasks", "1"),
+        ("created_at", "2026-08-26T13:00:00+00:00"),
+    ):
+        ineligible_app = {**app_rows[0], field: value}
+        monkeypatch.setattr(
+            orchestrator,
+            "_run_modal_cli",
+            modal_runner(billing_rows, [ineligible_app]),
+        )
+        with pytest.raises(
+            orchestrator.ReferenceOrchestratorError,
+            match="listed replacement app is ineligible",
+        ):
+            orchestrator.capture_replacement_billing(
+                tmp_path,
+                query_start="2026-08-26T14:00:00Z",
+                query_end="2026-08-26T16:00:00Z",
+            )
 
 
 def test_replacement_capture_rejects_local_lineage_before_provider_contact(
