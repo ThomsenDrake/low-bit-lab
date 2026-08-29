@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
+import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -1154,10 +1157,37 @@ def test_workspace_probe_is_credential_opaque_and_uses_pinned_client_rpc() -> No
     assert "_Client.from_env()" in script
     assert "client.server_url==DEFAULT_SERVER_URL" in script
     assert "WorkspaceNameLookup(Empty(),retry=None,timeout=3)" in script
-    assert "from modal_proto.api_pb2 import Empty" in script
+    assert "from google.protobuf.empty_pb2 import Empty" in script
+    assert "from modal_proto.api_pb2 import Empty" not in script
     assert "_lookup_workspace" not in script
     assert "token_id" not in script
     assert "token_secret" not in script
+
+
+def test_pinned_modal_workspace_lookup_accepts_protobuf_empty_in_isolation() -> None:
+    if importlib.util.find_spec("modal_proto") is None:
+        pytest.skip("remote extra is not installed")
+
+    script = (
+        "import modal_proto.api_grpc as api_grpc\n"
+        "from google.protobuf.empty_pb2 import Empty\n"
+        "seen=[]\n"
+        "api_grpc.grpclib.client.UnaryUnaryMethod=lambda channel,path,request_type,"
+        "response_type:(seen.append((path,request_type)) or object())\n"
+        "api_grpc.ModalClientStub(object())\n"
+        "matches=[request_type for path,request_type in seen "
+        "if path.endswith('/WorkspaceNameLookup')]\n"
+        "assert matches == [Empty]\n"
+    )
+    completed = subprocess.run(
+        [sys.executable, "-I", "-B", "-c", script],
+        check=False,
+        capture_output=True,
+        shell=False,
+        timeout=30,
+    )
+
+    assert completed.returncode == 0, completed.stderr.decode("utf-8", errors="replace")
 
 
 @pytest.mark.parametrize(

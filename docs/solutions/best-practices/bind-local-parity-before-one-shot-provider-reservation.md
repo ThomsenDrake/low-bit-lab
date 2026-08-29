@@ -30,6 +30,10 @@ again inside the sole provider adapter. A deterministic failure may release only
 action; after the durable provider-boundary transition, uncertainty remains audit-blocked and the
 grant is never restored.
 
+For provider-local probe scripts, syntax compilation is not dependency validation. Execute the exact
+isolated script against the pinned provider environment before the paid boundary so a moved protobuf
+type or private SDK symbol fails while the grant is still available.
+
 A normal submitted provider action may have both an app identity and a call identity. Preserve both
 in the ledger, then attribute billing only when all matching rows name exactly one of those durable
 identities. Prefer neither identity by assumption: select the one the authoritative rows prove and
