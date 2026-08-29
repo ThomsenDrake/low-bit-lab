@@ -44,6 +44,10 @@ def _prepared_graph() -> adapter.PreparedModalGraph:
     )
 
 
+def _assume_request_authority_match(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(adapter, "_validate_request_authority_generation", lambda _cap: None)
+
+
 def test_remote_contract_rejects_unbound_or_noncanonical_input() -> None:
     with pytest.raises(ReferenceModalError, match="schema drift"):
         adapter.validate_remote_contract_bytes(b"{}")
@@ -58,8 +62,19 @@ def test_evaluation_lock_transport_canonicalizes_persisted_json() -> None:
         adapter._canonical_evaluation_lock_bytes(b"not-json")
 
 
-def test_fresh_preflight_consumes_flat_validated_provider_environment(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    ("action", "expected_additional", "expected_preview"),
+    (
+        ("u8_reference_once", False, "original"),
+        ("u8_reference_additional_once", True, "additional"),
+    ),
+)
+def test_fresh_preflight_consumes_validated_action_and_provider_environment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    action: str,
+    expected_additional: bool,
+    expected_preview: str,
 ) -> None:
     import lowbit_lab.modal_job as modal_job
     import lowbit_lab.reference_authority as reference_authority
@@ -90,6 +105,7 @@ def test_fresh_preflight_consumes_flat_validated_provider_environment(
         "resource_spec_sha256": adapter._sha(adapter._canonical_json(resources)),
     }
     request_raw = {
+        "action": action,
         "lineage": {
             "reviewed_commit": "4" * 40,
             "control_plane_sha256": "6" * 64,
@@ -144,13 +160,27 @@ def test_fresh_preflight_consumes_flat_validated_provider_environment(
         "proven_useful_context_tokens": None,
         "empirical": {"memory": "pending", "timing": "pending"},
     }
+    calls: list[tuple[str, object]] = []
     monkeypatch.setattr(
         reference_authority, "validate_reference_signed_cdn_authority", lambda _r: None
     )
     monkeypatch.setattr(adapter, "validate_topology_evidence", lambda *_a, **_k: None)
     monkeypatch.setattr(modal_job, "load_reference_job_config", lambda *_a, **_k: config)
-    monkeypatch.setattr(modal_job, "plan_reference_bootstrap_preview", lambda *_a, **_k: preview)
-    monkeypatch.setattr(orchestrator, "validate_reproduced_request", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        modal_job,
+        "plan_reference_bootstrap_preview",
+        lambda *_a, **_k: calls.append(("preview", "original")) or preview,
+    )
+    monkeypatch.setattr(
+        modal_job,
+        "plan_reference_additional_preview",
+        lambda *_a, **_k: calls.append(("preview", "additional")) or preview,
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "validate_reproduced_request",
+        lambda *_a, **kwargs: calls.append(("reproduce", kwargs["additional"])),
+    )
     monkeypatch.setattr(
         runtime,
         "runtime_metadata",
@@ -174,6 +204,7 @@ def test_fresh_preflight_consumes_flat_validated_provider_environment(
     evidence = adapter.validate_reference_preflight(capability)
 
     assert evidence.provider_environment == "validated-environment"
+    assert calls == [("reproduce", expected_additional), ("preview", expected_preview)]
 
 
 def test_remote_result_binds_manifest_bytes_to_the_validated_receipt(
@@ -697,7 +728,13 @@ def test_fake_modal_persists_image_then_call_identity_and_uses_one_spawn(
             reference_execution_scope_sha256="scope",
         ),
     )
-    monkeypatch.setattr(adapter, "validate_bootstrap_request_bytes", lambda value: object())
+    monkeypatch.setattr(
+        adapter,
+        "validate_bootstrap_request_bytes",
+        lambda _value: SimpleNamespace(
+            canonical_json=json.dumps({"action": "u8_reference_once"})
+        ),
+    )
     monkeypatch.setattr(adapter, "validate_remote_contract_bytes", lambda value: {})
     monkeypatch.setattr(adapter, "build_remote_contract", lambda *args, **kwargs: b"contract")
     monkeypatch.setattr(adapter, "_validate_modal_sdk_boundary", lambda capability: None)
@@ -821,6 +858,7 @@ def test_missing_reservation_is_recorded_as_a_failed_preflight(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     events: list[str] = []
+    _assume_request_authority_match(monkeypatch)
 
     class FakeDatabase:
         def __init__(self, path: Path) -> None:
@@ -864,6 +902,7 @@ def test_watchdog_install_failure_after_boundary_is_audit_blocked(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, watchdog_failure: str
 ) -> None:
     events: list[str] = []
+    _assume_request_authority_match(monkeypatch)
 
     class FakeDatabase:
         def __init__(self, path: Path) -> None:
@@ -947,6 +986,8 @@ def test_serialization_failure_clears_every_registered_module(
 def test_audit_block_persistence_failure_is_fatal(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    _assume_request_authority_match(monkeypatch)
+
     class FakeDatabase:
         def __init__(self, path: Path) -> None:
             pass
@@ -1103,6 +1144,7 @@ def test_additional_sdk_identity_drift_releases_before_paid_boundary(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     events: list[str] = []
+    _assume_request_authority_match(monkeypatch)
 
     class FakeDatabase:
         def __init__(self, path: Path) -> None:
@@ -1214,6 +1256,79 @@ def test_authority_generation_rejects_hybrid_and_partial_shapes(
         adapter._validate_authority_generation_shape(SimpleNamespace(**values))
 
 
+@pytest.mark.parametrize(
+    ("action", "additional_generation", "expected_events"),
+    (
+        ("u8_reference_once", True, ["attempt", "released", "failed"]),
+        ("u8_reference_additional_once", False, ["attempt", "failed"]),
+    ),
+)
+def test_submission_rejects_request_authority_generation_mismatch_before_consumption(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    action: str,
+    additional_generation: bool,
+    expected_events: list[str],
+) -> None:
+    events: list[str] = []
+
+    class FakeDatabase:
+        def __init__(self, path: Path) -> None:
+            pass
+
+        def create_attempt(self, **kwargs: object) -> None:
+            events.append("attempt")
+
+        def release_reference_additional_reservation(self, *args: object, **kwargs: object) -> None:
+            events.append("released")
+
+        def fail_attempt(self, *args: object, **kwargs: object) -> None:
+            events.append("failed")
+
+    monkeypatch.setattr(adapter, "ResultsDatabase", FakeDatabase)
+    monkeypatch.setattr(
+        adapter,
+        "validate_bootstrap_request_bytes",
+        lambda _value: SimpleNamespace(canonical_json=json.dumps({"action": action})),
+    )
+    additional = {
+        "additional_authority_sha256": "1" * 64,
+        "additional_authenticated_workspace_identity_sha256": "2" * 64,
+        "additional_wsl_parity_receipt_sha256": "3" * 64,
+    }
+    capability = adapter.ReferenceModalCapability(
+        db_path=tmp_path / "results/local/reference.sqlite",
+        root=tmp_path,
+        config_path=Path("configs/local/reference.yaml"),
+        request_path=Path("reports/local/request.json"),
+        image_lock_path=Path("configs/modal/image.json"),
+        provider_capability_path=Path("reports/local/provider.json"),
+        billing_authority_path=Path("reports/local/billing-authority.json"),
+        billing_receipt_path=Path("reports/local/billing-receipt.json"),
+        billing_report_path=Path("reports/local/billing-report.json"),
+        publication_manifest_path=Path("reports/local/publication.json"),
+        reservation_id="reservation",
+        owner_id="owner",
+        authority_root=tmp_path,
+        provider_environment="low-bit-lab",
+        bootstrap_request_bytes=b"request",
+        evaluation_lock_bytes=b"lock",
+        fixture_bytes={},
+        execution_identity={},
+        image_lock={},
+        **(additional if additional_generation else {}),
+    )
+
+    with pytest.raises(
+        ReferenceModalError, match="deterministic remote contract gate failed"
+    ) as exc:
+        adapter.submit_reference(capability, _prepared_graph())
+
+    assert isinstance(exc.value.__cause__, ReferenceModalError)
+    assert str(exc.value.__cause__) == "request authority generation mismatch"
+    assert events == expected_events
+
+
 def test_additional_attempt_creation_failure_releases_reservation_and_preserves_grant(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -1296,6 +1411,7 @@ def test_replacement_boundary_rejects_ambient_modal_override_before_consumption(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, override_key: str
 ) -> None:
     events: list[str] = []
+    _assume_request_authority_match(monkeypatch)
 
     class FakeDatabase:
         def __init__(self, path: Path) -> None:
