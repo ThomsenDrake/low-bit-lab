@@ -998,7 +998,7 @@ _ACTIVE_WORKSPACE_DIGEST_SCRIPT = (
     "import asyncio,hashlib\n"
     "from modal.client import _Client\n"
     "from modal.config import DEFAULT_SERVER_URL,_check_config,_profile,config\n"
-    "from modal_proto.api_pb2 import Empty\n"
+    "from google.protobuf.empty_pb2 import Empty\n"
     "_check_config()\n"
     "server=config.get('server_url',profile=_profile,use_env=False)\n"
     "headers=config.get('override_headers',profile=_profile,use_env=False)\n"
