@@ -34,6 +34,9 @@ from lowbit_lab.db import DatabaseError, ResultsDatabase
 from lowbit_lab.evaluation_lock import EvaluationLockError, validate_pending_evaluation_lock
 from lowbit_lab.provider_evidence import validate_provider_capability_receipt
 from lowbit_lab.reference_bootstrap import (
+    ADDITIONAL_ACTION,
+    ORIGINAL_ACTION,
+    BootstrapRequest,
     ReferenceBootstrapError,
     validate_bootstrap_receipt_bytes,
     validate_bootstrap_request_bytes,
@@ -189,6 +192,22 @@ def _validate_authority_generation_shape(capability: ReferenceModalCapability) -
         raise ReferenceModalError("reference authority generation is invalid")
 
 
+def _validated_request_action(content: bytes) -> tuple[BootstrapRequest, str]:
+    request = validate_bootstrap_request_bytes(content)
+    action = json.loads(request.canonical_json).get("action")
+    if action not in {ORIGINAL_ACTION, ADDITIONAL_ACTION}:
+        raise ReferenceModalError("fresh request action is invalid")
+    return request, action
+
+
+def _validate_request_authority_generation(capability: ReferenceModalCapability) -> None:
+    _validate_authority_generation_shape(capability)
+    _, action = _validated_request_action(capability.bootstrap_request_bytes)
+    additional_generation = capability.additional_authority_sha256 is not None
+    if (action == ADDITIONAL_ACTION) != additional_generation:
+        raise ReferenceModalError("request authority generation mismatch")
+
+
 def validate_reference_preflight(
     capability: ReferenceModalCapability,
 ) -> FreshDeterministicEvidence:
@@ -225,15 +244,15 @@ def validate_reference_preflight(
             request_bytes=capability.bootstrap_request_bytes,
         )
         config = load_reference_job_config(root / capability.config_path, root=root)
-        additional = capability.additional_authority_sha256 is not None
+        request, action = _validated_request_action(capability.bootstrap_request_bytes)
+        request_raw = json.loads(request.canonical_json)
+        additional = action == ADDITIONAL_ACTION
         validate_reproduced_request(
             root,
             config,
             capability.bootstrap_request_bytes,
             additional=additional,
         )
-        request = validate_bootstrap_request_bytes(capability.bootstrap_request_bytes)
-        request_raw = json.loads(request.canonical_json)
         image = validate_image_lock(capability.image_lock)
         preview_builder = (
             plan_reference_additional_preview
@@ -896,6 +915,7 @@ def submit_reference(
         raise ReferenceModalError("additional attempt audit initialization failed") from exc
     # Validate every deterministic byte before consuming the sole action.
     try:
+        _validate_request_authority_generation(capability)
         _validate_additional_parity(capability, prepared)
         fresh = validate_reference_preflight(capability)
         deadline_signal = _local_deadline_signal()

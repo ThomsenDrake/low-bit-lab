@@ -34,6 +34,10 @@ For provider-local probe scripts, syntax compilation is not dependency validatio
 isolated script against the pinned provider environment before the paid boundary so a moved protobuf
 type or private SDK symbol fails while the grant is still available.
 
+Pre-reservation validation cannot infer an action generation from fields that exist only after its
+authority is consumed. Derive the reproduction path from the already validated immutable request
+action, while validating reservation-time authority fields separately as a closed all-or-none shape.
+
 A normal submitted provider action may have both an app identity and a call identity. Preserve both
 in the ledger, then attribute billing only when all matching rows name exactly one of those durable
 identities. Prefer neither identity by assumption: select the one the authoritative rows prove and
