@@ -14,6 +14,12 @@ from typing import Any
 
 from lowbit_lab.config import IMMUTABLE_REVISION_RE, SHA256_RE
 from lowbit_lab.constants import (
+    REFERENCE_ADDITIONAL_AUTHORITY_SHA256,
+    REFERENCE_ADDITIONAL_CUMULATIVE_CAP_USD,
+    REFERENCE_ADDITIONAL_INCREMENTAL_CAP_USD,
+    REFERENCE_ADDITIONAL_PRIOR_EXECUTION_SCOPE_SHA256,
+    REFERENCE_ADDITIONAL_PRIOR_SPEND_USD,
+    REFERENCE_ADDITIONAL_SETTLEMENT_RECEIPT_SHA256,
     REFERENCE_AUTHORITY_SHA256,
     REFERENCE_BOOTSTRAP_AUTHORITY_SHA256,
     REFERENCE_CUMULATIVE_CAP_USD,
@@ -25,11 +31,13 @@ from lowbit_lab.constants import (
 from lowbit_lab.handoff import sha256_json
 from lowbit_lab.jsonio import emit
 from lowbit_lab.reference_authority import (
+    ADDITIONAL_AUTHORITY_PATH,
     AUTHORITY_PATH,
     BOOTSTRAP_AUTHORITY_PATH,
     RECOVERY_AUTHORITY_PATH,
     WORKSPACE_RECONCILIATION_AUTHORITY_PATH,
     ReferenceAuthorityError,
+    validate_reference_additional_authority,
     validate_reference_authority,
     validate_reference_bootstrap_authority,
     validate_reference_recovery_authority,
@@ -49,6 +57,7 @@ from lowbit_lab.reference_contract import (
     REFERENCE_RESOURCES,
     reference_execution_scope_sha256,
 )
+from lowbit_lab.reference_provider_auth import OFFICIAL_MODAL_SERVER_URL
 from lowbit_lab.reference_settlement import (
     AUTH_RECEIPT_MAXIMUM_AGE_SECONDS,
     ReferenceSettlementError,
@@ -56,7 +65,15 @@ from lowbit_lab.reference_settlement import (
     validate_workspace_zero_settlement_evidence,
 )
 
-SCHEMA_VERSION = 14
+SCHEMA_VERSION = 15
+_V14_SCHEMA_SHA256 = {
+    # Fresh, deployed, and supported legacy-migration v14 shapes.
+    "afd74c9a39fd96ee08ab4f2564b714800def48a1e975bcfb9e3f08d80fd1c301",
+    "d48ac282c25d5aba47b21131b8351f603b95f1636e081dbbd05de3da3a76e4aa",
+    "73e0c9a1cafa2bd7bdcb79b5deff1b0f8366393c9edeb2d89303dfec7013bd8c",
+    "00fafa630a6c02be11b9beff0dc65f5a321b0c50c76489520cb1758d364e9190",
+    "16fa42b6dc7742c6bad40c62c0611681ee24952b62949d8917e9d72c03d0c993",
+}
 _V12_BUDGET_SCHEMA_SHA256 = {
     # Fresh schema-v12 creation and the deployed incremental-v12 migration shape.
     "fc16ab0b3adb0b84dbe85ac23afcc961ab64aed4e8ff64f5c852610ba555911b",
@@ -418,6 +435,39 @@ CREATE TABLE IF NOT EXISTS reference_replacement_entitlements (
               AND replacement_execution_scope_sha256 IS NOT NULL AND consumed_at IS NOT NULL
               AND consumed_auth_receipt_sha256 IS NOT NULL))
 );
+CREATE TABLE IF NOT EXISTS reference_additional_grants (
+    singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+    authority_sha256 TEXT NOT NULL UNIQUE CHECK(length(authority_sha256) = 64),
+    prior_settlement_receipt_sha256 TEXT NOT NULL UNIQUE
+        CHECK(length(prior_settlement_receipt_sha256) = 64),
+    prior_execution_scope_sha256 TEXT NOT NULL
+        CHECK(length(prior_execution_scope_sha256) = 64),
+    prior_actual_cost_usd TEXT NOT NULL CHECK(prior_actual_cost_usd = '0.00564445'),
+    incremental_cap_usd TEXT NOT NULL CHECK(incremental_cap_usd = '4.00'),
+    cumulative_cap_usd TEXT NOT NULL CHECK(cumulative_cap_usd = '4.00564445'),
+    state TEXT NOT NULL CHECK(state IN ('available', 'consumed')),
+    active_reservation_id TEXT UNIQUE
+        REFERENCES budget_reservations(reservation_id) ON DELETE RESTRICT,
+    active_execution_scope_sha256 TEXT
+        CHECK(active_execution_scope_sha256 IS NULL
+              OR length(active_execution_scope_sha256) = 64),
+    reserved_at TEXT,
+    consumed_at TEXT,
+    consumed_auth_receipt_sha256 TEXT
+        CHECK(consumed_auth_receipt_sha256 IS NULL
+              OR length(consumed_auth_receipt_sha256) = 64),
+    created_at TEXT NOT NULL,
+    CHECK((state = 'available' AND consumed_at IS NULL
+           AND consumed_auth_receipt_sha256 IS NULL)
+          OR (state = 'consumed' AND active_reservation_id IS NOT NULL
+              AND active_execution_scope_sha256 IS NOT NULL
+              AND reserved_at IS NOT NULL AND consumed_at IS NOT NULL
+              AND consumed_auth_receipt_sha256 IS NOT NULL)),
+    CHECK((active_reservation_id IS NULL AND active_execution_scope_sha256 IS NULL
+           AND reserved_at IS NULL)
+          OR (active_reservation_id IS NOT NULL
+              AND active_execution_scope_sha256 IS NOT NULL AND reserved_at IS NOT NULL))
+);
 CREATE TABLE IF NOT EXISTS controller_cycles (
     cycle_id TEXT PRIMARY KEY,
     workspace_id TEXT NOT NULL,
@@ -606,6 +656,92 @@ def _database_timestamp(value: str, label: str) -> datetime:
     return timestamp
 
 
+def _validate_additional_provider_auth_receipt(
+    content: bytes,
+    *,
+    reservation_id: str,
+    execution_scope_sha256: str,
+    authority_sha256: str,
+) -> str:
+    """Validate the sanitized receipt bound to the final provider boundary."""
+    try:
+        raw = json.loads(content)
+    except (TypeError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise DatabaseError("reference additional auth receipt is invalid") from exc
+    expected_fields = {
+        "additional_authority_sha256",
+        "authenticated_workspace_identity_sha256",
+        "environment_overrides_present",
+        "kind",
+        "provider_environment",
+        "reference_execution_scope_sha256",
+        "reservation_id",
+        "schema_version",
+        "sdk_version",
+        "server_url",
+    }
+    canonical = json.dumps(raw, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()
+    if (
+        not isinstance(raw, dict)
+        or set(raw) != expected_fields
+        or content != canonical
+        or raw["kind"] != "reference_additional_provider_auth_receipt"
+        or raw["schema_version"] != 1
+        or raw["additional_authority_sha256"] != authority_sha256
+        or raw["reservation_id"] != reservation_id
+        or raw["reference_execution_scope_sha256"] != execution_scope_sha256
+        or raw["server_url"] != OFFICIAL_MODAL_SERVER_URL
+        or raw["environment_overrides_present"] is not False
+        or not isinstance(raw["provider_environment"], str)
+        or not raw["provider_environment"]
+        or not isinstance(raw["sdk_version"], str)
+        or not raw["sdk_version"]
+        or not isinstance(raw["authenticated_workspace_identity_sha256"], str)
+        or SHA256_RE.fullmatch(raw["authenticated_workspace_identity_sha256"]) is None
+    ):
+        raise DatabaseError("reference additional auth receipt is invalid")
+    return hashlib.sha256(content).hexdigest()
+
+
+def _reference_boundary_consumed(
+    connection: sqlite3.Connection,
+    *,
+    reservation_id: str,
+    execution_scope_sha256: str,
+) -> bool:
+    """Require one exact reservation-specific authority generation after the boundary."""
+    original = connection.execute(
+        """SELECT 1 FROM reference_authority_slots
+        WHERE singleton = 1 AND state = 'consumed' AND execution_scope_sha256 = ?""",
+        (execution_scope_sha256,),
+    ).fetchone()
+    replacement = connection.execute(
+        """SELECT state, replacement_execution_scope_sha256
+        FROM reference_replacement_entitlements
+        WHERE replacement_reservation_id = ?""",
+        (reservation_id,),
+    ).fetchone()
+    additional = connection.execute(
+        """SELECT state, active_execution_scope_sha256, consumed_auth_receipt_sha256
+        FROM reference_additional_grants
+        WHERE singleton = 1 AND active_reservation_id = ?""",
+        (reservation_id,),
+    ).fetchone()
+    if replacement is not None:
+        return (
+            additional is None
+            and replacement["state"] == "consumed"
+            and replacement["replacement_execution_scope_sha256"] == execution_scope_sha256
+        )
+    if additional is not None:
+        return (
+            additional["state"] == "consumed"
+            and additional["active_execution_scope_sha256"] == execution_scope_sha256
+            and additional["consumed_auth_receipt_sha256"] is not None
+        )
+    return original is not None
+
+
 def _committed_provider_cost(connection: sqlite3.Connection) -> Decimal:
     committed = Decimal("0")
     for row in connection.execute(
@@ -653,6 +789,28 @@ def _committed_provider_smoke_cost(connection: sqlite3.Connection) -> Decimal:
         parser = _database_actual_money if use_actual else _database_money
         committed += parser(value, "stored provider smoke cost")
     return committed
+
+
+def _validate_reference_additional_prior_lineage(connection: sqlite3.Connection) -> None:
+    prior = connection.execute(
+        """SELECT status, provider_actual_cost_usd
+        FROM budget_reservations
+        WHERE settlement_identity = ? AND reference_execution_scope_sha256 = ?""",
+        (
+            REFERENCE_ADDITIONAL_SETTLEMENT_RECEIPT_SHA256,
+            REFERENCE_ADDITIONAL_PRIOR_EXECUTION_SCOPE_SHA256,
+        ),
+    ).fetchone()
+    if (
+        prior is None
+        or prior["status"] not in {"settled", "failed"}
+        or _database_actual_money(prior["provider_actual_cost_usd"], "additional prior actual cost")
+        != REFERENCE_ADDITIONAL_PRIOR_SPEND_USD - REFERENCE_SETTLED_SMOKE_USD
+        or _committed_provider_cost(connection) != REFERENCE_ADDITIONAL_PRIOR_SPEND_USD
+    ):
+        raise DatabaseError(
+            "reference additional prior receipt, scope, or actual-cost lineage has drifted"
+        )
 
 
 def _reference_billing_report(
@@ -1016,6 +1174,21 @@ def _table_sql_sha256(connection: sqlite3.Connection, table: str) -> str | None:
     return hashlib.sha256(row[0].encode()).hexdigest()
 
 
+def _schema_sha256(connection: sqlite3.Connection) -> str:
+    """Fingerprint every declared schema object, excluding SQLite internals."""
+    objects = [
+        (row[0], row[1], row[2], " ".join(str(row[3]).split()))
+        for row in connection.execute(
+            """SELECT type, name, tbl_name, sql FROM sqlite_master
+            WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%'
+            ORDER BY type, name"""
+        )
+    ]
+    return hashlib.sha256(
+        json.dumps(objects, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
 class ResultsDatabase:
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -1054,6 +1227,7 @@ class ResultsDatabase:
             ).fetchone()
             if has_schema is None:
                 connection.executescript(SCHEMA)
+                self._insert_reference_additional_grant(connection)
                 connection.execute(
                     """INSERT INTO schema_info(version, applied_at)
                     VALUES (?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))""",
@@ -1100,8 +1274,84 @@ class ResultsDatabase:
             if existing == 13:
                 self._migrate_v13_to_v14(connection)
                 existing = 14
+            if existing == 14:
+                self._migrate_v14_to_v15(connection)
+                existing = 15
             if existing != SCHEMA_VERSION:
                 raise DatabaseError(f"database schema {existing} != supported {SCHEMA_VERSION}")
+
+    @staticmethod
+    def _insert_reference_additional_grant(connection: sqlite3.Connection) -> None:
+        connection.execute(
+            """INSERT INTO reference_additional_grants(
+                singleton, authority_sha256, prior_settlement_receipt_sha256,
+                prior_execution_scope_sha256, prior_actual_cost_usd,
+                incremental_cap_usd, cumulative_cap_usd, state, created_at
+            ) VALUES (1, ?, ?, ?, ?, ?, ?, 'available',
+                      strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))""",
+            (
+                REFERENCE_ADDITIONAL_AUTHORITY_SHA256,
+                REFERENCE_ADDITIONAL_SETTLEMENT_RECEIPT_SHA256,
+                REFERENCE_ADDITIONAL_PRIOR_EXECUTION_SCOPE_SHA256,
+                str(REFERENCE_ADDITIONAL_PRIOR_SPEND_USD),
+                str(REFERENCE_ADDITIONAL_INCREMENTAL_CAP_USD),
+                str(REFERENCE_ADDITIONAL_CUMULATIVE_CAP_USD),
+            ),
+        )
+
+    def _migrate_v14_to_v15(self, connection: sqlite3.Connection) -> None:
+        """Append the final one-shot grant after fingerprinting all v14 objects."""
+        if _schema_sha256(connection) not in _V14_SCHEMA_SHA256:
+            raise DatabaseError("schema v14 shape is unknown")
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """CREATE TABLE reference_additional_grants (
+                    singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                    authority_sha256 TEXT NOT NULL UNIQUE CHECK(length(authority_sha256) = 64),
+                    prior_settlement_receipt_sha256 TEXT NOT NULL UNIQUE
+                        CHECK(length(prior_settlement_receipt_sha256) = 64),
+                    prior_execution_scope_sha256 TEXT NOT NULL
+                        CHECK(length(prior_execution_scope_sha256) = 64),
+                    prior_actual_cost_usd TEXT NOT NULL
+                        CHECK(prior_actual_cost_usd = '0.00564445'),
+                    incremental_cap_usd TEXT NOT NULL CHECK(incremental_cap_usd = '4.00'),
+                    cumulative_cap_usd TEXT NOT NULL CHECK(cumulative_cap_usd = '4.00564445'),
+                    state TEXT NOT NULL CHECK(state IN ('available', 'consumed')),
+                    active_reservation_id TEXT UNIQUE
+                        REFERENCES budget_reservations(reservation_id) ON DELETE RESTRICT,
+                    active_execution_scope_sha256 TEXT CHECK(
+                        active_execution_scope_sha256 IS NULL
+                        OR length(active_execution_scope_sha256) = 64
+                    ),
+                    reserved_at TEXT, consumed_at TEXT,
+                    consumed_auth_receipt_sha256 TEXT CHECK(
+                        consumed_auth_receipt_sha256 IS NULL
+                        OR length(consumed_auth_receipt_sha256) = 64
+                    ),
+                    created_at TEXT NOT NULL,
+                    CHECK((state = 'available' AND consumed_at IS NULL
+                           AND consumed_auth_receipt_sha256 IS NULL)
+                          OR (state = 'consumed' AND active_reservation_id IS NOT NULL
+                              AND active_execution_scope_sha256 IS NOT NULL
+                              AND reserved_at IS NOT NULL AND consumed_at IS NOT NULL
+                              AND consumed_auth_receipt_sha256 IS NOT NULL)),
+                    CHECK((active_reservation_id IS NULL
+                           AND active_execution_scope_sha256 IS NULL AND reserved_at IS NULL)
+                          OR (active_reservation_id IS NOT NULL
+                              AND active_execution_scope_sha256 IS NOT NULL
+                              AND reserved_at IS NOT NULL))
+                )"""
+            )
+            self._insert_reference_additional_grant(connection)
+            if connection.execute("PRAGMA foreign_key_check").fetchall():
+                raise DatabaseError("schema v15 foreign-key validation failed")
+            connection.execute(
+                """INSERT INTO schema_info(version, applied_at)
+                VALUES (15, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))"""
+            )
+        except Exception as exc:
+            raise DatabaseError(f"database schema v15 migration failed: {exc}") from exc
 
     def _migrate_v12_to_v13(self, connection: sqlite3.Connection) -> None:
         """Add an identity-less exact-zero settlement mode and its one-shot child slot."""
@@ -3330,26 +3580,70 @@ class ResultsDatabase:
         replacement_entitlement_sha256: str | None = None,
         recovery_authority_sha256: str | None = None,
         recovery_authority_path: Path = RECOVERY_AUTHORITY_PATH,
+        additional_authority_sha256: str | None = None,
+        additional_prior_settlement_receipt_sha256: str | None = None,
+        additional_prior_execution_scope_sha256: str | None = None,
+        additional_authority_path: Path = ADDITIONAL_AUTHORITY_PATH,
     ) -> None:
         requested = _database_money(requested_cost_usd, "requested_cost_usd")
         phase_cap = _database_money(phase_cap_usd, "phase_cap_usd")
         total_cap = _database_actual_money(total_cap_usd, "total_cap_usd")
         single_job_cap = _database_money(single_job_cap_usd, "single_job_cap_usd")
+        additional_mode = any(
+            value is not None
+            for value in (
+                additional_authority_sha256,
+                additional_prior_settlement_receipt_sha256,
+                additional_prior_execution_scope_sha256,
+            )
+        )
+        expected_total_cap = (
+            REFERENCE_ADDITIONAL_CUMULATIVE_CAP_USD
+            if additional_mode
+            else REFERENCE_CUMULATIVE_CAP_USD
+        )
         if (
             requested != REFERENCE_RESERVATION_USD
             or single_job_cap != REFERENCE_RESERVATION_USD
             or phase_cap != REFERENCE_RESERVATION_USD
-            or total_cap != REFERENCE_CUMULATIVE_CAP_USD
+            or total_cap != expected_total_cap
         ):
             raise DatabaseError(
                 "reference reservation, phase, and single-job caps must equal USD 4.00 "
-                "and cumulative cap must equal USD 4.00270969"
+                f"and cumulative cap must equal USD {expected_total_cap}"
             )
         if standing_authority_sha256 != REFERENCE_AUTHORITY_SHA256:
             raise DatabaseError("reference standing authority is invalid")
         if bootstrap_authority_sha256 != REFERENCE_BOOTSTRAP_AUTHORITY_SHA256:
             raise DatabaseError("reference bootstrap authority is invalid")
         replacement_mode = replacement_entitlement_sha256 is not None
+        if additional_mode and replacement_mode:
+            raise DatabaseError("reference additional and replacement authorities are exclusive")
+        additional_lineage = (
+            additional_authority_sha256,
+            additional_prior_settlement_receipt_sha256,
+            additional_prior_execution_scope_sha256,
+        )
+        if additional_mode and not all(value is not None for value in additional_lineage):
+            raise DatabaseError("reference additional authority is incomplete")
+        if additional_mode:
+            _database_sha256(additional_authority_sha256, "additional_authority_sha256")
+            _database_sha256(
+                additional_prior_settlement_receipt_sha256,
+                "additional_prior_settlement_receipt_sha256",
+            )
+            _database_sha256(
+                additional_prior_execution_scope_sha256,
+                "additional_prior_execution_scope_sha256",
+            )
+            if (
+                additional_authority_sha256 != REFERENCE_ADDITIONAL_AUTHORITY_SHA256
+                or additional_prior_settlement_receipt_sha256
+                != REFERENCE_ADDITIONAL_SETTLEMENT_RECEIPT_SHA256
+                or additional_prior_execution_scope_sha256
+                != REFERENCE_ADDITIONAL_PRIOR_EXECUTION_SCOPE_SHA256
+            ):
+                raise DatabaseError("reference additional authority lineage is invalid")
         if replacement_mode != (recovery_authority_sha256 is not None):
             raise DatabaseError("reference replacement authority is incomplete")
         if replacement_mode:
@@ -3368,6 +3662,11 @@ class ResultsDatabase:
                 if replacement_mode
                 else None
             )
+            validated_additional_sha256 = (
+                validate_reference_additional_authority(authority_root, additional_authority_path)
+                if additional_mode
+                else None
+            )
         except ReferenceAuthorityError as exc:
             raise DatabaseError(
                 "reference standing or bootstrap authority files are invalid"
@@ -3378,6 +3677,8 @@ class ResultsDatabase:
             raise DatabaseError("reference bootstrap authority digest does not match its files")
         if replacement_mode and validated_recovery_sha256 != recovery_authority_sha256:
             raise DatabaseError("reference recovery authority digest does not match its files")
+        if additional_mode and validated_additional_sha256 != additional_authority_sha256:
+            raise DatabaseError("reference additional authority digest does not match its files")
         if not owner_id or not idempotency_key:
             raise DatabaseError("reference reservation requires owner and idempotency key")
         standing_setup = (
@@ -3499,6 +3800,26 @@ class ResultsDatabase:
                 ).fetchone()
                 if replacement is None:
                     raise DatabaseError("reference replacement entitlement is unavailable")
+            additional_grant = None
+            if additional_mode:
+                additional_grant = connection.execute(
+                    """SELECT * FROM reference_additional_grants
+                    WHERE singleton = 1 AND authority_sha256 = ?
+                      AND prior_settlement_receipt_sha256 = ?
+                      AND prior_execution_scope_sha256 = ?
+                      AND prior_actual_cost_usd = '0.00564445'
+                      AND incremental_cap_usd = '4.00'
+                      AND cumulative_cap_usd = '4.00564445'
+                      AND state = 'available' AND active_reservation_id IS NULL""",
+                    (
+                        additional_authority_sha256,
+                        additional_prior_settlement_receipt_sha256,
+                        additional_prior_execution_scope_sha256,
+                    ),
+                ).fetchone()
+                if additional_grant is None:
+                    raise DatabaseError("reference additional grant is unavailable")
+                _validate_reference_additional_prior_lineage(connection)
             prior_scope_rows = connection.execute(
                 """SELECT br.reservation_id, br.status, e.config_json,
                     rac.challenge_sha256, rac.approval_digest
@@ -3523,7 +3844,11 @@ class ResultsDatabase:
                         and execution_scope_sha256 == replacement["original_execution_scope_sha256"]
                         and prior["status"] == "settled"
                     )
-                    if not allowed_original:
+                    allowed_additional_history = additional_mode and prior["status"] in {
+                        "settled",
+                        "failed",
+                    }
+                    if not allowed_original and not allowed_additional_history:
                         raise DatabaseError("reference execution scope is permanently consumed")
                 if prior["status"] == "released":
                     prior_config = json.loads(prior["config_json"])
@@ -3543,11 +3868,20 @@ class ResultsDatabase:
             phase_committed = _committed_reference_cost(connection)
             smoke_committed = _committed_provider_smoke_cost(connection)
             total_committed = phase_committed + smoke_committed
+            if additional_mode:
+                active = connection.execute(
+                    """SELECT 1 FROM budget_reservations WHERE status IN (
+                        'reserved', 'submission_pending', 'submitted',
+                        'settlement_pending', 'audit_blocked'
+                    ) LIMIT 1"""
+                ).fetchone()
+                if active is not None:
+                    raise DatabaseError("reference additional reservation overlaps active work")
             original_slot_exists = connection.execute(
                 "SELECT 1 FROM reference_authority_slots WHERE singleton = 1"
             ).fetchone()
-            if (not replacement_mode and original_slot_exists) or (
-                replacement_mode and original_slot_exists is None
+            if (not replacement_mode and not additional_mode and original_slot_exists) or (
+                (replacement_mode or additional_mode) and original_slot_exists is None
             ):
                 raise DatabaseError("reference U8 authority slot is already consumed")
             if smoke_committed != REFERENCE_SETTLED_SMOKE_USD:
@@ -3555,7 +3889,7 @@ class ResultsDatabase:
                     "reference cumulative ledger does not contain the exact settled "
                     "provider smoke cost"
                 )
-            if phase_committed + requested > phase_cap:
+            if not additional_mode and phase_committed + requested > phase_cap:
                 raise DatabaseError("reference reservation exceeds phase cap")
             if total_committed + requested > total_cap:
                 raise DatabaseError("reference reservation exceeds cumulative cap")
@@ -3643,6 +3977,22 @@ class ResultsDatabase:
                     started_at,
                 ),
             )
+            if additional_mode:
+                cursor = connection.execute(
+                    """UPDATE reference_additional_grants
+                    SET active_reservation_id = ?, active_execution_scope_sha256 = ?,
+                        reserved_at = ?
+                    WHERE singleton = 1 AND state = 'available'
+                      AND active_reservation_id IS NULL AND authority_sha256 = ?""",
+                    (
+                        reservation_id,
+                        execution_scope_sha256,
+                        started_at,
+                        additional_authority_sha256,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise DatabaseError("reference additional grant reservation lost its race")
             cursor = connection.execute(
                 """UPDATE reference_approval_challenges SET consumed_at = ?, run_id = ?
                 WHERE challenge_sha256 = ? AND approval_digest = ? AND consumed_at IS NULL""",
@@ -3650,6 +4000,180 @@ class ResultsDatabase:
             )
             if cursor.rowcount != 1:
                 raise DatabaseError("reference approval could not be consumed atomically")
+
+    def reference_additional_grant(self) -> dict[str, Any]:
+        """Return the singleton final grant without exposing provider identity."""
+        with self.connect_readonly() as connection:
+            rows = connection.execute(
+                "SELECT * FROM reference_additional_grants LIMIT 2"
+            ).fetchall()
+        if len(rows) != 1:
+            raise DatabaseError("reference additional grant cardinality is invalid")
+        return dict(rows[0])
+
+    def release_reference_additional_reservation(
+        self,
+        reservation_id: str,
+        *,
+        owner_id: str,
+        reason: str,
+        occurred_at: str,
+    ) -> None:
+        """Release a deterministic pre-boundary failure without consuming the grant."""
+        occurred = _database_timestamp(occurred_at, "occurred_at")
+        if not owner_id or not reason or len(reason.encode()) > 1_000:
+            raise DatabaseError("reference additional release metadata is invalid")
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """SELECT br.run_id, br.heartbeat_at
+                FROM budget_reservations AS br
+                JOIN reference_additional_grants AS rag
+                  ON rag.active_reservation_id = br.reservation_id
+                WHERE br.reservation_id = ? AND br.owner_id = ?
+                  AND br.status = 'reserved' AND rag.singleton = 1
+                  AND rag.state = 'available'""",
+                (reservation_id, owner_id),
+            ).fetchone()
+            if row is None:
+                raise DatabaseError("reference additional reservation is not releasable")
+            if occurred < _database_timestamp(row["heartbeat_at"], "stored heartbeat_at"):
+                raise DatabaseError("reference additional release time is backdated")
+            cursor = connection.execute(
+                """UPDATE budget_reservations
+                SET status = 'released', provider_actual_cost_usd = '0',
+                    failure_reason = ?, heartbeat_at = ?, updated_at = ?
+                WHERE reservation_id = ? AND owner_id = ? AND status = 'reserved'""",
+                (reason, occurred_at, occurred_at, reservation_id, owner_id),
+            )
+            if cursor.rowcount != 1:
+                raise DatabaseError("reference additional reservation release lost its race")
+            cursor = connection.execute(
+                """UPDATE reference_additional_grants
+                SET active_reservation_id = NULL, active_execution_scope_sha256 = NULL,
+                    reserved_at = NULL
+                WHERE singleton = 1 AND state = 'available'
+                  AND active_reservation_id = ?""",
+                (reservation_id,),
+            )
+            if cursor.rowcount != 1:
+                raise DatabaseError("reference additional grant release lost its race")
+            cursor = connection.execute(
+                """UPDATE experiments SET status = 'failed', modal_cost_actual_usd = '0',
+                    failure_reason = ?, ended_at = ?
+                WHERE run_id = ? AND status = 'created'""",
+                (reason, occurred_at, row["run_id"]),
+            )
+            if cursor.rowcount != 1:
+                raise DatabaseError("reference additional run release lost its race")
+            connection.execute(
+                """INSERT INTO state_transitions(
+                    run_id, from_state, to_state, reason, occurred_at
+                ) VALUES (?, 'created', 'failed', ?, ?)""",
+                (row["run_id"], reason, occurred_at),
+            )
+
+    def mark_reference_additional_submission_pending(
+        self,
+        reservation_id: str,
+        *,
+        owner_id: str,
+        additional_authority_sha256: str,
+        auth_receipt_bytes: bytes,
+        authority_root: Path,
+        occurred_at: str,
+        additional_authority_path: Path = ADDITIONAL_AUTHORITY_PATH,
+    ) -> None:
+        """Consume the final grant atomically at the reservation-specific boundary."""
+        occurred = _database_timestamp(occurred_at, "occurred_at")
+        if not owner_id or additional_authority_sha256 != REFERENCE_ADDITIONAL_AUTHORITY_SHA256:
+            raise DatabaseError("reference additional boundary authority is invalid")
+        try:
+            validated = validate_reference_additional_authority(
+                authority_root, additional_authority_path
+            )
+        except ReferenceAuthorityError as exc:
+            raise DatabaseError("reference additional authority file is invalid") from exc
+        if validated != additional_authority_sha256:
+            raise DatabaseError("reference additional authority digest does not match its files")
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """SELECT br.reference_execution_scope_sha256, br.lease_expires_at,
+                    br.heartbeat_at, rag.active_execution_scope_sha256
+                FROM budget_reservations AS br
+                JOIN reference_additional_grants AS rag
+                  ON rag.active_reservation_id = br.reservation_id
+                WHERE br.reservation_id = ? AND br.owner_id = ?
+                  AND br.status = 'reserved' AND rag.singleton = 1
+                  AND rag.authority_sha256 = ? AND rag.state = 'available'
+                  AND rag.prior_settlement_receipt_sha256 = ?
+                  AND rag.prior_execution_scope_sha256 = ?
+                  AND rag.prior_actual_cost_usd = '0.00564445'""",
+                (
+                    reservation_id,
+                    owner_id,
+                    additional_authority_sha256,
+                    REFERENCE_ADDITIONAL_SETTLEMENT_RECEIPT_SHA256,
+                    REFERENCE_ADDITIONAL_PRIOR_EXECUTION_SCOPE_SHA256,
+                ),
+            ).fetchone()
+            if (
+                row is None
+                or row["reference_execution_scope_sha256"] != row["active_execution_scope_sha256"]
+            ):
+                raise DatabaseError("reference additional grant is not ready for provider contact")
+            auth_receipt_sha256 = _validate_additional_provider_auth_receipt(
+                auth_receipt_bytes,
+                reservation_id=reservation_id,
+                execution_scope_sha256=row["reference_execution_scope_sha256"],
+                authority_sha256=additional_authority_sha256,
+            )
+            if occurred < _database_timestamp(row["heartbeat_at"], "stored heartbeat_at"):
+                raise DatabaseError("reference additional provider-contact time is backdated")
+            if occurred > _database_timestamp(row["lease_expires_at"], "stored lease_expires_at"):
+                raise DatabaseError("reference additional reservation lease has expired")
+            # The prior receipt remains immutable even after this reservation adds USD 4.00.
+            prior = connection.execute(
+                """SELECT status, provider_actual_cost_usd FROM budget_reservations
+                WHERE settlement_identity = ? AND reference_execution_scope_sha256 = ?""",
+                (
+                    REFERENCE_ADDITIONAL_SETTLEMENT_RECEIPT_SHA256,
+                    REFERENCE_ADDITIONAL_PRIOR_EXECUTION_SCOPE_SHA256,
+                ),
+            ).fetchone()
+            if (
+                prior is None
+                or prior["status"] not in {"settled", "failed"}
+                or _database_actual_money(
+                    prior["provider_actual_cost_usd"], "additional prior actual cost"
+                )
+                != REFERENCE_ADDITIONAL_PRIOR_SPEND_USD - REFERENCE_SETTLED_SMOKE_USD
+                or _committed_provider_cost(connection) != REFERENCE_ADDITIONAL_CUMULATIVE_CAP_USD
+            ):
+                raise DatabaseError("reference additional cumulative reservation lineage drifted")
+            cursor = connection.execute(
+                """UPDATE reference_additional_grants SET state = 'consumed', consumed_at = ?,
+                    consumed_auth_receipt_sha256 = ?
+                WHERE singleton = 1 AND authority_sha256 = ? AND state = 'available'
+                  AND active_reservation_id = ? AND consumed_at IS NULL""",
+                (
+                    occurred_at,
+                    auth_receipt_sha256,
+                    additional_authority_sha256,
+                    reservation_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise DatabaseError("reference additional grant was already consumed")
+            cursor = connection.execute(
+                """UPDATE budget_reservations
+                SET status = 'submission_pending', heartbeat_at = ?, updated_at = ?
+                WHERE reservation_id = ? AND owner_id = ? AND status = 'reserved'""",
+                (occurred_at, occurred_at, reservation_id, owner_id),
+            )
+            if cursor.rowcount != 1:
+                raise DatabaseError("reference additional boundary transition failed")
 
     def mark_reference_submission_pending(
         self,
@@ -3776,12 +4300,21 @@ class ResultsDatabase:
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
-                """SELECT heartbeat_at, lease_expires_at FROM budget_reservations
+                """SELECT heartbeat_at, lease_expires_at,
+                    reference_execution_scope_sha256, app_identity
+                FROM budget_reservations
                 WHERE reservation_id = ? AND owner_id = ? AND status = 'submission_pending'""",
                 (reservation_id, owner_id),
             ).fetchone()
+            if row is not None and not _reference_boundary_consumed(
+                connection,
+                reservation_id=reservation_id,
+                execution_scope_sha256=row["reference_execution_scope_sha256"],
+            ):
+                raise DatabaseError("reference provider-contact boundary was not consumed")
             if (
                 row is None
+                or row["app_identity"] not in (None, app_identity)
                 or occurred < _database_timestamp(row["heartbeat_at"], "stored heartbeat_at")
                 or occurred
                 > _database_timestamp(row["lease_expires_at"], "stored lease_expires_at")
@@ -3804,6 +4337,64 @@ class ResultsDatabase:
             )
             if cursor.rowcount != 1:
                 raise DatabaseError("reference provider preparation transition failed")
+
+    def mark_reference_app_identity(
+        self,
+        reservation_id: str,
+        *,
+        owner_id: str,
+        app_identity: str,
+        occurred_at: str,
+        lease_expires_at: str,
+    ) -> None:
+        """Persist the provider app identity immediately on app-context entry."""
+        occurred = _database_timestamp(occurred_at, "occurred_at")
+        lease_expiry = _database_timestamp(lease_expires_at, "lease_expires_at")
+        if (
+            not owner_id
+            or not _controller_identifier(app_identity, "app_identity")
+            or lease_expiry <= occurred
+        ):
+            raise DatabaseError("provider app identity or lease is invalid")
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """SELECT heartbeat_at, lease_expires_at,
+                    reference_execution_scope_sha256, app_identity
+                FROM budget_reservations
+                WHERE reservation_id = ? AND owner_id = ? AND status = 'submission_pending'""",
+                (reservation_id, owner_id),
+            ).fetchone()
+            if row is not None and not _reference_boundary_consumed(
+                connection,
+                reservation_id=reservation_id,
+                execution_scope_sha256=row["reference_execution_scope_sha256"],
+            ):
+                raise DatabaseError("reference provider-contact boundary was not consumed")
+            if (
+                row is None
+                or row["app_identity"] is not None
+                or occurred < _database_timestamp(row["heartbeat_at"], "stored heartbeat_at")
+                or occurred
+                > _database_timestamp(row["lease_expires_at"], "stored lease_expires_at")
+            ):
+                raise DatabaseError("reference app identity is not current")
+            cursor = connection.execute(
+                """UPDATE budget_reservations SET app_identity = ?, heartbeat_at = ?,
+                    lease_expires_at = ?, updated_at = ?
+                WHERE reservation_id = ? AND owner_id = ? AND status = 'submission_pending'
+                  AND app_identity IS NULL""",
+                (
+                    app_identity,
+                    occurred_at,
+                    lease_expires_at,
+                    occurred_at,
+                    reservation_id,
+                    owner_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise DatabaseError("reference app identity persistence lost its race")
 
     def mark_reservation_submitted(
         self,
@@ -3834,16 +4425,13 @@ class ResultsDatabase:
                 row["lease_expires_at"], "stored lease_expires_at"
             ):
                 raise DatabaseError("submitted reservation lease has expired")
-            slot = connection.execute(
-                """SELECT execution_scope_sha256 FROM reference_authority_slots
-                WHERE singleton = 1"""
-            ).fetchone()
             if (
                 row is not None
                 and row["reference_execution_scope_sha256"] is not None
-                and (
-                    slot is None
-                    or slot["execution_scope_sha256"] != row["reference_execution_scope_sha256"]
+                and not _reference_boundary_consumed(
+                    connection,
+                    reservation_id=reservation_id,
+                    execution_scope_sha256=row["reference_execution_scope_sha256"],
                 )
             ):
                 raise DatabaseError("reference provider-contact boundary was not consumed")
@@ -3895,7 +4483,8 @@ class ResultsDatabase:
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
-                """SELECT lease_expires_at, heartbeat_at, submitted_at
+                """SELECT lease_expires_at, heartbeat_at, submitted_at,
+                    reference_execution_scope_sha256
                 FROM budget_reservations WHERE reservation_id = ?""",
                 (reservation_id,),
             ).fetchone()
@@ -3905,6 +4494,11 @@ class ResultsDatabase:
                     raise DatabaseError("provider terminal time is outside the transition window")
             if (
                 row is None
+                or not _reference_boundary_consumed(
+                    connection,
+                    reservation_id=reservation_id,
+                    execution_scope_sha256=row["reference_execution_scope_sha256"],
+                )
                 or row["submitted_at"] is None
                 or occurred < _database_timestamp(row["heartbeat_at"], "stored heartbeat_at")
                 or occurred
@@ -3938,6 +4532,18 @@ class ResultsDatabase:
         safe_reason = _controller_text(reason, "audit reason", maximum=256)
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """SELECT reference_execution_scope_sha256 FROM budget_reservations
+                WHERE reservation_id = ? AND owner_id = ?
+                  AND status IN ('submission_pending', 'submitted', 'settlement_pending')""",
+                (reservation_id, owner_id),
+            ).fetchone()
+            if row is None or not _reference_boundary_consumed(
+                connection,
+                reservation_id=reservation_id,
+                execution_scope_sha256=row["reference_execution_scope_sha256"],
+            ):
+                raise DatabaseError("reference provider-contact boundary was not consumed")
             cursor = connection.execute(
                 """UPDATE budget_reservations SET status = 'audit_blocked',
                     failure_reason = ?, heartbeat_at = ?, updated_at = ?
@@ -4536,26 +5142,18 @@ class ResultsDatabase:
                     pre_auth_receipt_bytes=pre_auth_receipt_bytes,
                     post_auth_receipt_bytes=post_auth_receipt_bytes,
                     expected_reservation_id=reservation_id,
-                    expected_execution_scope_sha256=row[
-                        "reference_execution_scope_sha256"
-                    ],
+                    expected_execution_scope_sha256=row["reference_execution_scope_sha256"],
                     expected_entitlement_sha256=row["entitlement_sha256"],
                     expected_environment_scope_sha256=environment_scope_sha256,
-                    expected_original_workspace_scope_sha256=row[
-                        "original_workspace_scope_sha256"
-                    ],
+                    expected_original_workspace_scope_sha256=row["original_workspace_scope_sha256"],
                     expected_workspace_identity_sha256=row[
                         "authenticated_workspace_identity_sha256"
                     ],
-                    expected_reconciliation_authority_sha256=row[
-                        "reconciliation_authority_sha256"
-                    ],
+                    expected_reconciliation_authority_sha256=row["reconciliation_authority_sha256"],
                     expected_auth_binding_sha256=row["auth_binding_sha256"],
                     expected_billing_authority_sha256=row["billing_authority_sha256"],
                     expected_billing_method_sha256=authority["attribution_method_sha256"],
-                    expected_report_identity_sha256=row[
-                        "authoritative_report_identity_sha256"
-                    ],
+                    expected_report_identity_sha256=row["authoritative_report_identity_sha256"],
                     action_consumed_at=_database_timestamp(
                         row["consumed_at"], "replacement consumed_at"
                     ),
@@ -4563,9 +5161,7 @@ class ResultsDatabase:
                         row["heartbeat_at"], "replacement heartbeat_at"
                     ),
                     maximum_action_seconds=int(REFERENCE_RESOURCES["timeout_seconds"]),
-                    expected_completeness_delay_seconds=row[
-                        "billing_completeness_delay_seconds"
-                    ],
+                    expected_completeness_delay_seconds=row["billing_completeness_delay_seconds"],
                     validated_at=occurred,
                 )
             except (KeyError, TypeError, json.JSONDecodeError, ReplacementSettlementError) as exc:
@@ -4617,6 +5213,330 @@ class ResultsDatabase:
                 (row["run_id"], failure_reason, occurred_at),
             )
         if over_cap:
+            raise DatabaseError(
+                "authoritative provider cost was recorded as a terminal budget failure"
+            )
+        return evidence.receipt_sha256
+
+    def settle_reference_additional_billing(
+        self,
+        receipt_bytes: bytes,
+        identity_evidence_bytes: bytes,
+        filtered_report_bytes: bytes,
+        *,
+        pre_auth_receipt_bytes: bytes,
+        post_auth_receipt_bytes: bytes,
+        billing_authority_bytes: bytes,
+        bootstrap_request_bytes: bytes,
+        remote_receipt_bytes: bytes | None,
+        occurred_at: str,
+    ) -> str:
+        """Settle the final grant without conflating billing and experiment outcome."""
+        from lowbit_lab.reference_bootstrap import (
+            ReferenceBootstrapError,
+            validate_bootstrap_receipt_bytes,
+            validate_bootstrap_request_bytes,
+        )
+        from lowbit_lab.reference_contract import additional_reference_binding
+        from lowbit_lab.reference_replacement_settlement import (
+            ReplacementSettlementError,
+            validate_additional_settlement,
+        )
+
+        self.initialize()
+        occurred = _database_timestamp(occurred_at, "occurred_at")
+        try:
+            selector = json.loads(receipt_bytes)
+            reservation_id = selector["reservation_id"]
+            authority = json.loads(billing_authority_bytes)
+        except (TypeError, KeyError, UnicodeError, json.JSONDecodeError) as exc:
+            raise DatabaseError("additional settlement selector is invalid") from exc
+        if not isinstance(reservation_id, str) or not isinstance(authority, dict):
+            raise DatabaseError("additional settlement selector is invalid")
+        if (
+            set(authority)
+            != {
+                "schema_version",
+                "kind",
+                "provider",
+                "environment_scope_sha256",
+                "attribution_method_sha256",
+                "authoritative_report_identity_sha256",
+                "billing_completeness_delay_seconds",
+            }
+            or authority.get("schema_version") != 2
+            or authority.get("kind") != "provider_billing_authority_contract"
+            or authority.get("provider") != "modal"
+        ):
+            raise DatabaseError("additional billing authority is invalid")
+        budget_failure = False
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """SELECT br.run_id, br.reference_execution_scope_sha256,
+                    br.requested_cost_usd, br.status, br.provider_job_id, br.app_identity,
+                    br.settlement_identity, br.provider_actual_cost_usd, br.heartbeat_at,
+                    br.billing_authority_sha256, br.authoritative_report_identity_sha256,
+                    br.billing_completeness_delay_seconds, e.status AS run_status,
+                    e.config_sha256, e.config_json, rag.authority_sha256, rag.consumed_at,
+                    rac.challenge_sha256, rac.packet_sha256,
+                    rps.auth_binding_sha256, rws.original_workspace_scope_sha256,
+                    rws.authenticated_workspace_identity_sha256,
+                    rws.authority_sha256 AS reconciliation_authority_sha256
+                FROM budget_reservations AS br
+                JOIN experiments AS e ON e.run_id = br.run_id
+                JOIN reference_additional_grants AS rag
+                  ON rag.active_reservation_id = br.reservation_id
+                JOIN reference_approval_challenges AS rac ON rac.run_id = br.run_id
+                JOIN budget_reservations AS prior
+                  ON prior.settlement_identity = rag.prior_settlement_receipt_sha256
+                JOIN reference_replacement_entitlements AS rre
+                  ON rre.replacement_reservation_id = prior.reservation_id
+                JOIN reference_preidentity_settlements AS rps
+                  ON rps.settlement_sha256 = rre.settlement_sha256
+                JOIN reference_workspace_scope_reconciliations AS rws
+                  ON rws.authority_sha256 = rre.workspace_reconciliation_authority_sha256
+                WHERE br.reservation_id = ? AND rag.state = 'consumed'""",
+                (reservation_id,),
+            ).fetchone()
+            if row is None or not _reference_boundary_consumed(
+                connection,
+                reservation_id=reservation_id,
+                execution_scope_sha256=row["reference_execution_scope_sha256"],
+            ):
+                raise DatabaseError("additional reservation is not settlement-eligible")
+            try:
+                config_challenge, config = _reference_challenge(
+                    row["config_json"], row["config_sha256"]
+                )
+                request = validate_bootstrap_request_bytes(bootstrap_request_bytes)
+                binding = additional_reference_binding(
+                    config_sha256=row["config_sha256"],
+                    config_challenge_sha256=config_challenge,
+                    request_sha256=request.sha256,
+                    execution_scope_sha256=row["reference_execution_scope_sha256"],
+                )
+                if (
+                    binding.challenge_sha256 != row["challenge_sha256"]
+                    or binding.packet_sha256 != row["packet_sha256"]
+                    or json.loads(request.canonical_json)["action"]
+                    != "u8_reference_additional_once"
+                ):
+                    raise DatabaseError("additional request packet lineage drift")
+                environment_scope_sha256 = config["provider"]["environment_scope_sha256"]
+                if (
+                    hashlib.sha256(billing_authority_bytes).hexdigest()
+                    != row["billing_authority_sha256"]
+                    or authority["environment_scope_sha256"] != environment_scope_sha256
+                    or authority["authoritative_report_identity_sha256"]
+                    != row["authoritative_report_identity_sha256"]
+                    or authority["billing_completeness_delay_seconds"]
+                    != row["billing_completeness_delay_seconds"]
+                ):
+                    raise DatabaseError("additional billing authority lineage drift")
+                evidence = validate_additional_settlement(
+                    receipt_bytes,
+                    identity_evidence_bytes,
+                    filtered_report_bytes,
+                    pre_auth_receipt_bytes=pre_auth_receipt_bytes,
+                    post_auth_receipt_bytes=post_auth_receipt_bytes,
+                    expected_reservation_id=reservation_id,
+                    expected_execution_scope_sha256=row["reference_execution_scope_sha256"],
+                    expected_additional_authority_sha256=row["authority_sha256"],
+                    expected_environment_scope_sha256=environment_scope_sha256,
+                    expected_original_workspace_scope_sha256=row[
+                        "original_workspace_scope_sha256"
+                    ],
+                    expected_workspace_identity_sha256=row[
+                        "authenticated_workspace_identity_sha256"
+                    ],
+                    expected_reconciliation_authority_sha256=row[
+                        "reconciliation_authority_sha256"
+                    ],
+                    expected_auth_binding_sha256=row["auth_binding_sha256"],
+                    expected_billing_authority_sha256=row["billing_authority_sha256"],
+                    expected_billing_method_sha256=authority["attribution_method_sha256"],
+                    expected_report_identity_sha256=row[
+                        "authoritative_report_identity_sha256"
+                    ],
+                    action_consumed_at=_database_timestamp(
+                        row["consumed_at"], "additional consumed_at"
+                    ),
+                    latest_boundary_at=_database_timestamp(
+                        row["heartbeat_at"], "additional heartbeat_at"
+                    ),
+                    maximum_action_seconds=int(REFERENCE_RESOURCES["timeout_seconds"]),
+                    expected_completeness_delay_seconds=row[
+                        "billing_completeness_delay_seconds"
+                    ],
+                    validated_at=occurred,
+                )
+            except (
+                KeyError,
+                TypeError,
+                json.JSONDecodeError,
+                ReferenceBootstrapError,
+                ReplacementSettlementError,
+                ValueError,
+            ) as exc:
+                raise DatabaseError("additional settlement evidence validation failed") from exc
+            replay = row["status"] in {"settled", "failed"}
+            if replay and (
+                row["settlement_identity"] != evidence.receipt_sha256
+                or row["provider_actual_cost_usd"] != evidence.actual_cost_usd
+                or row["run_status"] not in TERMINAL_STATES
+            ):
+                raise DatabaseError("additional settlement replay drift")
+            if not replay and row["status"] not in {
+                "submission_pending",
+                "submitted",
+                "settlement_pending",
+                "audit_blocked",
+            }:
+                raise DatabaseError("additional reservation is not settlement-eligible")
+            if not replay and row["run_status"] != "created":
+                raise DatabaseError("additional reservation is not settlement-eligible")
+            execution_status = "unknown"
+            full_context_proven = False
+            if evidence.execution_receipt_sha256 is not None:
+                if remote_receipt_bytes is None or hashlib.sha256(
+                    remote_receipt_bytes
+                ).hexdigest() != evidence.execution_receipt_sha256:
+                    raise DatabaseError("additional execution receipt bytes mismatch")
+                validated_receipt = validate_bootstrap_receipt_bytes(
+                    remote_receipt_bytes, request=request
+                )
+                execution_status = validated_receipt.status
+                full_context_proven = validated_receipt.full_context_usefulness_proven
+                artifact = connection.execute(
+                    """SELECT sha256 FROM artifacts
+                    WHERE run_id = ? AND kind = 'bootstrap_receipt'""",
+                    (row["run_id"],),
+                ).fetchall()
+                if len(artifact) != 1 or artifact[0]["sha256"] != evidence.execution_receipt_sha256:
+                    raise DatabaseError("additional execution receipt is not durably recorded")
+                manifests = connection.execute(
+                    """SELECT sha256 FROM artifacts
+                    WHERE run_id = ? AND kind = 'reference_manifest'""",
+                    (row["run_id"],),
+                ).fetchall()
+                expected_manifest = evidence.execution_manifest_sha256
+                if (expected_manifest is None and manifests) or (
+                    expected_manifest is not None
+                    and (len(manifests) != 1 or manifests[0]["sha256"] != expected_manifest)
+                ):
+                    raise DatabaseError("additional execution manifest lineage drift")
+                if execution_status == "succeeded" and expected_manifest is None:
+                    raise DatabaseError("successful additional execution lacks locked evidence")
+            elif remote_receipt_bytes is not None:
+                raise DatabaseError("unbound additional execution receipt is forbidden")
+            if replay:
+                return evidence.receipt_sha256
+            expected_identity = {
+                "call": row["provider_job_id"],
+                "app": row["app_identity"],
+                "billing_only": None,
+                "workspace_zero_preidentity": None,
+            }[evidence.attribution_mode]
+            if evidence.attribution_mode in {"call", "app"}:
+                if expected_identity is None or expected_identity != evidence.provider_identity:
+                    raise DatabaseError("additional durable provider identity drift")
+            elif row["provider_job_id"] is not None or row["app_identity"] is not None:
+                raise DatabaseError("additional billing-only identity conflicts with durable state")
+            actual = _database_actual_money(evidence.actual_cost_usd, "actual_cost_usd")
+            over_cap = actual > _database_money(row["requested_cost_usd"], "requested_cost_usd")
+            experiment_success = execution_status == "succeeded" and not over_cap
+            failure_reason = None
+            if over_cap:
+                failure_reason = (
+                    "authoritative provider actual cost exceeds the USD 4.00 local reservation; "
+                    "budget failure"
+                )
+            elif execution_status == "failed":
+                failure_reason = "validated reference execution receipt reported failure"
+            elif execution_status == "unknown":
+                failure_reason = "reference provider outcome was not authoritatively established"
+            reservation_status = "failed" if over_cap else "settled"
+            cursor = connection.execute(
+                """UPDATE budget_reservations SET status = ?, provider_job_id =
+                    CASE WHEN ? = 'call' THEN ? ELSE provider_job_id END,
+                    app_identity = CASE WHEN ? IN ('app', 'billing_only') THEN ?
+                        ELSE app_identity END,
+                    provider_actual_cost_usd = ?, settlement_pending_at = ?,
+                    settlement_identity = ?, settlement_mode = ?, failure_reason = ?,
+                    heartbeat_at = ?, updated_at = ?
+                WHERE reservation_id = ? AND status IN (
+                    'submission_pending', 'submitted', 'settlement_pending', 'audit_blocked'
+                )""",
+                (
+                    reservation_status,
+                    evidence.attribution_mode,
+                    evidence.provider_identity,
+                    evidence.attribution_mode,
+                    evidence.provider_identity,
+                    evidence.actual_cost_usd,
+                    evidence.query_end.isoformat(),
+                    evidence.receipt_sha256,
+                    (
+                        "workspace_zero_preidentity"
+                        if evidence.attribution_mode == "workspace_zero_preidentity"
+                        else None
+                    ),
+                    failure_reason,
+                    occurred_at,
+                    occurred_at,
+                    reservation_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise DatabaseError("additional settlement lost its compare-and-set")
+            for from_state, to_state in (
+                ("created", "validated"),
+                ("validated", "running"),
+            ):
+                connection.execute(
+                    "UPDATE experiments SET status = ? WHERE run_id = ? AND status = ?",
+                    (to_state, row["run_id"], from_state),
+                )
+                connection.execute(
+                    """INSERT INTO state_transitions(
+                        run_id, from_state, to_state, reason, occurred_at
+                    ) VALUES (?, ?, ?, NULL, ?)""",
+                    (row["run_id"], from_state, to_state, occurred_at),
+                )
+            terminal = "completed" if experiment_success else "failed"
+            run_cursor = connection.execute(
+                """UPDATE experiments SET status = ?, modal_cost_actual_usd = ?,
+                    failure_reason = ?, ended_at = ? WHERE run_id = ? AND status = 'running'""",
+                (
+                    terminal,
+                    evidence.actual_cost_usd,
+                    failure_reason,
+                    occurred_at,
+                    row["run_id"],
+                ),
+            )
+            if run_cursor.rowcount != 1:
+                raise DatabaseError("additional run settlement lost its compare-and-set")
+            connection.execute(
+                """INSERT INTO state_transitions(
+                    run_id, from_state, to_state, reason, occurred_at
+                ) VALUES (?, 'running', ?, ?, ?)""",
+                (row["run_id"], terminal, failure_reason, occurred_at),
+            )
+            connection.execute(
+                """INSERT INTO metrics(run_id, name, value_json, unit)
+                VALUES (?, 'configured_context_tokens', '262144', 'tokens')""",
+                (row["run_id"],),
+            )
+            if experiment_success and full_context_proven:
+                connection.execute(
+                    """INSERT INTO metrics(run_id, name, value_json, unit)
+                    VALUES (?, 'proven_useful_context_tokens', '262144', 'tokens')""",
+                    (row["run_id"],),
+                )
+            budget_failure = over_cap
+        if budget_failure:
             raise DatabaseError(
                 "authoritative provider cost was recorded as a terminal budget failure"
             )

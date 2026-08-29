@@ -7,7 +7,9 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import signal
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -25,6 +27,12 @@ import yaml
 
 from lowbit_lab.config import SHA256_RE
 from lowbit_lab.constants import (
+    REFERENCE_ADDITIONAL_AUTHORITY_SHA256,
+    REFERENCE_ADDITIONAL_CUMULATIVE_CAP_USD,
+    REFERENCE_ADDITIONAL_INCREMENTAL_CAP_USD,
+    REFERENCE_ADDITIONAL_PRIOR_EXECUTION_SCOPE_SHA256,
+    REFERENCE_ADDITIONAL_PRIOR_SPEND_USD,
+    REFERENCE_ADDITIONAL_SETTLEMENT_RECEIPT_SHA256,
     REFERENCE_AUTHORITY_SHA256,
     REFERENCE_BOOTSTRAP_AUTHORITY_SHA256,
     REFERENCE_BOOTSTRAP_MERGE_COMMIT,
@@ -44,6 +52,7 @@ from lowbit_lab.jsonio import emit
 from lowbit_lab.modal_job import (
     ReferenceJobConfig,
     load_reference_job_config,
+    plan_reference_additional_preview,
     plan_reference_bootstrap_preview,
 )
 from lowbit_lab.provenance import parse_weight_inventory
@@ -58,11 +67,13 @@ from lowbit_lab.provider_evidence import (
     DEFAULT_OUTPUT as PROVIDER_CAPABILITY_PATH,
 )
 from lowbit_lab.reference_authority import (
+    ADDITIONAL_AUTHORITY_PATH,
     RECOVERY_AUTHORITY_PATH,
     WORKSPACE_RECONCILIATION_AUTHORITY_PATH,
     ReferenceAuthorityError,
     build_reference_recovery_authority,
     build_workspace_scope_reconciliation_authority,
+    validate_reference_additional_authority,
     validate_reference_recovery_authority,
     validate_workspace_scope_reconciliation_authority,
 )
@@ -79,6 +90,8 @@ from lowbit_lab.reference_contract import (
     REFERENCE_APP_NAME,
     REFERENCE_REPLACEMENT_AUDIT_REASON,
     REFERENCE_RESOURCES,
+    AdditionalReferenceBinding,
+    additional_reference_binding,
 )
 from lowbit_lab.reference_gates import ReferenceGateError, verify_provider_billing_authority
 from lowbit_lab.reference_provider_auth import (
@@ -86,6 +99,10 @@ from lowbit_lab.reference_provider_auth import (
     auth_receipt_path,
     provider_environment_overrides_present,
     sanitized_modal_environment,
+)
+from lowbit_lab.reference_replacement_settlement import (
+    ADDITIONAL_RECEIPT_KIND,
+    ADDITIONAL_REPORT_KIND,
 )
 from lowbit_lab.reference_replacement_settlement import (
     APP_KIND as REPLACEMENT_APP_KIND,
@@ -113,11 +130,12 @@ from lowbit_lab.runtime import (
     runtime_metadata,
     verify_current_installed_environment,
 )
-from lowbit_lab.safe_files import SafeFileError, atomic_write
+from lowbit_lab.safe_files import SafeFileError, atomic_write, confined_output
 
 _MODAL_APP_ID_RE = re.compile(r"ap-[A-Za-z0-9]{22}")
 CONFIG_PATH = Path("configs/local/reference.yaml")
 REQUEST_PATH = Path("reports/local/u8-bootstrap-request.json")
+ADDITIONAL_REQUEST_PATH = Path("reports/local/u8-additional-bootstrap-request.json")
 IMAGE_LOCK_PATH = Path("configs/local/reference-image-lock.json")
 PUBLICATION_MANIFEST_PATH = Path("configs/local/publication.yaml")
 DATABASE_PATH = Path("results/local/reference.sqlite")
@@ -128,6 +146,20 @@ WORKSPACE_ZERO_RECEIPT_PATH = Path("reports/local/reference-preidentity-zero-rec
 REPLACEMENT_APP_EVIDENCE_PATH = Path("reports/local/reference-replacement-app-evidence.json")
 REPLACEMENT_REPORT_PATH = Path("reports/local/reference-replacement-billing-report.json")
 REPLACEMENT_RECEIPT_PATH = Path("reports/local/reference-replacement-settlement-receipt.json")
+ADDITIONAL_IDENTITY_EVIDENCE_PATH = Path(
+    "reports/local/reference-additional-identity-evidence.json"
+)
+ADDITIONAL_BILLING_REPORT_PATH = Path("reports/local/reference-additional-billing-report.json")
+ADDITIONAL_SETTLEMENT_RECEIPT_PATH = Path(
+    "reports/local/reference-additional-settlement-receipt.json"
+)
+WSL_TRANSFER_MARKER_PATH = Path("reports/local/reference-wsl-ownership-transfer.json")
+WSL_PARITY_RECEIPT_PATH = Path("reports/local/reference-wsl-parity-receipt.json")
+WSL_PARITY_HISTORY_ROOT = Path("reports/local/reference-wsl-parity-history")
+WSL_RETURN_RECEIPT_PATH = Path("reports/local/reference-wsl-return-receipt.json")
+WSL_TRANSFER_HISTORY_ROOT = Path("reports/local/reference-wsl-transfer-history")
+WSL_DATABASE_BACKUP_ROOT = Path("results/local/reference-wsl-transfer-backups")
+U9_PROPOSAL_PATH = Path("reports/local/reference-threshold-proposal.json")
 AUTH_MAXIMUM_AGE_SECONDS = AUTH_RECEIPT_MAXIMUM_AGE_SECONDS
 MAX_LOCAL_EVIDENCE_BYTES = 64 * 1024
 MAX_FILTERED_BILLING_REPORT_BYTES = 1_000_000
@@ -189,6 +221,641 @@ def _write_atomic(root: Path, path: Path, content: bytes) -> None:
         atomic_write(root.resolve(strict=True), path, content, replace=True)
     except SafeFileError as exc:
         raise ReferenceOrchestratorError("orchestration evidence path is unsafe") from exc
+
+
+def _canonical_local_path(path: Path) -> str:
+    """Return the exact local path used only inside ignored ownership evidence."""
+    return path.resolve(strict=True).as_posix()
+
+
+def _database_integrity(path: Path) -> str:
+    """Validate a closed SQLite snapshot without modifying or recovering it."""
+    try:
+        database_uri = f"file:{path.resolve(strict=True).as_posix()}?mode=ro"
+        connection = sqlite3.connect(database_uri, uri=True)
+        try:
+            rows = connection.execute("PRAGMA integrity_check").fetchall()
+        finally:
+            connection.close()
+    except (OSError, sqlite3.Error) as exc:
+        raise ReferenceOrchestratorError("state database integrity is unavailable") from exc
+    if rows != [("ok",)]:
+        raise ReferenceOrchestratorError("state database integrity failed")
+    return "ok"
+
+
+def _database_snapshot_sha256(path: Path) -> str:
+    _database_integrity(path)
+    for suffix in ("-journal", "-shm", "-wal"):
+        if Path(str(path) + suffix).exists():
+            raise ReferenceOrchestratorError("state database has an unsettled sidecar")
+    return _sha(path.read_bytes())
+
+
+def _tracked_tree_sha256(root: Path) -> str:
+    try:
+        completed = subprocess.run(
+            ["git", "ls-files", "-s", "-z"],
+            cwd=root,
+            check=False,
+            capture_output=True,
+            shell=False,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ReferenceOrchestratorError("tracked tree identity is unavailable") from exc
+    if completed.returncode != 0 or not completed.stdout:
+        raise ReferenceOrchestratorError("tracked tree identity is unavailable")
+    return _sha(completed.stdout)
+
+
+def _linux_filesystem_type(path: Path) -> str:
+    """Resolve the longest Linux mount for a path without invoking a shell."""
+    try:
+        resolved = path.resolve(strict=True).as_posix()
+        lines = Path("/proc/self/mountinfo").read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        raise ReferenceOrchestratorError("WSL filesystem identity is unavailable") from exc
+    matches: list[tuple[int, str]] = []
+    for line in lines:
+        before, separator, after = line.partition(" - ")
+        if not separator:
+            continue
+        fields = before.split()
+        after_fields = after.split()
+        if len(fields) < 5 or not after_fields:
+            continue
+        mount = fields[4].replace("\\040", " ").replace("\\134", "\\")
+        if resolved == mount or resolved.startswith(mount.rstrip("/") + "/"):
+            matches.append((len(mount), after_fields[0]))
+    if not matches:
+        raise ReferenceOrchestratorError("WSL filesystem identity is unavailable")
+    return max(matches)[1]
+
+
+def _require_wsl_ext4_root(root: Path) -> None:
+    try:
+        release = Path("/proc/sys/kernel/osrelease").read_text(encoding="ascii").lower()
+    except OSError as exc:
+        raise ReferenceOrchestratorError("paid state owner must be WSL2 ext4") from exc
+    if (
+        sys.platform != "linux"
+        or "microsoft" not in release
+        or _linux_filesystem_type(root) != "ext4"
+    ):
+        raise ReferenceOrchestratorError("paid state owner must be WSL2 ext4")
+
+
+def _read_transfer_marker(durable_root: Path) -> tuple[Mapping[str, object], bytes]:
+    marker, marker_bytes = _read_json_bytes(
+        durable_root / WSL_TRANSFER_MARKER_PATH, "WSL ownership transfer marker"
+    )
+    expected = {
+        "database_sha256",
+        "database_size_bytes",
+        "kind",
+        "schema_version",
+        "transfer_id",
+        "wsl_mirror_path",
+        "wsl_mirror_path_sha256",
+    }
+    mirror = marker.get("wsl_mirror_path")
+    try:
+        transfer_id = str(uuid.UUID(str(marker.get("transfer_id"))))
+    except ValueError:
+        transfer_id = ""
+    if (
+        set(marker) != expected
+        or marker.get("kind") != "reference_wsl_ownership_transfer"
+        or marker.get("schema_version") != 1
+        or marker.get("transfer_id") != transfer_id
+        or not isinstance(marker.get("database_size_bytes"), int)
+        or not isinstance(mirror, str)
+        or SHA256_RE.fullmatch(str(marker.get("database_sha256"))) is None
+        or _sha(mirror.encode("utf-8")) != marker.get("wsl_mirror_path_sha256")
+        or canonical_bytes(marker) != marker_bytes
+    ):
+        raise ReferenceOrchestratorError("WSL ownership transfer marker schema drift")
+    return marker, marker_bytes
+
+
+def _reject_active_wsl_transfer(durable_root: Path) -> None:
+    if (durable_root.resolve() / WSL_TRANSFER_MARKER_PATH).exists():
+        # Validate before reporting it as active so corrupt state never becomes an override.
+        _read_transfer_marker(durable_root.resolve())
+        raise ReferenceOrchestratorError("WSL owns the active reference state")
+
+
+def _copy_database_atomic(source: Path, destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(destination.name + ".transfer-tmp")
+    if temporary.exists():
+        temporary.unlink()
+    try:
+        shutil.copy2(source, temporary)
+        if _database_snapshot_sha256(temporary) != _database_snapshot_sha256(source):
+            raise ReferenceOrchestratorError("transferred database hash mismatch")
+        os.replace(temporary, destination)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def begin_wsl_state_transfer(durable_root: Path, wsl_root: Path) -> Mapping[str, object]:
+    """Mark Windows state as WSL-owned, then import it recoverably into ext4."""
+    durable_root = durable_root.resolve(strict=True)
+    wsl_root = wsl_root.resolve(strict=True)
+    _require_wsl_ext4_root(wsl_root)
+    if durable_root == wsl_root:
+        raise ReferenceOrchestratorError("durable and WSL roots must be distinct")
+    source = confine_results_db(durable_root, DATABASE_PATH)
+    source_sha256 = _database_snapshot_sha256(source)
+    mirror = _canonical_local_path(wsl_root)
+    marker_path = durable_root / WSL_TRANSFER_MARKER_PATH
+    if marker_path.exists():
+        marker, marker_bytes = _read_transfer_marker(durable_root)
+        if (
+            marker["wsl_mirror_path"] != mirror
+            or marker["database_sha256"] != source_sha256
+            or marker["database_size_bytes"] != source.stat().st_size
+        ):
+            raise ReferenceOrchestratorError("active WSL state owner mismatch")
+        parity_paths = [wsl_root / WSL_PARITY_RECEIPT_PATH]
+        parity_root = wsl_root / WSL_PARITY_HISTORY_ROOT
+        if parity_root.exists():
+            parity_paths.extend(sorted(parity_root.glob("*.json")))
+        if any(path.exists() for path in parity_paths):
+            raise ReferenceOrchestratorError("WSL owns the active reference state")
+        destination = confine_results_db(wsl_root, DATABASE_PATH)
+        if destination.exists() and _database_snapshot_sha256(destination) != source_sha256:
+            backup = confined_output(
+                wsl_root,
+                WSL_DATABASE_BACKUP_ROOT / f"{marker['transfer_id']}.sqlite",
+            )
+            if not backup.exists():
+                _copy_database_atomic(destination, backup)
+            else:
+                _database_snapshot_sha256(backup)
+        _copy_database_atomic(source, destination)
+        if destination.stat().st_size != marker["database_size_bytes"]:
+            raise ReferenceOrchestratorError("imported WSL database size mismatch")
+        return {
+            "database_sha256": source_sha256,
+            "marker_sha256": _sha(marker_bytes),
+            "provider_contacted": False,
+            "resumed": True,
+            "transfer_id": marker["transfer_id"],
+            "wsl_mirror_path_sha256": marker["wsl_mirror_path_sha256"],
+        }
+    transfer_id = str(uuid.uuid4())
+    marker = {
+        "database_sha256": source_sha256,
+        "database_size_bytes": source.stat().st_size,
+        "kind": "reference_wsl_ownership_transfer",
+        "schema_version": 1,
+        "transfer_id": transfer_id,
+        "wsl_mirror_path": mirror,
+        "wsl_mirror_path_sha256": _sha(mirror.encode("utf-8")),
+    }
+    marker_bytes = canonical_bytes(marker)
+    try:
+        atomic_write(durable_root, WSL_TRANSFER_MARKER_PATH, marker_bytes, replace=False)
+    except SafeFileError as exc:
+        raise ReferenceOrchestratorError("WSL ownership transfer marker raced") from exc
+
+    destination = confine_results_db(wsl_root, DATABASE_PATH)
+    if destination.exists():
+        backup = confined_output(wsl_root, WSL_DATABASE_BACKUP_ROOT / f"{transfer_id}.sqlite")
+        _copy_database_atomic(destination, backup)
+    _copy_database_atomic(source, destination)
+    if destination.stat().st_size != marker["database_size_bytes"]:
+        raise ReferenceOrchestratorError("imported WSL database size mismatch")
+    return {
+        "database_sha256": source_sha256,
+        "marker_sha256": _sha(marker_bytes),
+        "provider_contacted": False,
+        "resumed": False,
+        "transfer_id": transfer_id,
+        "wsl_mirror_path_sha256": marker["wsl_mirror_path_sha256"],
+    }
+
+
+def _validate_wsl_reparity_state(root: Path) -> None:
+    """Allow a new parity generation only after contact-free released attempts."""
+    database = ResultsDatabase(confine_results_db(root, DATABASE_PATH))
+    with database.connect_readonly() as connection:
+        grant = connection.execute(
+            """SELECT state, active_reservation_id, active_execution_scope_sha256,
+                consumed_at, consumed_auth_receipt_sha256
+            FROM reference_additional_grants WHERE singleton = 1"""
+        ).fetchone()
+        rows = connection.execute(
+            """SELECT br.status, br.provider_job_id, br.app_identity, br.submitted_at,
+                br.provider_actual_cost_usd
+            FROM budget_reservations AS br
+            JOIN experiments AS e ON e.run_id = br.run_id
+            WHERE json_extract(e.config_json, '$.action') =
+                  'u8_reference_additional_once'"""
+        ).fetchall()
+    if (
+        grant is None
+        or grant["state"] != "available"
+        or grant["active_reservation_id"] is not None
+        or grant["active_execution_scope_sha256"] is not None
+        or grant["consumed_at"] is not None
+        or grant["consumed_auth_receipt_sha256"] is not None
+        or not rows
+        or any(
+            row["status"] != "released"
+            or row["provider_job_id"] is not None
+            or row["app_identity"] is not None
+            or row["submitted_at"] is not None
+            or row["provider_actual_cost_usd"] is not None
+            for row in rows
+        )
+    ):
+        raise ReferenceOrchestratorError(
+            "fresh WSL parity requires released contact-free attempts and available grant"
+        )
+
+
+def record_wsl_execution_parity(
+    root: Path,
+    durable_root: Path,
+    *,
+    config: ReferenceJobConfig,
+    request_bytes: bytes,
+    serialized_payload: bytes,
+    serialized_payload_confirmation: bytes,
+) -> Mapping[str, object]:
+    """Bind every paid execution input to the named ext4 state owner."""
+    root = root.resolve(strict=True)
+    durable_root = durable_root.resolve(strict=True)
+    _require_wsl_ext4_root(root)
+    marker, marker_bytes = _read_transfer_marker(durable_root)
+    mirror = _canonical_local_path(root)
+    if marker["wsl_mirror_path"] != mirror:
+        raise ReferenceOrchestratorError("active WSL state owner mismatch")
+    database_sha256 = _database_snapshot_sha256(root / DATABASE_PATH)
+    if database_sha256 != marker["database_sha256"]:
+        _validate_wsl_reparity_state(root)
+    elif (root / DATABASE_PATH).stat().st_size != marker["database_size_bytes"]:
+        raise ReferenceOrchestratorError("imported WSL database lineage drift")
+    if serialized_payload != serialized_payload_confirmation:
+        raise ReferenceOrchestratorError("serialized payload reproduction drift")
+    if not serialized_payload or len(serialized_payload) > (64 << 10):
+        raise ReferenceOrchestratorError("serialized payload exceeds provider envelope")
+    head = _require_merged_clean_main(root)
+    execution_scope_sha256 = config.reference_execution_scope_sha256
+    if (
+        head != config.inputs["reviewed_commit_sha256"]
+        or not isinstance(execution_scope_sha256, str)
+        or SHA256_RE.fullmatch(execution_scope_sha256) is None
+    ):
+        raise ReferenceOrchestratorError("reviewed WSL execution lineage drift")
+    authority_sha256 = validate_reference_additional_authority(root, ADDITIONAL_AUTHORITY_PATH)
+    if authority_sha256 != REFERENCE_ADDITIONAL_AUTHORITY_SHA256:
+        raise ReferenceOrchestratorError("additional authority lineage drift")
+    validate_reproduced_request(root, config, request_bytes, additional=True)
+    auth_value, auth_bytes = _read_json_bytes(root / AUTH_RECEIPT_PATH, "workspace auth receipt")
+    auth_binding, auth_binding_bytes = _read_json_bytes(
+        root / AUTH_BINDING_PATH, "workspace auth binding"
+    )
+    expected_scope = _configured_workspace_scope(root)
+    expected_workspace = auth_binding.get("authenticated_workspace_identity_sha256")
+    expected_auth_binding_fields = {
+        "authenticated_workspace_identity_sha256",
+        "kind",
+        "original_workspace_scope_sha256",
+        "provider",
+        "reconciliation_authority_sha256",
+        "schema_version",
+    }
+    if (
+        set(auth_binding) != expected_auth_binding_fields
+        or canonical_bytes(auth_binding) != auth_binding_bytes
+        or canonical_bytes(auth_value) != auth_bytes
+        or not isinstance(expected_workspace, str)
+    ):
+        raise ReferenceOrchestratorError("workspace auth binding schema drift")
+    reconciliation = validate_workspace_scope_reconciliation_authority(root)
+    if (
+        auth_binding.get("original_workspace_scope_sha256") != expected_scope
+        or auth_value.get("binding_sha256") != _sha(canonical_bytes(auth_binding))
+        or reconciliation.get("original_workspace_scope_sha256") != expected_scope
+        or reconciliation.get("authenticated_workspace_identity_sha256") != expected_workspace
+    ):
+        raise ReferenceOrchestratorError("workspace auth binding lineage drift")
+    _validate_fresh_auth_receipt(
+        root,
+        expected_original_workspace_scope_sha256=expected_scope,
+        expected_authenticated_workspace_identity_sha256=expected_workspace,
+    )
+    provider_value, provider_bytes = _read_json_bytes(
+        root / PROVIDER_CAPABILITY_PATH, "provider capability receipt"
+    )
+    validated_provider = _validated_provider_capability(root, request_bytes)
+    sdk_version = provider_value.get("sdk_version")
+    if sdk_version != validated_provider.get("sdk_version") or not isinstance(sdk_version, str):
+        raise ReferenceOrchestratorError("provider SDK identity is unavailable")
+    authority_files = config.authority_files
+    evaluation_path = root / str(authority_files["evaluation_lock_path"])
+    provenance_path = root / str(authority_files["provenance_manifest_path"])
+    runtime_path = root / str(authority_files["runtime_receipt_path"])
+    provenance_value = _read_json(provenance_path, "provenance manifest")
+    provenance_sha256 = _manifest_identity(provenance_value)
+    evaluation_sha256 = _sha(evaluation_path.read_bytes())
+    runtime_sha256 = _sha(runtime_path.read_bytes())
+    if (
+        provenance_sha256 != config.inputs["provenance_manifest_sha256"]
+        or evaluation_sha256 != config.inputs["evaluation_lock_sha256"]
+        or runtime_sha256 != config.inputs["runtime_receipt_sha256"]
+    ):
+        raise ReferenceOrchestratorError("WSL execution input identity drift")
+    receipt = {
+        "additional_authority_sha256": authority_sha256,
+        "config_challenge_sha256": config.challenge_sha256,
+        "config_sha256": config.sha256,
+        "database_integrity": "ok",
+        "database_sha256": database_sha256,
+        "evaluation_lock_sha256": evaluation_sha256,
+        "execution_scope_sha256": execution_scope_sha256,
+        "git_head": head,
+        "git_tracked_tree_sha256": _tracked_tree_sha256(root),
+        "kind": "reference_wsl_execution_parity_receipt",
+        "marker_sha256": _sha(marker_bytes),
+        "provenance_manifest_sha256": provenance_sha256,
+        "provider_auth_receipt_sha256": _sha(auth_bytes),
+        "provider_auth_binding_sha256": _sha(auth_binding_bytes),
+        "provider_capability_receipt_sha256": _sha(provider_bytes),
+        "provider_sdk_version": sdk_version,
+        "request_sha256": _sha(request_bytes),
+        "reviewed_commit_sha256": head,
+        "runtime_receipt_sha256": runtime_sha256,
+        "schema_version": 1,
+        "serialized_payload_sha256": _sha(serialized_payload),
+        "serialized_payload_size_bytes": len(serialized_payload),
+        "transfer_id": marker["transfer_id"],
+        "wsl_mirror_path_sha256": marker["wsl_mirror_path_sha256"],
+    }
+    # Ensure the authentication receipt is the closed, sanitized schema rather than arbitrary bytes.
+    if auth_value.get("kind") != "reference_modal_workspace_auth_receipt":
+        raise ReferenceOrchestratorError("workspace auth receipt schema drift")
+    encoded = canonical_bytes(receipt)
+    generation_path = WSL_PARITY_HISTORY_ROOT / f"{_sha(encoded)}.json"
+    output = root / generation_path
+    if output.exists() and output.read_bytes() != encoded:
+        raise ReferenceOrchestratorError("WSL parity generation collision")
+    if not output.exists():
+        try:
+            atomic_write(root, generation_path, encoded, replace=False)
+        except SafeFileError as exc:
+            raise ReferenceOrchestratorError("WSL parity receipt raced") from exc
+    legacy = root / WSL_PARITY_RECEIPT_PATH
+    if not legacy.exists():
+        try:
+            atomic_write(root, WSL_PARITY_RECEIPT_PATH, encoded, replace=False)
+        except SafeFileError as exc:
+            raise ReferenceOrchestratorError("WSL parity receipt raced") from exc
+    return {**receipt, "parity_receipt_sha256": _sha(encoded), "provider_contacted": False}
+
+
+def return_wsl_state(durable_root: Path, wsl_root: Path) -> Mapping[str, object]:
+    """Return terminal WSL state and archive, rather than erase, ownership evidence."""
+    durable_root = durable_root.resolve(strict=True)
+    wsl_root = wsl_root.resolve(strict=True)
+    _require_wsl_ext4_root(wsl_root)
+    marker, marker_bytes = _read_transfer_marker(durable_root)
+    if marker["wsl_mirror_path"] != _canonical_local_path(wsl_root):
+        raise ReferenceOrchestratorError("active WSL state owner mismatch")
+    state = reference_status(wsl_root)["additional"]
+    scope = state.get("execution_scope_sha256") if isinstance(state, Mapping) else None
+    parity_candidates = [wsl_root / WSL_PARITY_RECEIPT_PATH]
+    parity_root = wsl_root / WSL_PARITY_HISTORY_ROOT
+    if parity_root.exists():
+        parity_candidates.extend(sorted(parity_root.glob("*.json")))
+    matches: list[tuple[Mapping[str, object], bytes]] = []
+    for path in parity_candidates:
+        if not path.exists():
+            continue
+        candidate, candidate_bytes = _read_json_bytes(path, "WSL parity receipt")
+        if (
+            candidate.get("marker_sha256") == _sha(marker_bytes)
+            and candidate.get("transfer_id") == marker["transfer_id"]
+            and (scope is None or candidate.get("execution_scope_sha256") == scope)
+            and all(candidate_bytes != existing[1] for existing in matches)
+        ):
+            matches.append((candidate, candidate_bytes))
+    if len(matches) != 1:
+        raise ReferenceOrchestratorError("unique WSL parity generation is unavailable")
+    parity, parity_bytes = matches[0]
+    if (
+        parity.get("marker_sha256") != _sha(marker_bytes)
+        or parity.get("transfer_id") != marker["transfer_id"]
+    ):
+        raise ReferenceOrchestratorError("WSL parity receipt lineage drift")
+    if not isinstance(state, Mapping) or state.get("state") not in {
+        "settled-success",
+        "settled-failure",
+    }:
+        raise ReferenceOrchestratorError("WSL state is not terminal")
+    _copy_terminal_wsl_evidence(
+        durable_root,
+        wsl_root,
+        execution_scope_sha256=str(scope),
+        parity_bytes=parity_bytes,
+    )
+    source = confine_results_db(wsl_root, DATABASE_PATH)
+    source_sha256 = _database_snapshot_sha256(source)
+    destination = confine_results_db(durable_root, DATABASE_PATH)
+    transfer_id = str(marker["transfer_id"])
+    backup = confined_output(durable_root, WSL_DATABASE_BACKUP_ROOT / f"{transfer_id}.sqlite")
+    if not backup.exists():
+        _copy_database_atomic(destination, backup)
+    else:
+        _database_snapshot_sha256(backup)
+    _copy_database_atomic(source, destination)
+    destination_sha256 = _database_snapshot_sha256(destination)
+    if destination_sha256 != source_sha256:
+        raise ReferenceOrchestratorError("returned durable database hash mismatch")
+    receipt = {
+        "database_sha256": source_sha256,
+        "kind": "reference_wsl_state_return_receipt",
+        "marker_sha256": _sha(marker_bytes),
+        "parity_receipt_sha256": _sha(parity_bytes),
+        "schema_version": 1,
+        "terminal_state": state["state"],
+        "transfer_id": transfer_id,
+    }
+    receipt_bytes = canonical_bytes(receipt)
+    receipt_path = durable_root / WSL_RETURN_RECEIPT_PATH
+    if receipt_path.exists() and receipt_path.read_bytes() != receipt_bytes:
+        raise ReferenceOrchestratorError("WSL return receipt is immutable")
+    if not receipt_path.exists():
+        try:
+            atomic_write(durable_root, WSL_RETURN_RECEIPT_PATH, receipt_bytes, replace=False)
+        except SafeFileError as exc:
+            raise ReferenceOrchestratorError("WSL return receipt raced") from exc
+    history = confined_output(durable_root, WSL_TRANSFER_HISTORY_ROOT / f"{transfer_id}.json")
+    history.parent.mkdir(parents=True, exist_ok=True)
+    marker_path = durable_root / WSL_TRANSFER_MARKER_PATH
+    if history.exists() and history.read_bytes() != marker_bytes:
+        raise ReferenceOrchestratorError("WSL transfer history collision")
+    os.replace(marker_path, history)
+    return {**receipt, "provider_contacted": False, "return_receipt_sha256": _sha(receipt_bytes)}
+
+
+def _copy_verified_return_file(
+    durable_root: Path,
+    wsl_root: Path,
+    relative: Path,
+    *,
+    expected_sha256: str,
+    label: str,
+) -> bytes:
+    """Copy one hash-bound ignored artifact without replacing durable evidence."""
+    if (
+        relative.is_absolute()
+        or ".." in relative.parts
+        or SHA256_RE.fullmatch(expected_sha256) is None
+    ):
+        raise ReferenceOrchestratorError(f"{label} return binding is invalid")
+    content = _read_bounded(
+        wsl_root / relative,
+        maximum_bytes=MAX_LOCAL_EVIDENCE_BYTES,
+        label=label,
+    )
+    if _sha(content) != expected_sha256:
+        raise ReferenceOrchestratorError(f"{label} return hash mismatch")
+    destination = durable_root / relative
+    if destination.exists():
+        if destination.read_bytes() != content:
+            raise ReferenceOrchestratorError(f"{label} durable collision")
+    else:
+        try:
+            atomic_write(durable_root, relative, content, replace=False)
+        except SafeFileError as exc:
+            raise ReferenceOrchestratorError(f"{label} return path is unsafe") from exc
+    return content
+
+
+def _unique_hash_bound_evidence(
+    root: Path, pattern: str, expected_sha256: str, label: str
+) -> Path:
+    matches = []
+    for path in sorted((root / "reports/local").glob(pattern)):
+        content = _read_bounded(
+            path,
+            maximum_bytes=MAX_LOCAL_EVIDENCE_BYTES,
+            label=label,
+        )
+        if _sha(content) == expected_sha256:
+            matches.append(path)
+    if len(matches) != 1:
+        raise ReferenceOrchestratorError(f"unique {label} is unavailable")
+    return matches[0].relative_to(root)
+
+
+def _copy_terminal_wsl_evidence(
+    durable_root: Path,
+    wsl_root: Path,
+    *,
+    execution_scope_sha256: str,
+    parity_bytes: bytes,
+) -> None:
+    """Return the closed evidence chain required to audit settlement and compile U9."""
+    receipt_bytes = _read_bounded(
+        wsl_root / ADDITIONAL_SETTLEMENT_RECEIPT_PATH,
+        maximum_bytes=MAX_LOCAL_EVIDENCE_BYTES,
+        label="additional settlement receipt",
+    )
+    try:
+        receipt = json.loads(receipt_bytes)
+        if not isinstance(receipt, Mapping) or canonical_bytes(receipt) != receipt_bytes:
+            raise TypeError
+        if (
+            receipt["kind"] != ADDITIONAL_RECEIPT_KIND
+            or receipt["schema_version"] != 1
+            or receipt["additional_authority_sha256"] != REFERENCE_ADDITIONAL_AUTHORITY_SHA256
+            or receipt["execution_scope_sha256"] != execution_scope_sha256
+        ):
+            raise TypeError
+    except (KeyError, TypeError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ReferenceOrchestratorError("additional return receipt is invalid") from exc
+
+    fixed = (
+        (
+            ADDITIONAL_SETTLEMENT_RECEIPT_PATH,
+            _sha(receipt_bytes),
+            "additional settlement receipt",
+        ),
+        (
+            ADDITIONAL_IDENTITY_EVIDENCE_PATH,
+            str(receipt["identity_evidence_sha256"]),
+            "additional identity evidence",
+        ),
+        (
+            ADDITIONAL_BILLING_REPORT_PATH,
+            str(receipt["filtered_report_sha256"]),
+            "additional billing report",
+        ),
+        (
+            auth_receipt_path(str(receipt["pre_auth_receipt_sha256"])),
+            str(receipt["pre_auth_receipt_sha256"]),
+            "additional pre-auth receipt",
+        ),
+        (
+            auth_receipt_path(str(receipt["post_auth_receipt_sha256"])),
+            str(receipt["post_auth_receipt_sha256"]),
+            "additional post-auth receipt",
+        ),
+    )
+    for relative, digest, label in fixed:
+        _copy_verified_return_file(
+            durable_root,
+            wsl_root,
+            relative,
+            expected_sha256=digest,
+            label=label,
+        )
+
+    try:
+        parity = json.loads(parity_bytes)
+        request_sha256 = str(parity["request_sha256"])
+    except (KeyError, TypeError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ReferenceOrchestratorError("WSL parity request binding is invalid") from exc
+    _copy_verified_return_file(
+        durable_root,
+        wsl_root,
+        ADDITIONAL_REQUEST_PATH,
+        expected_sha256=request_sha256,
+        label="additional bootstrap request",
+    )
+    parity_sha256 = _sha(parity_bytes)
+    _copy_verified_return_file(
+        durable_root,
+        wsl_root,
+        WSL_PARITY_HISTORY_ROOT / f"{parity_sha256}.json",
+        expected_sha256=parity_sha256,
+        label="WSL parity generation",
+    )
+    for field, pattern, label in (
+        ("execution_receipt_sha256", "u8-bootstrap-receipt-*.json", "execution receipt"),
+        ("execution_manifest_sha256", "u8-reference-manifest-*.json", "execution manifest"),
+    ):
+        digest = receipt[field]
+        if digest is None:
+            continue
+        if not isinstance(digest, str) or SHA256_RE.fullmatch(digest) is None:
+            raise ReferenceOrchestratorError(f"{label} return binding is invalid")
+        relative = _unique_hash_bound_evidence(wsl_root, pattern, digest, label)
+        _copy_verified_return_file(
+            durable_root,
+            wsl_root,
+            relative,
+            expected_sha256=digest,
+            label=label,
+        )
 
 
 def _utc(value: str, label: str) -> datetime:
@@ -328,18 +995,23 @@ _VALIDATED_MODAL_CLI_SCRIPT = (
     "from modal.__main__ import main;main()"
 )
 _ACTIVE_WORKSPACE_DIGEST_SCRIPT = (
-    "import asyncio,hashlib;"
-    "from modal.config import DEFAULT_SERVER_URL,_check_config,_lookup_workspace,_profile,config;"
-    "_check_config();"
-    "server=config.get('server_url',profile=_profile,use_env=False);"
-    "headers=config.get('override_headers',profile=_profile,use_env=False);"
+    "import asyncio,hashlib\n"
+    "from modal.client import _Client\n"
+    "from modal.config import DEFAULT_SERVER_URL,_check_config,_profile,config\n"
+    "from modal_proto.api_pb2 import Empty\n"
+    "_check_config()\n"
+    "server=config.get('server_url',profile=_profile,use_env=False)\n"
+    "headers=config.get('override_headers',profile=_profile,use_env=False)\n"
     "ok=(DEFAULT_SERVER_URL==" + repr(OFFICIAL_MODAL_SERVER_URL) + " and "
-    "server==DEFAULT_SERVER_URL and headers in (None,{}));"
-    "ok or (_ for _ in ()).throw(RuntimeError('unsupported provider transport'));"
-    "token_id=config.get('token_id',profile=_profile,use_env=False);"
-    "token_secret=config.get('token_secret',profile=_profile,use_env=False);"
-    "response=asyncio.run(_lookup_workspace(server,token_id,token_secret));"
-    "print(hashlib.sha256(response.username.encode('utf-8')).hexdigest())"
+    "server==DEFAULT_SERVER_URL and headers in (None,{}))\n"
+    "ok or (_ for _ in ()).throw(RuntimeError('unsupported provider transport'))\n"
+    "async def probe():\n"
+    "    client=await _Client.from_env()\n"
+    "    (client.server_url==DEFAULT_SERVER_URL) or "
+    "(_ for _ in ()).throw(RuntimeError('unsupported provider client'))\n"
+    "    return await client.stub.WorkspaceNameLookup(Empty(),retry=None,timeout=3)\n"
+    "response=asyncio.run(probe())\n"
+    "print(hashlib.sha256(response.username.encode('utf-8')).hexdigest())\n"
 )
 
 
@@ -580,9 +1252,7 @@ def materialize_workspace_reconciliation_authority(
             atomic_write(root, WORKSPACE_RECONCILIATION_AUTHORITY_PATH, encoded, replace=False)
         validated = validate_workspace_scope_reconciliation_authority(root)
     except (OSError, SafeFileError, ReferenceAuthorityError) as exc:
-        raise ReferenceOrchestratorError(
-            "workspace reconciliation authority is invalid"
-        ) from exc
+        raise ReferenceOrchestratorError("workspace reconciliation authority is invalid") from exc
     return {
         "authenticated_workspace_identity_sha256": str(
             validated["authenticated_workspace_identity_sha256"]
@@ -810,9 +1480,7 @@ def _provider_json(raw: bytes, label: str) -> list[Mapping[str, object]]:
     return value
 
 
-def _validated_provider_capability(
-    root: Path, request_bytes: bytes
-) -> Mapping[str, object]:
+def _validated_provider_capability(root: Path, request_bytes: bytes) -> Mapping[str, object]:
     """Reproduce provider evidence bound to one canonical bootstrap request."""
     validated_request = validate_bootstrap_request_bytes(request_bytes)
     request = json.loads(validated_request.canonical_json)
@@ -888,13 +1556,9 @@ def capture_replacement_billing(
     ):
         raise ReferenceOrchestratorError("billing authority lineage drift")
     pre_auth = verify_workspace_auth(root, runner=runner, write_latest=False)
-    app_raw = _run_modal_cli(
-        ["app", "list", "--env", environment, "--json"], runner=runner
-    )
+    app_raw = _run_modal_cli(["app", "list", "--env", environment, "--json"], runner=runner)
     app_rows = _provider_json(app_raw, "provider app list")
-    target_app_rows = [
-        item for item in app_rows if item.get("description") == REFERENCE_APP_NAME
-    ]
+    target_app_rows = [item for item in app_rows if item.get("description") == REFERENCE_APP_NAME]
     candidates = [
         item
         for item in target_app_rows
@@ -1018,9 +1682,7 @@ def capture_replacement_billing(
                 "authenticated_workspace_identity_sha256"
             ],
             "auth_binding_sha256": row["auth_binding_sha256"],
-            "authoritative_report_identity_sha256": row[
-                "authoritative_report_identity_sha256"
-            ],
+            "authoritative_report_identity_sha256": row["authoritative_report_identity_sha256"],
             "billing_authority_sha256": row["billing_authority_sha256"],
             "billing_method_sha256": authority["attribution_method_sha256"],
             "completeness_delay_seconds": delay,
@@ -1105,6 +1767,402 @@ def settle_replacement_billing(root: Path) -> Mapping[str, object]:
     }
 
 
+def _additional_audit_row(database: ResultsDatabase) -> Mapping[str, Any]:
+    with database.connect_readonly() as connection:
+        rows = connection.execute(
+            """SELECT br.reservation_id, br.run_id,
+                br.reference_execution_scope_sha256, br.billing_authority_sha256,
+                br.authoritative_report_identity_sha256,
+                br.billing_completeness_delay_seconds, br.heartbeat_at,
+                br.provider_job_id, br.app_identity, rag.authority_sha256,
+                rag.consumed_at, rps.auth_binding_sha256,
+                rws.original_workspace_scope_sha256,
+                rws.authenticated_workspace_identity_sha256
+            FROM budget_reservations AS br
+            JOIN reference_additional_grants AS rag
+              ON rag.active_reservation_id = br.reservation_id
+            JOIN budget_reservations AS prior
+              ON prior.settlement_identity = rag.prior_settlement_receipt_sha256
+            JOIN reference_replacement_entitlements AS rre
+              ON rre.replacement_reservation_id = prior.reservation_id
+            JOIN reference_preidentity_settlements AS rps
+              ON rps.settlement_sha256 = rre.settlement_sha256
+            JOIN reference_workspace_scope_reconciliations AS rws
+              ON rws.authority_sha256 = rre.workspace_reconciliation_authority_sha256
+            WHERE rag.singleton = 1 AND rag.state = 'consumed'
+              AND br.status IN ('submission_pending', 'submitted',
+                                'settlement_pending', 'audit_blocked') LIMIT 2"""
+        ).fetchall()
+        if len(rows) != 1:
+            raise ReferenceOrchestratorError("unique additional audit reservation is unavailable")
+        row = dict(rows[0])
+        artifacts = connection.execute(
+            """SELECT kind, sha256 FROM artifacts WHERE run_id = ?
+               AND kind IN ('bootstrap_receipt', 'reference_manifest')""",
+            (row["run_id"],),
+        ).fetchall()
+    by_kind: dict[str, list[str]] = {}
+    for artifact in artifacts:
+        by_kind.setdefault(str(artifact["kind"]), []).append(str(artifact["sha256"]))
+    if any(len(values) != 1 for values in by_kind.values()):
+        raise ReferenceOrchestratorError("additional execution evidence is ambiguous")
+    row["execution_receipt_sha256"] = next(iter(by_kind.get("bootstrap_receipt", [])), None)
+    row["execution_manifest_sha256"] = next(iter(by_kind.get("reference_manifest", [])), None)
+    return row
+
+
+def capture_additional_billing(
+    root: Path,
+    *,
+    query_start: str,
+    query_end: str,
+    runner: Any | None = None,
+) -> Mapping[str, object]:
+    """Capture one closed settlement packet for the consumed additional action."""
+    root = root.resolve()
+    _require_merged_clean_main(root)
+    if provider_environment_overrides_present():
+        raise ReferenceOrchestratorError("ambient provider environment override is forbidden")
+    start = _utc(query_start, "query start")
+    end = _utc(query_end, "query end")
+    if (
+        start >= end
+        or any((start.minute, start.second, start.microsecond))
+        or any((end.minute, end.second, end.microsecond))
+    ):
+        raise ReferenceOrchestratorError("billing interval must contain complete UTC hours")
+    database = ResultsDatabase(confine_results_db(root, DATABASE_PATH))
+    row = _additional_audit_row(database)
+    consumed = _utc(str(row["consumed_at"]), "additional consumed_at")
+    latest = _utc(str(row["heartbeat_at"]), "additional heartbeat_at")
+    delay = int(row["billing_completeness_delay_seconds"])
+    if (
+        start > consumed
+        or end < latest + timedelta(seconds=int(REFERENCE_RESOURCES["timeout_seconds"]))
+        or datetime.now(UTC) < end + timedelta(seconds=delay)
+    ):
+        raise ReferenceOrchestratorError("additional billing interval is incomplete")
+    config = load_reference_job_config(root / CONFIG_PATH, root=root)
+    request_bytes = _read_bounded(
+        root / ADDITIONAL_REQUEST_PATH,
+        maximum_bytes=MAX_LOCAL_EVIDENCE_BYTES,
+        label="additional bootstrap request",
+    )
+    provider = _validated_provider_capability(root, request_bytes)
+    environment = str(provider["provider_environment"])
+    environment_scope_sha256 = str(config.provider["environment_scope_sha256"])
+    try:
+        authority = verify_provider_billing_authority(
+            root / DEFAULT_BILLING_AUTHORITY,
+            expected_sha256=str(row["billing_authority_sha256"]),
+            expected_environment_scope_sha256=environment_scope_sha256,
+        )
+    except ReferenceGateError as exc:
+        raise ReferenceOrchestratorError("billing authority lineage drift") from exc
+    if (
+        authority["authoritative_report_identity_sha256"]
+        != row["authoritative_report_identity_sha256"]
+        or authority["billing_completeness_delay_seconds"] != delay
+        or row["authority_sha256"] != REFERENCE_ADDITIONAL_AUTHORITY_SHA256
+    ):
+        raise ReferenceOrchestratorError("additional billing lineage drift")
+
+    pre_auth = verify_workspace_auth(root, runner=runner, write_latest=False)
+    captured_at = datetime.now(UTC).isoformat()
+    billing_raw = _run_modal_cli(
+        [
+            "billing",
+            "report",
+            "--start",
+            start.isoformat().replace("+00:00", "Z"),
+            "--end",
+            end.isoformat().replace("+00:00", "Z"),
+            "--resolution",
+            "h",
+            "--show-resources",
+            "--json",
+        ],
+        runner=runner,
+    )
+    billing_rows = _provider_json(billing_raw, "provider billing report")
+    durable_call = row["provider_job_id"]
+    durable_app = row["app_identity"]
+    target_rows: list[dict[str, object]] = []
+    total = Decimal("0")
+    for item in billing_rows:
+        if set(item) != REPORT_FIELDS:
+            raise ReferenceOrchestratorError("additional billing report schema drift")
+        if type(item["cost"]) is not str or type(item["interval_start"]) is not str:
+            raise ReferenceOrchestratorError("additional billing row type drift")
+        try:
+            cost = Decimal(item["cost"])
+        except InvalidOperation as exc:
+            raise ReferenceOrchestratorError("additional billing cost is invalid") from exc
+        if not cost.is_finite() or cost < 0 or cost.as_tuple().exponent < -10:
+            raise ReferenceOrchestratorError("additional billing cost is invalid")
+        interval = _parse_modal_billing_interval(item["interval_start"])
+        if interval < start or interval >= end:
+            raise ReferenceOrchestratorError("additional billing interval drift")
+        if item["environment"] == environment and item["description"] == REFERENCE_APP_NAME:
+            if not isinstance(item["object_id"], str) or not isinstance(item["resource"], str):
+                raise ReferenceOrchestratorError("additional billing row type drift")
+            target_rows.append(
+                {
+                    "cost": item["cost"],
+                    "interval_start": interval.isoformat(),
+                    "object_id": item["object_id"],
+                    "resource": item["resource"],
+                }
+            )
+            total += cost
+
+    target_identities = {str(item["object_id"]) for item in target_rows}
+    if durable_call is not None and durable_app is not None:
+        if target_identities == {str(durable_call)}:
+            mode, provider_identity = "call", str(durable_call)
+        elif target_identities == {str(durable_app)}:
+            mode, provider_identity = "app", str(durable_app)
+        else:
+            raise ReferenceOrchestratorError("additional submitted billing identity is ambiguous")
+    elif durable_call is not None:
+        mode, provider_identity = "call", str(durable_call)
+        if any(item["object_id"] != provider_identity for item in target_rows):
+            raise ReferenceOrchestratorError("additional call billing identity drift")
+    elif durable_app is not None:
+        mode, provider_identity = "app", str(durable_app)
+        if any(item["object_id"] != provider_identity for item in target_rows):
+            raise ReferenceOrchestratorError("additional app billing identity drift")
+    elif target_rows:
+        if (
+            len(target_identities) != 1
+            or _MODAL_APP_ID_RE.fullmatch(next(iter(target_identities))) is None
+        ):
+            raise ReferenceOrchestratorError("additional billing-only identity is ambiguous")
+        mode, provider_identity = "billing_only", next(iter(target_identities))
+    else:
+        if billing_raw != CANONICAL_EMPTY_REPORT:
+            raise ReferenceOrchestratorError("workspace billing report is not exact zero")
+        mode, provider_identity = "workspace_zero_preidentity", None
+    if mode in {"call", "app"} and not target_rows:
+        raise ReferenceOrchestratorError("additional durable identity lacks billing evidence")
+
+    post_auth = verify_workspace_auth(root, runner=runner, write_latest=False)
+    if (
+        pre_auth["receipt_sha256"] == post_auth["receipt_sha256"]
+        or pre_auth["authenticated_workspace_identity_sha256"]
+        != post_auth["authenticated_workspace_identity_sha256"]
+        or pre_auth["authenticated_workspace_identity_sha256"]
+        != row["authenticated_workspace_identity_sha256"]
+        or pre_auth["binding_sha256"] != row["auth_binding_sha256"]
+        or post_auth["binding_sha256"] != row["auth_binding_sha256"]
+    ):
+        raise ReferenceOrchestratorError("Modal workspace changed during additional capture")
+    kind_source = {
+        "call": ("reference_additional_call_identity", "durable_call_identity"),
+        "app": ("reference_additional_app_identity", "durable_app_identity"),
+        "billing_only": (
+            "reference_additional_billing_identity",
+            "authoritative_filtered_billing_report",
+        ),
+        "workspace_zero_preidentity": (
+            "reference_additional_workspace_zero_identity",
+            "complete_workspace_billing",
+        ),
+    }[mode]
+    identity = canonical_bytes(
+        {
+            "identity_source": kind_source[1],
+            "kind": kind_source[0],
+            "provider_identity": provider_identity,
+            "schema_version": 1,
+        }
+    )
+    report = canonical_bytes(
+        {"kind": ADDITIONAL_REPORT_KIND, "rows": target_rows, "schema_version": 1}
+    )
+    acquired_at = datetime.now(UTC).isoformat()
+    receipt = canonical_bytes(
+        {
+            "acquired_at": acquired_at,
+            "actual_cost_usd": str(total),
+            "additional_authority_sha256": row["authority_sha256"],
+            "attribution_mode": mode,
+            "authenticated_workspace_identity_sha256": row[
+                "authenticated_workspace_identity_sha256"
+            ],
+            "authoritative_report_identity_sha256": row["authoritative_report_identity_sha256"],
+            "billing_authority_sha256": row["billing_authority_sha256"],
+            "billing_method_sha256": authority["attribution_method_sha256"],
+            "captured_at": captured_at,
+            "completeness_delay_seconds": delay,
+            "environment_scope_sha256": environment_scope_sha256,
+            "execution_manifest_sha256": row["execution_manifest_sha256"],
+            "execution_receipt_sha256": row["execution_receipt_sha256"],
+            "execution_scope_sha256": row["reference_execution_scope_sha256"],
+            "filtered_report_sha256": _sha(report),
+            "filtered_report_size_bytes": len(report),
+            "identity_evidence_sha256": _sha(identity),
+            "kind": ADDITIONAL_RECEIPT_KIND,
+            "post_auth_receipt_sha256": post_auth["receipt_sha256"],
+            "pre_auth_receipt_sha256": pre_auth["receipt_sha256"],
+            "provider": "modal",
+            "query_end": end.isoformat(),
+            "query_start": start.isoformat(),
+            "reservation_id": row["reservation_id"],
+            "schema_version": 1,
+        }
+    )
+    for path, content in (
+        (ADDITIONAL_IDENTITY_EVIDENCE_PATH, identity),
+        (ADDITIONAL_BILLING_REPORT_PATH, report),
+        (ADDITIONAL_SETTLEMENT_RECEIPT_PATH, receipt),
+    ):
+        output = root / path
+        if output.exists() and output.read_bytes() != content:
+            raise ReferenceOrchestratorError("additional settlement evidence is immutable")
+        if not output.exists():
+            try:
+                atomic_write(root, path, content, replace=False)
+            except SafeFileError as exc:
+                raise ReferenceOrchestratorError(
+                    "additional settlement evidence path is unsafe"
+                ) from exc
+    return {
+        "actual_cost_usd": str(total),
+        "attribution_mode": mode,
+        "provider_read_only_contacted": True,
+        "receipt_sha256": _sha(receipt),
+    }
+
+
+def settle_additional_billing(root: Path) -> Mapping[str, object]:
+    """Settle the additional action from closed local evidence without provider contact."""
+    root = root.resolve()
+    _require_merged_clean_main(root)
+    receipt_bytes = _read_bounded(
+        root / ADDITIONAL_SETTLEMENT_RECEIPT_PATH,
+        maximum_bytes=MAX_LOCAL_EVIDENCE_BYTES,
+        label="additional settlement receipt",
+    )
+    try:
+        receipt = json.loads(receipt_bytes)
+        if not isinstance(receipt, Mapping):
+            raise TypeError
+        pre_auth_sha256 = str(receipt["pre_auth_receipt_sha256"])
+        post_auth_sha256 = str(receipt["post_auth_receipt_sha256"])
+        execution_receipt_sha256 = receipt["execution_receipt_sha256"]
+        if execution_receipt_sha256 is not None and (
+            not isinstance(execution_receipt_sha256, str)
+            or SHA256_RE.fullmatch(execution_receipt_sha256) is None
+        ):
+            raise TypeError
+    except (KeyError, TypeError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ReferenceOrchestratorError("additional settlement receipt is invalid") from exc
+    remote_receipt_bytes = None
+    if execution_receipt_sha256 is not None:
+        candidates: list[bytes] = []
+        for path in sorted((root / "reports/local").glob("u8-bootstrap-receipt-*.json")):
+            content = _read_bounded(
+                path,
+                maximum_bytes=MAX_LOCAL_EVIDENCE_BYTES,
+                label="additional execution receipt",
+            )
+            if _sha(content) == execution_receipt_sha256:
+                candidates.append(content)
+        if len(candidates) != 1:
+            raise ReferenceOrchestratorError("unique additional execution receipt is unavailable")
+        remote_receipt_bytes = candidates[0]
+    database = ResultsDatabase(confine_results_db(root, DATABASE_PATH))
+    settlement_sha256 = database.settle_reference_additional_billing(
+        receipt_bytes,
+        _read_bounded(
+            root / ADDITIONAL_IDENTITY_EVIDENCE_PATH,
+            maximum_bytes=MAX_LOCAL_EVIDENCE_BYTES,
+            label="additional identity evidence",
+        ),
+        _read_bounded(
+            root / ADDITIONAL_BILLING_REPORT_PATH,
+            maximum_bytes=MAX_FILTERED_BILLING_REPORT_BYTES,
+            label="additional filtered billing report",
+        ),
+        pre_auth_receipt_bytes=_read_bounded(
+            root / auth_receipt_path(pre_auth_sha256),
+            maximum_bytes=MAX_LOCAL_EVIDENCE_BYTES,
+            label="additional pre-auth receipt",
+        ),
+        post_auth_receipt_bytes=_read_bounded(
+            root / auth_receipt_path(post_auth_sha256),
+            maximum_bytes=MAX_LOCAL_EVIDENCE_BYTES,
+            label="additional post-auth receipt",
+        ),
+        billing_authority_bytes=_read_bounded(
+            root / DEFAULT_BILLING_AUTHORITY,
+            maximum_bytes=MAX_LOCAL_EVIDENCE_BYTES,
+            label="additional billing authority",
+        ),
+        bootstrap_request_bytes=_read_bounded(
+            root / ADDITIONAL_REQUEST_PATH,
+            maximum_bytes=MAX_LOCAL_EVIDENCE_BYTES,
+            label="additional bootstrap request",
+        ),
+        remote_receipt_bytes=remote_receipt_bytes,
+        occurred_at=datetime.now(UTC).isoformat(),
+    )
+    return {
+        "actual_cost_usd": str(receipt["actual_cost_usd"]),
+        "provider_contacted": False,
+        "settlement_receipt_sha256": settlement_sha256,
+    }
+
+
+def compile_u9_proposal(root: Path) -> Mapping[str, object]:
+    """Emit only a reviewable proposal after a successful settled baseline."""
+    root = root.resolve(strict=True)
+    status = reference_status(root)
+    additional = status.get("additional")
+    if (
+        not isinstance(additional, Mapping)
+        or additional.get("state") != "settled-success"
+        or additional.get("execution_evidence_recorded") is not True
+    ):
+        raise ReferenceOrchestratorError("U9 requires a successful settled reference baseline")
+    settlement_bytes = _read_bounded(
+        root / ADDITIONAL_SETTLEMENT_RECEIPT_PATH,
+        maximum_bytes=MAX_LOCAL_EVIDENCE_BYTES,
+        label="additional settlement receipt",
+    )
+    proposal = {
+        "additional_authority_sha256": REFERENCE_ADDITIONAL_AUTHORITY_SHA256,
+        "candidate_execution_authorized": False,
+        "configured_context_tokens": 262144,
+        "kind": "reference_u9_threshold_proposal",
+        "numeric_threshold_approval_authorized": False,
+        "proven_useful_context_tokens": status.get("proven_useful_context_tokens"),
+        "sample_count": 1,
+        "schema_version": 1,
+        "settlement_receipt_sha256": _sha(settlement_bytes),
+        "status": "proposal",
+        # No tracked or local authority currently supplies approved numeric
+        # threshold formulas. Unsupported n=1 thresholds therefore stay unset.
+        "thresholds": {},
+        "unsupported_threshold_reason": "approved_numeric_formula_unavailable",
+    }
+    encoded = canonical_bytes(proposal)
+    output = root / U9_PROPOSAL_PATH
+    if output.exists() and output.read_bytes() != encoded:
+        raise ReferenceOrchestratorError("U9 proposal is immutable")
+    if not output.exists():
+        try:
+            atomic_write(root, U9_PROPOSAL_PATH, encoded, replace=False)
+        except SafeFileError as exc:
+            raise ReferenceOrchestratorError("U9 proposal path is unsafe") from exc
+    return {
+        **proposal,
+        "proposal_sha256": _sha(encoded),
+        "provider_contacted": False,
+    }
+
+
 def materialize_recovery_authority(root: Path) -> Mapping[str, str]:
     """Create the ignored canonical recovery authority without provider contact."""
     root = root.resolve()
@@ -1126,6 +2184,22 @@ def materialize_recovery_authority(root: Path) -> Mapping[str, str]:
     if validated != REFERENCE_RECOVERY_AUTHORITY_SHA256:
         raise ReferenceOrchestratorError("recovery authority lineage drift")
     return {"recovery_authority_sha256": validated}
+
+
+def _additional_status_state(
+    grant_state: str, reservation_status: str | None, experiment_status: str | None
+) -> str:
+    if grant_state == "available":
+        return "reserved" if reservation_status == "reserved" else "available"
+    if grant_state != "consumed":
+        raise ReferenceOrchestratorError("reference additional grant state is invalid")
+    if reservation_status == "audit_blocked":
+        return "audit-blocked"
+    if reservation_status in {"settled", "failed"} and experiment_status == "completed":
+        return "settled-success"
+    if reservation_status in {"settled", "failed"} and experiment_status == "failed":
+        return "settled-failure"
+    return "consumed"
 
 
 def reference_status(root: Path) -> Mapping[str, object]:
@@ -1156,10 +2230,63 @@ def reference_status(root: Path) -> Mapping[str, object]:
             LEFT JOIN budget_reservations AS br
               ON br.reservation_id = rre.replacement_reservation_id LIMIT 2"""
         ).fetchall()
+        additional = connection.execute(
+            """SELECT rag.authority_sha256, rag.state, rag.active_reservation_id,
+                rag.active_execution_scope_sha256,
+                br.status AS reservation_status, br.provider_actual_cost_usd,
+                e.status AS experiment_status,
+                EXISTS(SELECT 1 FROM artifacts AS a WHERE a.run_id = e.run_id)
+                    AS evidence_recorded,
+                (SELECT m.value_json FROM metrics AS m
+                 WHERE m.run_id = e.run_id
+                   AND m.name = 'proven_useful_context_tokens') AS proven_context
+            FROM reference_additional_grants AS rag
+            LEFT JOIN budget_reservations AS br
+              ON br.reservation_id = rag.active_reservation_id
+            LEFT JOIN experiments AS e ON e.run_id = br.run_id
+            LIMIT 2"""
+        ).fetchall()
+        actual_rows = connection.execute(
+            """SELECT provider_actual_cost_usd FROM budget_reservations
+            WHERE provider_actual_cost_usd IS NOT NULL
+            UNION ALL
+            SELECT provider_actual_cost_usd FROM provider_smoke_reservations
+            WHERE provider_actual_cost_usd IS NOT NULL"""
+        ).fetchall()
     if len(entitlements) > 1:
         raise ReferenceOrchestratorError("multiple replacement entitlements are invalid")
+    if len(additional) != 1:
+        raise ReferenceOrchestratorError("reference additional grant cardinality is invalid")
     entitlement = None if not entitlements else entitlements[0]
+    additional_row = additional[0]
+    reservation_status = additional_row["reservation_status"]
+    experiment_status = additional_row["experiment_status"]
+    additional_state = _additional_status_state(
+        str(additional_row["state"]), reservation_status, experiment_status
+    )
+    proven_context = (
+        262144
+        if experiment_status == "completed" and additional_row["proven_context"] == "262144"
+        else None
+    )
+    cumulative_actual = sum(
+        (Decimal(str(row["provider_actual_cost_usd"])) for row in actual_rows),
+        Decimal("0"),
+    )
     return {
+        "additional": {
+            "authority_sha256": additional_row["authority_sha256"],
+            "billing_state": reservation_status,
+            "execution_evidence_recorded": bool(additional_row["evidence_recorded"]),
+            "experiment_state": experiment_status,
+            "state": additional_state,
+            **(
+                {"execution_scope_sha256": additional_row["active_execution_scope_sha256"]}
+                if additional_row["active_execution_scope_sha256"] is not None
+                else {}
+            ),
+        },
+        "cumulative_actual_cost_usd": format(cumulative_actual, "f"),
         "configured_context_tokens": 262144,
         "original": None
         if original is None
@@ -1173,7 +2300,7 @@ def reference_status(root: Path) -> Mapping[str, object]:
         "provider_contacted": bool(
             entitlement is not None and entitlement["reservation_id"] is not None
         ),
-        "proven_useful_context_tokens": None,
+        "proven_useful_context_tokens": proven_context,
         "replacement": None
         if entitlement is None
         else {
@@ -1447,7 +2574,9 @@ def _source_artifacts(root: Path, config: ReferenceJobConfig) -> list[dict[str, 
     ]
 
 
-def build_bootstrap_request(root: Path, config: ReferenceJobConfig) -> bytes:
+def build_bootstrap_request(
+    root: Path, config: ReferenceJobConfig, *, additional: bool = False
+) -> bytes:
     """Build canonical target-neutral wire bytes; target details remain inside the bytes."""
     root = root.resolve()
     image_path = root / IMAGE_LOCK_PATH
@@ -1490,22 +2619,41 @@ def build_bootstrap_request(root: Path, config: ReferenceJobConfig) -> bytes:
         if key not in {"weight_inventory_tensor_bytes", "evaluation_max_context_tokens"}
         and value is not None
     }
+    authority = {
+        "bootstrap_sha256": REFERENCE_BOOTSTRAP_AUTHORITY_SHA256,
+        "merge_commit": REFERENCE_BOOTSTRAP_MERGE_COMMIT,
+        "parent_sha256": REFERENCE_AUTHORITY_SHA256,
+        "signed_cdn_merge_commit": REFERENCE_SIGNED_CDN_MERGE_COMMIT,
+        "signed_cdn_sha256": REFERENCE_SIGNED_CDN_AUTHORITY_SHA256,
+    }
+    if additional:
+        authority.update(
+            {
+                "additional_sha256": REFERENCE_ADDITIONAL_AUTHORITY_SHA256,
+                "prior_execution_scope_sha256": (REFERENCE_ADDITIONAL_PRIOR_EXECUTION_SCOPE_SHA256),
+                "prior_settlement_receipt_sha256": (REFERENCE_ADDITIONAL_SETTLEMENT_RECEIPT_SHA256),
+            }
+        )
     request = {
-        "action": "u8_reference_once",
+        "action": "u8_reference_additional_once" if additional else "u8_reference_once",
         "approved_https_hosts": hosts,
-        "authority": {
-            "bootstrap_sha256": REFERENCE_BOOTSTRAP_AUTHORITY_SHA256,
-            "merge_commit": REFERENCE_BOOTSTRAP_MERGE_COMMIT,
-            "parent_sha256": REFERENCE_AUTHORITY_SHA256,
-            "signed_cdn_merge_commit": REFERENCE_SIGNED_CDN_MERGE_COMMIT,
-            "signed_cdn_sha256": REFERENCE_SIGNED_CDN_AUTHORITY_SHA256,
-        },
+        "authority": authority,
         "budget": {
-            "cumulative_cap_usd": str(REFERENCE_CUMULATIVE_CAP_USD),
-            "incremental_reserved_usd": str(REFERENCE_INCREMENTAL_CAP_USD),
+            "cumulative_cap_usd": str(
+                REFERENCE_ADDITIONAL_CUMULATIVE_CAP_USD
+                if additional
+                else REFERENCE_CUMULATIVE_CAP_USD
+            ),
+            "incremental_reserved_usd": str(
+                REFERENCE_ADDITIONAL_INCREMENTAL_CAP_USD
+                if additional
+                else REFERENCE_INCREMENTAL_CAP_USD
+            ),
             "no_overlapping_reservations": True,
             "provider_hard_dollar_cap": False,
-            "settled_before_usd": str(REFERENCE_SETTLED_SMOKE_USD),
+            "settled_before_usd": str(
+                REFERENCE_ADDITIONAL_PRIOR_SPEND_USD if additional else REFERENCE_SETTLED_SMOKE_USD
+            ),
         },
         "configured_context_tokens": 262144,
         "context_ladder_tokens": [8192, 32768, 131072, 262144],
@@ -1564,7 +2712,7 @@ def build_bootstrap_request(root: Path, config: ReferenceJobConfig) -> bytes:
             "user_payloads": False,
             "weights_source": "remote_immutable_public_only",
         },
-        "schema_version": 1,
+        "schema_version": 2 if additional else 1,
         "source_artifacts": artifacts,
         "source_artifacts_sha256": canonical_sha256(artifacts),
     }
@@ -1574,10 +2722,19 @@ def build_bootstrap_request(root: Path, config: ReferenceJobConfig) -> bytes:
 
 
 def validate_reproduced_request(
-    root: Path, config: ReferenceJobConfig, request_bytes: bytes
+    root: Path,
+    config: ReferenceJobConfig,
+    request_bytes: bytes,
+    *,
+    additional: bool = False,
 ) -> None:
     """Require the paid consumer to reproduce every source entry from local authority."""
-    if build_bootstrap_request(root, config) != request_bytes:
+    reproduced = (
+        build_bootstrap_request(root, config, additional=True)
+        if additional
+        else build_bootstrap_request(root, config)
+    )
+    if reproduced != request_bytes:
         raise ReferenceOrchestratorError("bootstrap request does not match local provenance")
 
 
@@ -1668,6 +2825,70 @@ def prepare_replacement(
         expected_authenticated_workspace_identity_sha256=binding[
             "authenticated_workspace_identity_sha256"
         ],
+    )
+    return config, request, capability, binding
+
+
+def prepare_additional(
+    root: Path,
+) -> tuple[
+    ReferenceJobConfig,
+    bytes,
+    ReferenceModalCapability,
+    AdditionalReferenceBinding,
+]:
+    """Prepare the additional action locally without reservation or provider contact."""
+    root = root.resolve()
+    _reject_active_wsl_transfer(root)
+    config = refresh_local_config(root)
+    authority_sha256 = validate_reference_additional_authority(root, ADDITIONAL_AUTHORITY_PATH)
+    if authority_sha256 != REFERENCE_ADDITIONAL_AUTHORITY_SHA256:
+        raise ReferenceOrchestratorError("additional authority lineage drift")
+    database = ResultsDatabase(confine_results_db(root, DATABASE_PATH))
+    database.initialize()
+    grant = database.reference_additional_grant()
+    if (
+        grant["state"] != "available"
+        or grant["authority_sha256"] != authority_sha256
+        or grant["prior_settlement_receipt_sha256"]
+        != REFERENCE_ADDITIONAL_SETTLEMENT_RECEIPT_SHA256
+        or grant["prior_execution_scope_sha256"]
+        != REFERENCE_ADDITIONAL_PRIOR_EXECUTION_SCOPE_SHA256
+        or grant["prior_actual_cost_usd"] != str(REFERENCE_ADDITIONAL_PRIOR_SPEND_USD)
+        or grant["active_reservation_id"] is not None
+    ):
+        raise ReferenceOrchestratorError("additional grant is not locally available")
+    request = build_bootstrap_request(root, config, additional=True)
+    validate_reproduced_request(root, config, request, additional=True)
+    _write_atomic(root, root / ADDITIONAL_REQUEST_PATH, request)
+    preview = plan_reference_additional_preview(
+        config,
+        root=root,
+        request_path=ADDITIONAL_REQUEST_PATH,
+        request_sha256=_sha(request),
+        image_lock_path=IMAGE_LOCK_PATH,
+        image_lock_sha256=_sha((root / IMAGE_LOCK_PATH).read_bytes()),
+        provider_capability_path=PROVIDER_CAPABILITY_PATH,
+        provider_capability_sha256=_sha((root / PROVIDER_CAPABILITY_PATH).read_bytes()),
+        billing_authority_path=DEFAULT_BILLING_AUTHORITY,
+        billing_receipt_path=DEFAULT_BILLING_RECEIPT,
+        billing_report_path=DEFAULT_BILLING_REPORT,
+        publication_manifest_path=PUBLICATION_MANIFEST_PATH,
+    )
+    if preview["bootstrap_ready"] is not True or preview["blockers"]:
+        raise ReferenceOrchestratorError("additional deterministic gates are not ready")
+    execution_scope = config.reference_execution_scope_sha256
+    if execution_scope is None:
+        raise ReferenceOrchestratorError("reference execution scope is unavailable")
+    binding = additional_reference_binding(
+        config_sha256=config.sha256,
+        config_challenge_sha256=config.challenge_sha256,
+        request_sha256=_sha(request),
+        execution_scope_sha256=execution_scope,
+    )
+    capability = replace(
+        _capability(root, config, request),
+        request_path=ADDITIONAL_REQUEST_PATH,
     )
     return config, request, capability, binding
 
@@ -1827,6 +3048,125 @@ def execute(
         raise ReferenceProviderStateUnknown("reference provider state requires audit") from None
 
 
+def execute_additional(
+    root: Path,
+    durable_root: Path,
+    *,
+    confirm_request_sha256: str,
+) -> Mapping[str, object]:
+    """Cross the one additional U8 boundary after exact WSL parity and reservation."""
+    root = root.resolve(strict=True)
+    durable_root = durable_root.resolve(strict=True)
+    _require_merged_clean_main(root)
+    _watchdog_ready()
+    if provider_environment_overrides_present():
+        raise ReferenceOrchestratorError("ambient provider environment override is forbidden")
+
+    config, request, unreserved, binding = prepare_additional(root)
+    request_sha256 = _sha(request)
+    if confirm_request_sha256 != request_sha256:
+        raise ReferenceOrchestratorError("request confirmation does not match fresh bytes")
+
+    from lowbit_lab.reference_modal_adapter import (
+        prepare_local_modal_graph,
+        submit_reference,
+        validate_reference_preflight,
+    )
+
+    # These are metadata-only/local gates. No reservation exists yet.
+    observe_topology(root / ADDITIONAL_REQUEST_PATH)
+    validate_reference_preflight(unreserved)
+    first_graph = prepare_local_modal_graph(unreserved)
+    second_graph = prepare_local_modal_graph(unreserved)
+    if first_graph.serialized.payload != second_graph.serialized.payload:
+        raise ReferenceOrchestratorError("serialized payload reproduction drift")
+    auth = verify_workspace_auth(root)
+    workspace_identity = str(auth["authenticated_workspace_identity_sha256"])
+    parity = record_wsl_execution_parity(
+        root,
+        durable_root,
+        config=config,
+        request_bytes=request,
+        serialized_payload=second_graph.serialized.payload,
+        serialized_payload_confirmation=first_graph.serialized.payload,
+    )
+    # Freshness is measured again immediately before the mutable budget boundary.
+    observe_topology(root / ADDITIONAL_REQUEST_PATH)
+    validate_reference_preflight(unreserved)
+
+    database = ResultsDatabase(confine_results_db(root, DATABASE_PATH))
+    database.initialize()
+    now = datetime.now(UTC)
+    expires = now + timedelta(hours=1)
+    reservation_id = str(uuid.uuid4())
+    owner_id = str(uuid.uuid4())
+    attempt_id = str(uuid.uuid4())
+    run_id = str(uuid.uuid4())
+    approval_digest = canonical_sha256(
+        {
+            "action": "u8_reference_additional_once",
+            "additional_authority_sha256": REFERENCE_ADDITIONAL_AUTHORITY_SHA256,
+            "capability_sha256": binding.capability_sha256,
+            "challenge_sha256": binding.challenge_sha256,
+            "packet_sha256": binding.packet_sha256,
+        }
+    )
+    database.reserve_reference_run(
+        reservation_id=reservation_id,
+        attempt_id=attempt_id,
+        run_id=run_id,
+        experiment_id=config.experiment_id,
+        config_sha256=config.sha256,
+        config_json=config.canonical_json,
+        source_hashes={
+            key: value
+            for key, value in config.inputs.items()
+            if key not in {"weight_inventory_tensor_bytes", "evaluation_max_context_tokens"}
+            and value is not None
+        },
+        runtime={"receipt_sha256": config.inputs["runtime_receipt_sha256"]},
+        hardware={},
+        requested_cost_usd=str(REFERENCE_ADDITIONAL_INCREMENTAL_CAP_USD),
+        phase_cap_usd=str(REFERENCE_ADDITIONAL_INCREMENTAL_CAP_USD),
+        total_cap_usd=str(REFERENCE_ADDITIONAL_CUMULATIVE_CAP_USD),
+        single_job_cap_usd=str(REFERENCE_ADDITIONAL_INCREMENTAL_CAP_USD),
+        idempotency_key=str(uuid.uuid4()),
+        owner_id=owner_id,
+        lease_expires_at=expires.isoformat(),
+        started_at=now.isoformat(),
+        challenge_sha256=config.challenge_sha256,
+        approval_digest=approval_digest,
+        standing_authority_sha256=REFERENCE_AUTHORITY_SHA256,
+        bootstrap_authority_sha256=REFERENCE_BOOTSTRAP_AUTHORITY_SHA256,
+        authority_root=root,
+        standing_packet_sha256=binding.packet_sha256,
+        approval_expires_at=expires.isoformat(),
+        attempt_config_path=CONFIG_PATH.as_posix(),
+        attempt_raw_config_sha256=_sha((root / CONFIG_PATH).read_bytes()),
+        additional_authority_sha256=REFERENCE_ADDITIONAL_AUTHORITY_SHA256,
+        additional_prior_settlement_receipt_sha256=(REFERENCE_ADDITIONAL_SETTLEMENT_RECEIPT_SHA256),
+        additional_prior_execution_scope_sha256=(REFERENCE_ADDITIONAL_PRIOR_EXECUTION_SCOPE_SHA256),
+    )
+    capability = replace(
+        unreserved,
+        reservation_id=reservation_id,
+        owner_id=owner_id,
+        additional_authority_sha256=REFERENCE_ADDITIONAL_AUTHORITY_SHA256,
+        additional_authenticated_workspace_identity_sha256=workspace_identity,
+        additional_wsl_parity_receipt_sha256=str(parity["parity_receipt_sha256"]),
+    )
+    try:
+        return submit_reference(capability, second_graph)
+    except Exception:
+        try:
+            reservation = database.get_reservation(reservation_id)
+        except Exception:
+            raise ReferenceProviderStateUnknown("reference provider state requires audit") from None
+        if reservation.get("status") == "released":
+            raise ReferenceOrchestratorError("reference stopped before Modal contact") from None
+        raise ReferenceProviderStateUnknown("reference provider state requires audit") from None
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Gate the one U8 reference action")
     parser.add_argument("--root", type=Path, default=Path("."))
@@ -1843,13 +3183,26 @@ def _parser() -> argparse.ArgumentParser:
     replacement_capture = sub.add_parser("billing-capture-replacement")
     replacement_capture.add_argument("--query-start", required=True)
     replacement_capture.add_argument("--query-end", required=True)
+    additional_capture = sub.add_parser("billing-capture-additional")
+    additional_capture.add_argument("--query-start", required=True)
+    additional_capture.add_argument("--query-end", required=True)
     sub.add_parser("settle-preidentity-zero")
     sub.add_parser("settle-replacement")
+    sub.add_parser("settle-additional")
+    sub.add_parser("compile-u9-proposal")
     sub.add_parser("prepare-replacement")
+    sub.add_parser("prepare-additional")
+    transfer_begin = sub.add_parser("wsl-transfer-begin")
+    transfer_begin.add_argument("--durable-root", type=Path, required=True)
+    transfer_return = sub.add_parser("wsl-transfer-return")
+    transfer_return.add_argument("--durable-root", type=Path, required=True)
     live = sub.add_parser("execute")
     live.add_argument("--confirm-request-sha256", required=True)
     replacement = sub.add_parser("execute-replacement")
     replacement.add_argument("--confirm-request-sha256", required=True)
+    additional = sub.add_parser("execute-additional")
+    additional.add_argument("--durable-root", type=Path, required=True)
+    additional.add_argument("--confirm-request-sha256", required=True)
     return parser
 
 
@@ -1923,21 +3276,32 @@ def main(argv: list[str] | None = None) -> int:
                 }
             )
             return 0
-        if command == "billing-capture-replacement":
+        if command in {"billing-capture-replacement", "billing-capture-additional"}:
+
             def track_read_only_provider_call(*args: object, **kwargs: object) -> object:
                 nonlocal provider_read_only_contacted
                 provider_read_only_contacted = True
                 return subprocess.run(*args, **kwargs)
 
+            capture_result = (
+                capture_replacement_billing(
+                    args.root,
+                    query_start=args.query_start,
+                    query_end=args.query_end,
+                    runner=track_read_only_provider_call,
+                )
+                if command == "billing-capture-replacement"
+                else capture_additional_billing(
+                    args.root,
+                    query_start=args.query_start,
+                    query_end=args.query_end,
+                    runner=track_read_only_provider_call,
+                )
+            )
             emit(
                 {
                     "ok": True,
-                    **capture_replacement_billing(
-                        args.root,
-                        query_start=args.query_start,
-                        query_end=args.query_end,
-                        runner=track_read_only_provider_call,
-                    ),
+                    **capture_result,
                 }
             )
             return 0
@@ -1946,6 +3310,12 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if command == "settle-replacement":
             emit({"ok": True, **settle_replacement_billing(args.root)})
+            return 0
+        if command == "settle-additional":
+            emit({"ok": True, **settle_additional_billing(args.root)})
+            return 0
+        if command == "compile-u9-proposal":
+            emit({"ok": True, **compile_u9_proposal(args.root)})
             return 0
         if command == "prepare-replacement":
             config, request, _, binding = prepare_replacement(args.root)
@@ -1961,11 +3331,52 @@ def main(argv: list[str] | None = None) -> int:
                 }
             )
             return 0
-        result = execute(
-            args.root,
-            confirm_request_sha256=args.confirm_request_sha256,
-            replacement=command == "execute-replacement",
-        )
+        if command == "prepare-additional":
+            config, request, _, binding = prepare_additional(args.root)
+            emit(
+                {
+                    "action": "u8_reference_additional_once",
+                    "additional_authority_sha256": REFERENCE_ADDITIONAL_AUTHORITY_SHA256,
+                    "capability_sha256": binding.capability_sha256,
+                    "challenge_sha256": binding.challenge_sha256,
+                    "configured_context_tokens": 262144,
+                    "execution_scope_sha256": config.reference_execution_scope_sha256,
+                    "ok": True,
+                    "packet_sha256": binding.packet_sha256,
+                    "provider_contacted": False,
+                    "proven_useful_context_tokens": None,
+                    "request_sha256": _sha(request),
+                }
+            )
+            return 0
+        if command == "wsl-transfer-begin":
+            emit(
+                {
+                    "ok": True,
+                    **begin_wsl_state_transfer(args.durable_root, args.root),
+                }
+            )
+            return 0
+        if command == "wsl-transfer-return":
+            emit(
+                {
+                    "ok": True,
+                    **return_wsl_state(args.durable_root, args.root),
+                }
+            )
+            return 0
+        if command == "execute-additional":
+            result = execute_additional(
+                args.root,
+                args.durable_root,
+                confirm_request_sha256=args.confirm_request_sha256,
+            )
+        else:
+            result = execute(
+                args.root,
+                confirm_request_sha256=args.confirm_request_sha256,
+                replacement=command == "execute-replacement",
+            )
         emit({"ok": True, "provider_contacted": True, "result": result})
         return 0
     except Exception as exc:
@@ -1977,7 +3388,7 @@ def main(argv: list[str] | None = None) -> int:
                 "unknown" if isinstance(exc, ReferenceProviderStateUnknown) else False
             ),
         }
-        if command == "billing-capture-replacement":
+        if command in {"billing-capture-replacement", "billing-capture-additional"}:
             failure["provider_read_only_contacted"] = provider_read_only_contacted
         emit(failure, stream=sys.stderr)
         return 1

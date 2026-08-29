@@ -9,6 +9,9 @@ from lowbit_lab.constants import REFERENCE_RECOVERY_AUTHORITY_SHA256
 from lowbit_lab.handoff import canonical_json, sha256_json
 from lowbit_lab.reference_authority import (
     ACTION_CLASSES,
+    ADDITIONAL_AUTHORITY_PATH,
+    ADDITIONAL_SETTLEMENT_RECEIPT_PATH,
+    ADDITIONAL_STATEMENT_PATH,
     BOOTSTRAP_AUTHORITY_PATH,
     BOOTSTRAP_STATEMENT_PATH,
     RECOVERY_AUTHORITY_PATH,
@@ -22,9 +25,11 @@ from lowbit_lab.reference_authority import (
     WORKSPACE_RECONCILIATION_STATEMENT_PATH,
     ReferenceAuthorityError,
     authorize_reference_action,
+    authorize_reference_additional_action,
     authorize_reference_bootstrap_action,
     build_reference_recovery_authority,
     build_workspace_scope_reconciliation_authority,
+    validate_reference_additional_authority,
     validate_reference_authority,
     validate_reference_bootstrap_authority,
     validate_reference_recovery_authority,
@@ -115,6 +120,113 @@ def _write_reconciliation_authority(
     authority_path.parent.mkdir(parents=True, exist_ok=True)
     authority_path.write_bytes((canonical_json(authority) + "\n").encode())
     return authority_path
+
+
+def _copy_additional_authority_inputs(root: Path) -> Path:
+    _copy_recovery_authority_inputs(root)
+    repository = Path(__file__).resolve().parents[1]
+    for relative in (
+        ADDITIONAL_STATEMENT_PATH,
+        ADDITIONAL_AUTHORITY_PATH,
+        ADDITIONAL_SETTLEMENT_RECEIPT_PATH,
+    ):
+        source = repository / relative
+        destination = root / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(source.read_bytes())
+    return root / ADDITIONAL_AUTHORITY_PATH
+
+
+def test_additional_authority_validates_exact_real_bytes(tmp_path: Path) -> None:
+    authority_path = _copy_additional_authority_inputs(tmp_path)
+    authority_sha256 = validate_reference_additional_authority(tmp_path, authority_path)
+    assert authority_sha256 == reference_authority.REFERENCE_ADDITIONAL_AUTHORITY_SHA256
+    assert authorize_reference_additional_action(
+        tmp_path, authority_path, "u8_reference_additional_once"
+    ) == sha256_json(
+        {
+            "action_class": "u8_reference_additional_once",
+            "authority_sha256": authority_sha256,
+        }
+    )
+
+
+@pytest.mark.parametrize("suffix", (b"\n", b"\r\n"))
+def test_additional_authority_rejects_statement_byte_drift(tmp_path: Path, suffix: bytes) -> None:
+    authority_path = _copy_additional_authority_inputs(tmp_path)
+    statement = tmp_path / ADDITIONAL_STATEMENT_PATH
+    statement.write_bytes(statement.read_bytes() + suffix)
+    with pytest.raises(ReferenceAuthorityError, match="additional authority statement"):
+        validate_reference_additional_authority(tmp_path, authority_path)
+
+
+def test_additional_authority_rejects_statement_bom(tmp_path: Path) -> None:
+    authority_path = _copy_additional_authority_inputs(tmp_path)
+    statement = tmp_path / ADDITIONAL_STATEMENT_PATH
+    statement.write_bytes(b"\xef\xbb\xbf" + statement.read_bytes())
+    with pytest.raises(ReferenceAuthorityError, match="additional authority statement"):
+        validate_reference_additional_authority(tmp_path, authority_path)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("approved_base_commit", "0" * 40),
+        ("required_pre_submit_gates", ["budget"]),
+        ("settled_replacement_receipt_sha256", "0" * 64),
+        ("settled_replacement_execution_scope_sha256", "1" * 64),
+        ("authoritative_prior_spend_usd", "0.00564444"),
+        ("incremental_u8_cap_usd", "4.01"),
+        ("cumulative_lab_cap_usd", "4.00564446"),
+        ("gpu", "A100-40GB:1"),
+        ("max_concurrent_containers", 2),
+        ("timeout_seconds", 2701),
+        ("provider_retries", 1),
+        ("application_retries", 1),
+        ("fallback_gpu_authorized", True),
+        ("private_data_authorized", True),
+        ("local_weight_transfer_authorized", True),
+        ("secrets_passed_to_worker_authorized", True),
+        ("mounts_volumes_persistent_storage_authorized", True),
+        ("scheduling_authorized", True),
+        ("destructive_cleanup_authorized", True),
+        ("overlapping_reservations_authorized", True),
+        ("additional_provider_actions_authorized", True),
+        ("candidate_execution_authorized", True),
+        ("numeric_threshold_approval_authorized", True),
+        ("u9_proposal_only", False),
+        ("configured_context_tokens", 131072),
+        ("proven_useful_context_tokens", 262144),
+    ),
+)
+def test_additional_authority_rejects_semantic_drift(
+    tmp_path: Path, field: str, value: object
+) -> None:
+    authority_path = _copy_additional_authority_inputs(tmp_path)
+    authority = json.loads(authority_path.read_text(encoding="utf-8"))
+    authority[field] = value
+    authority_path.write_text(
+        json.dumps(authority, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ReferenceAuthorityError, match="additional authority"):
+        validate_reference_additional_authority(tmp_path, authority_path)
+
+
+def test_additional_authority_rejects_receipt_drift_and_wrong_action(
+    tmp_path: Path,
+) -> None:
+    authority_path = _copy_additional_authority_inputs(tmp_path)
+    receipt = tmp_path / ADDITIONAL_SETTLEMENT_RECEIPT_PATH
+    receipt.write_bytes(receipt.read_bytes() + b"\n")
+    with pytest.raises(ReferenceAuthorityError, match="settled replacement receipt"):
+        validate_reference_additional_authority(tmp_path, authority_path)
+
+    authority_path = _copy_additional_authority_inputs(tmp_path)
+    with pytest.raises(ReferenceAuthorityError, match="additional action class"):
+        authorize_reference_additional_action(
+            tmp_path, authority_path, "u8_reference_replacement_once"
+        )
 
 
 def test_workspace_reconciliation_validates_real_canonical_bytes(

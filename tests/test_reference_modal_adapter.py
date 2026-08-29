@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import inspect
 import json
 import subprocess
 import sys
@@ -436,10 +437,52 @@ def test_serialized_callable_round_trips_without_repository_on_import_path(tmp_p
         [sys.executable, "-I", "-c", code], check=False, capture_output=True, text=True
     )
     assert completed.returncode == 0
-    assert "ReferenceModalError remote contract schema drift" in completed.stdout
+    assert "RuntimeError remote_contract_schema_drift" in completed.stdout
     assert "low-bit-lab" not in completed.stderr
-    assert len(payload) > adapter.MODAL_SERIALIZED_FUNCTION_MAX_BYTES
+    assert len(payload) < adapter.MODAL_SERIALIZED_FUNCTION_MAX_BYTES
     adapter._clear_serialization_policy(modules)
+
+
+def test_production_serialization_is_stable_twice_and_below_provider_cap() -> None:
+    first_entry, first, first_modules = adapter._build_serialized_remote_callable()
+    adapter._clear_serialization_policy(first_modules)
+    second_entry, second, second_modules = adapter._build_serialized_remote_callable()
+    adapter._clear_serialization_policy(second_modules)
+
+    assert first_entry is second_entry
+    assert first == second
+    assert len(first) < adapter.MODAL_SERIALIZED_FUNCTION_MAX_BYTES
+    assert len(first) <= 48 * 1024
+    assert first_modules == second_modules
+    assert tuple(module.__name__ for module in first_modules) == (
+        "lowbit_lab.reference_remote_runtime",
+    )
+
+
+def test_production_serialization_is_stable_across_isolated_processes() -> None:
+    import modal
+
+    source_root = Path(adapter.__file__).resolve().parents[1]
+    site_packages = Path(modal.__file__).resolve().parent.parent
+    code = (
+        "import hashlib,sys;"
+        f"sys.path[:0]=[{str(source_root)!r},{str(site_packages)!r}];"
+        "import lowbit_lab.reference_modal_adapter as a;"
+        "e,p,m=a._build_serialized_remote_callable();"
+        "a._clear_serialization_policy(m);"
+        "print(len(p),hashlib.sha256(p).hexdigest())"
+    )
+    outputs = [
+        subprocess.run(
+            [sys.executable, "-I", "-B", "-c", code],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        for _ in range(2)
+    ]
+    assert outputs[0] == outputs[1]
+    assert int(outputs[0].split()[0]) <= 48 * 1024
 
 
 def test_modal_hydration_uses_the_exact_cached_audited_bytes(
@@ -555,6 +598,9 @@ def test_fake_modal_persists_image_then_call_identity_and_uses_one_spawn(
 
         def mark_reference_submission_pending(self, *args, **kwargs) -> None:
             events.append("pending")
+
+        def mark_reference_app_identity(self, *args, **kwargs) -> None:
+            events.append(("app", kwargs["app_identity"]))
 
         def mark_reference_provider_prepared(self, *args, **kwargs) -> None:
             events.append(("prepared", kwargs["provider_image_identity"], kwargs["app_identity"]))
@@ -709,6 +755,7 @@ def test_fake_modal_persists_image_then_call_identity_and_uses_one_spawn(
         "attempt_linked",
         "pending",
         "run",
+        ("app", "ap-one"),
         "build",
         ("prepared", "im-one", "ap-one"),
         "spawn",
@@ -995,6 +1042,243 @@ def test_replacement_boundary_consumes_entitlement_instead_of_original_slot(
 
     assert [name for name, _ in calls] == ["replacement"]
     assert calls[0][1]["entitlement_sha256"] == "a" * 64
+
+
+def test_additional_boundary_consumes_exact_grant_with_auth_receipt(tmp_path: Path) -> None:
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    class FakeDatabase:
+        def mark_reference_submission_pending(self, *args: object, **kwargs: object) -> None:
+            calls.append(("original", kwargs))
+
+        def mark_reference_replacement_submission_pending(
+            self, *args: object, **kwargs: object
+        ) -> None:
+            calls.append(("replacement", kwargs))
+
+        def mark_reference_additional_submission_pending(
+            self, *args: object, **kwargs: object
+        ) -> None:
+            calls.append(("additional", kwargs))
+
+    capability = SimpleNamespace(
+        reservation_id="additional-reservation",
+        owner_id="owner",
+        authority_root=tmp_path,
+        additional_authority_sha256="b" * 64,
+        replacement_entitlement_sha256=None,
+    )
+    receipt = b'{"sanitized":true}'
+
+    adapter._mark_submission_pending(
+        FakeDatabase(),
+        capability,
+        "2026-08-29T12:00:00+00:00",
+        additional_auth_receipt_bytes=receipt,
+    )
+
+    assert [name for name, _ in calls] == ["additional"]
+    assert calls[0][1]["additional_authority_sha256"] == "b" * 64
+    assert calls[0][1]["auth_receipt_bytes"] == receipt
+
+
+def test_additional_auth_receipt_binds_reservation_scope_and_workspace() -> None:
+    receipt = adapter._build_additional_boundary_auth_receipt(
+        additional_authority_sha256=adapter.REFERENCE_ADDITIONAL_AUTHORITY_SHA256,
+        reservation_id="reservation-one",
+        execution_scope_sha256="b" * 64,
+        authenticated_workspace_identity_sha256="c" * 64,
+        provider_environment="low-bit-lab",
+        sdk_version="1.2.3",
+    )
+    assert receipt == adapter._canonical_json(json.loads(receipt))
+    raw = json.loads(receipt)
+    assert raw["reservation_id"] == "reservation-one"
+    assert raw["reference_execution_scope_sha256"] == "b" * 64
+    assert raw["authenticated_workspace_identity_sha256"] == "c" * 64
+    assert raw["environment_overrides_present"] is False
+
+
+def test_additional_sdk_identity_drift_releases_before_paid_boundary(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    events: list[str] = []
+
+    class FakeDatabase:
+        def __init__(self, path: Path) -> None:
+            pass
+
+        def create_attempt(self, *args: object, **kwargs: object) -> None:
+            events.append("received")
+
+        def get_reservation(self, reservation_id: str) -> dict[str, str]:
+            return {
+                "run_id": "run-one",
+                "owner_id": "owner",
+                "reference_execution_scope_sha256": "scope",
+            }
+
+        def get_run(self, run_id: str) -> dict[str, str]:
+            return {"config_sha256": "config"}
+
+        def link_attempt(self, *args: object, **kwargs: object) -> None:
+            events.append("linked")
+
+        def release_reference_additional_reservation(
+            self, *args: object, **kwargs: object
+        ) -> None:
+            events.append("released")
+
+        def mark_reference_additional_submission_pending(
+            self, *args: object, **kwargs: object
+        ) -> None:
+            events.append("pending")
+
+    monkeypatch.setattr(adapter, "ResultsDatabase", FakeDatabase)
+    monkeypatch.setattr(adapter, "_validate_additional_parity", lambda *args: None)
+    monkeypatch.setattr(adapter, "_local_deadline_signal", lambda: FakeDeadlineSignal())
+    monkeypatch.setattr(adapter, "provider_environment_overrides_present", lambda: False)
+    monkeypatch.setattr(adapter, "_validate_modal_sdk_boundary", lambda capability: "d" * 64)
+    monkeypatch.setattr(adapter, "build_remote_contract", lambda *args, **kwargs: b"contract")
+    monkeypatch.setattr(
+        adapter,
+        "validate_reference_preflight",
+        lambda capability: adapter.FreshDeterministicEvidence(
+            provider_environment="low-bit-lab",
+            execution_identity={},
+            config_sha256="config",
+            reference_execution_scope_sha256="scope",
+        ),
+    )
+    capability = SimpleNamespace(
+        root=tmp_path,
+        config_path=Path("config.yaml"),
+        reservation_id="reservation",
+        owner_id="owner",
+        authority_root=tmp_path,
+        provider_environment="low-bit-lab",
+        replacement_entitlement_sha256=None,
+        additional_authority_sha256=adapter.REFERENCE_ADDITIONAL_AUTHORITY_SHA256,
+        additional_authenticated_workspace_identity_sha256="e" * 64,
+    )
+
+    with pytest.raises(ReferenceModalError, match="additional boundary authentication failed"):
+        adapter.submit_reference(capability, _prepared_graph())
+
+    assert events == ["received", "linked", "released"]
+
+
+def test_modal_sdk_boundary_never_reads_or_copies_credential_values() -> None:
+    source = inspect.getsource(adapter._validate_modal_sdk_boundary)
+    assert "_Client.from_env()" in source
+    assert "WorkspaceNameLookup(Empty(), retry=None, timeout=3)" in source
+    assert "_lookup_workspace" not in source
+    assert 'config.get("token_' not in source
+    assert "config['token_" not in source
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    (
+        {
+            "replacement_entitlement_sha256": "1" * 64,
+            "recovery_authority_sha256": "2" * 64,
+            "replacement_original_workspace_scope_sha256": "3" * 64,
+            "replacement_authenticated_workspace_identity_sha256": "4" * 64,
+            "workspace_reconciliation_authority_sha256": "5" * 64,
+            "replacement_auth_binding_sha256": "6" * 64,
+            "additional_authority_sha256": "7" * 64,
+            "additional_authenticated_workspace_identity_sha256": "8" * 64,
+            "additional_wsl_parity_receipt_sha256": "9" * 64,
+        },
+        {"additional_authenticated_workspace_identity_sha256": "8" * 64},
+        {"replacement_entitlement_sha256": "1" * 64},
+    ),
+)
+def test_authority_generation_rejects_hybrid_and_partial_shapes(
+    overrides: dict[str, str],
+) -> None:
+    values = {
+        "replacement_entitlement_sha256": None,
+        "recovery_authority_sha256": None,
+        "replacement_original_workspace_scope_sha256": None,
+        "replacement_authenticated_workspace_identity_sha256": None,
+        "workspace_reconciliation_authority_sha256": None,
+        "replacement_auth_binding_sha256": None,
+        "additional_authority_sha256": None,
+        "additional_authenticated_workspace_identity_sha256": None,
+        "additional_wsl_parity_receipt_sha256": None,
+        **overrides,
+    }
+    with pytest.raises(ReferenceModalError, match="authority generation"):
+        adapter._validate_authority_generation_shape(SimpleNamespace(**values))
+
+
+def test_additional_attempt_creation_failure_releases_reservation_and_preserves_grant(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    events: list[str] = []
+
+    class FakeDatabase:
+        def __init__(self, path: Path) -> None:
+            pass
+
+        def create_attempt(self, *args: object, **kwargs: object) -> None:
+            events.append("attempt_failed")
+            raise adapter.DatabaseError("injected attempt write failure")
+
+        def release_reference_additional_reservation(
+            self, *args: object, **kwargs: object
+        ) -> None:
+            events.append("reservation_released")
+
+        def mark_reference_additional_submission_pending(
+            self, *args: object, **kwargs: object
+        ) -> None:
+            events.append("grant_consumed")
+
+    monkeypatch.setattr(adapter, "ResultsDatabase", FakeDatabase)
+    capability = SimpleNamespace(
+        root=tmp_path,
+        config_path=Path("configs/local/reference.yaml"),
+        reservation_id="additional-reservation",
+        owner_id="owner",
+        additional_authority_sha256=adapter.REFERENCE_ADDITIONAL_AUTHORITY_SHA256,
+    )
+
+    with pytest.raises(ReferenceModalError, match="attempt audit initialization failed"):
+        adapter.submit_reference(capability, _prepared_graph())
+
+    assert events == ["attempt_failed", "reservation_released"]
+
+
+def test_additional_parity_binds_exact_hydration_payload(tmp_path: Path) -> None:
+    payload = b"exact-hydration"
+    request = b"request"
+    receipt = {
+        "additional_authority_sha256": adapter.REFERENCE_ADDITIONAL_AUTHORITY_SHA256,
+        "request_sha256": adapter._sha(request),
+        "serialized_payload_sha256": adapter._sha(payload),
+        "serialized_payload_size_bytes": len(payload),
+    }
+    content = adapter._canonical_json(receipt)
+    path = tmp_path / "reports/local/reference-wsl-parity-receipt.json"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(content)
+    capability = SimpleNamespace(
+        root=tmp_path,
+        bootstrap_request_bytes=request,
+        additional_authority_sha256=adapter.REFERENCE_ADDITIONAL_AUTHORITY_SHA256,
+        additional_wsl_parity_receipt_sha256=adapter._sha(content),
+    )
+
+    adapter._validate_additional_parity(
+        capability, adapter.SerializedRemoteCallable(lambda: None, payload)
+    )
+    with pytest.raises(ReferenceModalError, match="parity binding drift"):
+        adapter._validate_additional_parity(
+            capability, adapter.SerializedRemoteCallable(lambda: None, payload + b"drift")
+        )
 
 
 @pytest.mark.parametrize(

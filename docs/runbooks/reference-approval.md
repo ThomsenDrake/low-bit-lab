@@ -245,3 +245,96 @@ the approved provider-environment digest, and its filtered billing rows; other w
 descriptions and costs are discarded in memory. Any ambiguity, incomplete interval,
 workspace drift, noncanonical bytes, attribution mismatch, or over-cap cost stays terminal and must
 not produce a retry.
+
+## WSL state ownership for the additional one-shot action
+
+The additional action may run only from an ext4-backed WSL2 mirror. The Windows checkout remains
+the durable state owner before and after the action, but it must not be prepared or imported again
+while WSL owns an unsettled attempt. Credentials and weights are never part of this transfer.
+
+First synchronize the reviewed, merged, clean `main` checkout and the already-audited ignored local
+inputs into the ext4 mirror without copying credential files or weight bodies. Then, from that exact
+mirror, transfer only the SQLite state. Use the Windows checkout's WSL mount path as
+`<durable-root>`; do not record a personal path in tracked documentation:
+
+```text
+uv run --extra remote lowbit-reference-u8 --root . wsl-transfer-begin \
+  --durable-root <durable-root>
+```
+
+This command writes an immutable ownership marker under the ignored Windows `reports/local/`
+directory before importing the database. It snapshots any prior mirror database, validates both
+SQLite snapshots, and compares their SHA-256 hashes. If the first import is interrupted before any
+parity receipt exists, rerunning the same command for the same mirror resumes that import without
+deleting or rewriting the marker. Once parity exists, the active marker rejects another transfer
+and rejects preparation in the Windows checkout.
+
+The additional paid command must reproduce Modal's exact serialized hydration payload twice and
+write an immutable, generation-specific parity receipt before creating a reservation. The receipt binds the marker,
+merged HEAD, tracked tree, SQLite hash and integrity, authority, config, request, provider-auth,
+runtime, evaluation, provenance, pinned SDK, and serialized-payload identities. Native Windows,
+`/mnt/c`, a non-ext4 mirror, a different mirror path, a dirty or unmerged checkout, changed database,
+stale authentication, or any byte mismatch stops before reservation. If a deterministic pre-boundary
+failure releases its reservation at zero cost, a later parity generation is allowed only while the
+grant remains available and every intervening reservation is durably released with no provider
+identity, submission timestamp, or actual cost. Earlier receipts and the original import hash remain
+immutable. A parity receipt is evidence
+of configured 262,144-token context only; it does not prove useful context.
+
+After the ignored authority and request have been regenerated from clean merged `main`, the only
+paid entrypoint is:
+
+```text
+uv run --extra remote lowbit-reference-u8 --root . execute-additional \
+  --durable-root <durable-root> \
+  --confirm-request-sha256 <prepare-additional-request-sha256>
+```
+
+`--durable-root` is mandatory. The command authenticates the active provider-local profile without
+reading credential values, constructs the exact lazy provider graph twice, records WSL parity, and
+only then creates the USD 4.00 local reservation. It passes the additional authority, reservation,
+fresh workspace-identity digest, and parity receipt into the sole provider boundary. There is no
+retry or fallback command. Do not run this command as a dry-run: it is the one authorized paid
+action and consumes the action at `submission_pending`.
+
+If the process stops after the one-shot boundary, leave the marker active. Do not copy the Windows
+database back into WSL, start another preparation, or reconstruct state from partial output. Resume
+billing reconciliation against the exact mirror named by the marker. Only after that WSL database
+reports a terminal settled-success or settled-failure state may it return to Windows:
+
+```text
+uv run --extra remote lowbit-reference-u8 --root . billing-capture-additional \
+  --query-start <YYYY-MM-DDTHH:00:00Z> \
+  --query-end <YYYY-MM-DDTHH:00:00Z>
+uv run --extra remote lowbit-reference-u8 --root . settle-additional
+uv run --extra remote lowbit-reference-u8 --root . status
+```
+
+The capture uses fresh opaque workspace-auth receipts before and after its read-only billing query.
+It emits exactly one closed attribution mode: durable call, durable app, billing-only app, or exact
+workspace-zero preidentity. Ambiguous identities, incomplete windows, noncanonical workspace-zero
+bytes, or workspace drift fail closed and leave settlement blocked.
+
+Only after local settlement reports a terminal state may the state return command run:
+
+```text
+uv run --extra remote lowbit-reference-u8 --root . wsl-transfer-return \
+  --durable-root <durable-root>
+```
+
+Return creates a recoverable Windows database backup, atomically replaces the durable database,
+verifies source and destination hashes and integrity, writes an immutable return receipt, and moves
+the active marker into ignored transfer history. A missing or mismatched parity receipt, a
+nonterminal state, or a hash failure leaves the marker active. The state-transfer commands do not
+contact Modal, reserve budget, transfer credentials, or transfer model weights; billing capture is
+read-only provider contact and stores only sanitized evidence.
+
+After an authoritatively settled successful baseline, and only then, the zero-spend U9 compiler is:
+
+```text
+uv run lowbit-reference-u8 --root . compile-u9-proposal
+```
+
+The output remains an ignored, immutable proposal with threshold approval and candidate execution
+both false. Unsupported single-sample numeric thresholds remain unset. Configured 262,144-token
+context is reported separately from empirically proven-useful context.

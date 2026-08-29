@@ -34,9 +34,11 @@ from lowbit_lab.provider_evidence import (
 )
 from lowbit_lab.publication import PublicationError, load_manifest, scan_publication
 from lowbit_lab.reference_authority import (
+    ADDITIONAL_AUTHORITY_PATH,
     AUTHORITY_PATH,
     BOOTSTRAP_AUTHORITY_PATH,
     ReferenceAuthorityError,
+    validate_reference_additional_authority,
     validate_reference_authority,
     validate_reference_bootstrap_authority,
 )
@@ -59,6 +61,8 @@ from lowbit_lab.reference_contract import (
     REFERENCE_CONFIG_SCHEMA_VERSION,
     REFERENCE_GATE_FIELDS,
     REFERENCE_RESOURCES,
+    AdditionalReferenceBinding,
+    additional_reference_binding,
     reference_execution_scope_sha256,
 )
 from lowbit_lab.reference_evidence import (
@@ -688,9 +692,7 @@ def plan_reference_preview(config: ReferenceJobConfig, *, root: Path) -> dict[st
                 evidence_sha256=memory_sha,
                 inventory_path=root / str(config.authority_files["weight_inventory_path"]),
                 architecture_path=root / str(config.gates["architecture_metadata_path"]),
-                expected_architecture_sha256=str(
-                    config.gates["architecture_metadata_sha256"]
-                ),
+                expected_architecture_sha256=str(config.gates["architecture_metadata_sha256"]),
                 runtime_receipt_path=root / str(config.authority_files["runtime_receipt_path"]),
                 image_build_identity_path=root / str(config.gates["image_build_identity_path"]),
                 evaluation_lock_path=root / str(config.authority_files["evaluation_lock_path"]),
@@ -919,6 +921,78 @@ def plan_reference_bootstrap_preview(
     }
 
 
+def plan_reference_additional_preview(
+    config: ReferenceJobConfig,
+    *,
+    root: Path,
+    request_path: Path,
+    request_sha256: str,
+    image_lock_path: Path,
+    image_lock_sha256: str,
+    provider_capability_path: Path,
+    provider_capability_sha256: str,
+    billing_authority_path: Path,
+    billing_receipt_path: Path,
+    billing_report_path: Path,
+    publication_manifest_path: Path,
+    additional_authority_path: Path = ADDITIONAL_AUTHORITY_PATH,
+) -> dict[str, object]:
+    """Preview the final append-only action without reservation or provider contact."""
+    preview = plan_reference_bootstrap_preview(
+        config,
+        root=root,
+        request_path=request_path,
+        request_sha256=request_sha256,
+        image_lock_path=image_lock_path,
+        image_lock_sha256=image_lock_sha256,
+        provider_capability_path=provider_capability_path,
+        provider_capability_sha256=provider_capability_sha256,
+        billing_authority_path=billing_authority_path,
+        billing_receipt_path=billing_receipt_path,
+        billing_report_path=billing_report_path,
+        publication_manifest_path=publication_manifest_path,
+    )
+    blockers = list(preview["blockers"])
+    binding: AdditionalReferenceBinding | None = None
+    try:
+        request_bytes = (root.resolve() / request_path).read_bytes()
+        request = validate_bootstrap_request_bytes(request_bytes)
+        request_raw = json.loads(request.canonical_json)
+        if request_raw["action"] != "u8_reference_additional_once":
+            raise ReferenceBootstrapError("additional bootstrap action drift")
+        authority_sha256 = validate_reference_additional_authority(
+            root.resolve(), additional_authority_path
+        )
+        execution_scope = config.reference_execution_scope_sha256
+        if execution_scope is None:
+            raise ReferenceBootstrapError("additional execution scope is unavailable")
+        binding = additional_reference_binding(
+            config_sha256=config.sha256,
+            config_challenge_sha256=config.challenge_sha256,
+            request_sha256=request.sha256,
+            execution_scope_sha256=execution_scope,
+        )
+    except (OSError, ReferenceAuthorityError, ReferenceBootstrapError, ValueError):
+        authority_sha256 = None
+        blockers.append("additional_authority_unverified")
+    blockers = sorted(set(blockers))
+    return {
+        **preview,
+        "schema_version": 2,
+        "kind": "modal_reference_additional_preview",
+        "action": "u8_reference_additional_once",
+        "additional_authority_sha256": authority_sha256,
+        "packet_sha256": None if binding is None else binding.packet_sha256,
+        "challenge_sha256": None if binding is None else binding.challenge_sha256,
+        "capability_sha256": None if binding is None else binding.capability_sha256,
+        "bootstrap_ready": not blockers,
+        "deterministic_state": "bootstrap_ready" if not blockers else "stopped",
+        "configured_context_tokens": 262144,
+        "proven_useful_context_tokens": None,
+        "blockers": blockers,
+    }
+
+
 def _verify_runtime_receipt_bytes(
     path: Path, *, root: Path, runtime_lock: RuntimeLock, expected_sha256: str
 ) -> bool:
@@ -928,15 +1002,10 @@ def _verify_runtime_receipt_bytes(
     return hashlib.sha256(receipt_bytes).hexdigest() == expected_sha256
 
 
-def _load_bound_evaluation_lock(
-    path: Path, *, expected_file_sha256: str
-) -> dict[str, Any]:
+def _load_bound_evaluation_lock(path: Path, *, expected_file_sha256: str) -> dict[str, Any]:
     content = path.read_bytes()
     raw = json.loads(content.decode("utf-8"))
-    if (
-        not isinstance(raw, dict)
-        or hashlib.sha256(content).hexdigest() != expected_file_sha256
-    ):
+    if not isinstance(raw, dict) or hashlib.sha256(content).hexdigest() != expected_file_sha256:
         raise ReferenceJobError("evaluation lock bytes drift")
     return raw
 
