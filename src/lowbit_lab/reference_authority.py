@@ -9,6 +9,15 @@ from typing import Any
 
 from lowbit_lab.config import SHA256_RE
 from lowbit_lab.constants import (
+    REFERENCE_ADDITIONAL_AUTHORITY_SHA256,
+    REFERENCE_ADDITIONAL_BASE_COMMIT,
+    REFERENCE_ADDITIONAL_CUMULATIVE_CAP_USD,
+    REFERENCE_ADDITIONAL_INCREMENTAL_CAP_USD,
+    REFERENCE_ADDITIONAL_PRIOR_EXECUTION_SCOPE_SHA256,
+    REFERENCE_ADDITIONAL_PRIOR_SPEND_USD,
+    REFERENCE_ADDITIONAL_SETTLEMENT_RECEIPT_SHA256,
+    REFERENCE_ADDITIONAL_STATEMENT_ARTIFACT_SHA256,
+    REFERENCE_ADDITIONAL_STATEMENT_SHA256,
     REFERENCE_AUTHORITY_SHA256,
     REFERENCE_AUTHORITY_STATEMENT_SHA256,
     REFERENCE_BOOTSTRAP_AUTHORITY_SHA256,
@@ -49,6 +58,11 @@ WORKSPACE_RECONCILIATION_STATEMENT_PATH = Path(
 WORKSPACE_RECONCILIATION_AUTHORITY_PATH = Path(
     "configs/local/reference-workspace-scope-reconciliation-authority.json"
 )
+ADDITIONAL_STATEMENT_PATH = Path("configs/local/reference-additional-u8-standing-authority.txt")
+ADDITIONAL_AUTHORITY_PATH = Path("configs/local/reference-additional-u8-authority.json")
+ADDITIONAL_SETTLEMENT_RECEIPT_PATH = Path(
+    "reports/local/reference-replacement-settlement-receipt.json"
+)
 CONTROLLING_PLANS = {
     "original_reference_baseline": (
         Path("docs/plans/local/2026-08-21-2358-feat-full-weight-baseline-plan.md"),
@@ -86,6 +100,20 @@ BOOTSTRAP_PRE_SUBMIT_GATES = (
     "resource_envelope",
     "source_hashes",
     "static_lineage",
+)
+ADDITIONAL_ACTION_CLASS = "u8_reference_additional_once"
+ADDITIONAL_REQUIRED_PRE_SUBMIT_GATES = (
+    "lineage",
+    "clean_tree",
+    "privacy",
+    "provenance",
+    "evaluation_lock",
+    "runtime",
+    "memory_lower_bound",
+    "provider_environment",
+    "resource_envelope",
+    "watchdog",
+    "budget",
 )
 
 
@@ -247,6 +275,67 @@ def build_workspace_scope_reconciliation_authority(
         "replacement_action": "u8_reference_replacement_once",
         "schema_version": 1,
         "statement_sha256": REFERENCE_WORKSPACE_RECONCILIATION_STATEMENT_SHA256,
+    }
+
+
+def build_reference_additional_authority() -> dict[str, Any]:
+    """Return the closed third-generation U8 authority without reopening history."""
+    return {
+        "schema_version": 1,
+        "kind": "reference_additional_u8_authority",
+        "statement_sha256": REFERENCE_ADDITIONAL_STATEMENT_SHA256,
+        "statement_artifact_sha256": REFERENCE_ADDITIONAL_STATEMENT_ARTIFACT_SHA256,
+        "statement_framing": "utf-8-lf-paragraphs-terminal-lf",
+        "approved_base_commit": REFERENCE_ADDITIONAL_BASE_COMMIT,
+        "parent_recovery_authority_sha256": REFERENCE_RECOVERY_AUTHORITY_SHA256,
+        "parent_signed_cdn_authority_sha256": REFERENCE_SIGNED_CDN_AUTHORITY_SHA256,
+        "settled_replacement_receipt_sha256": (REFERENCE_ADDITIONAL_SETTLEMENT_RECEIPT_SHA256),
+        "settled_replacement_execution_scope_sha256": (
+            REFERENCE_ADDITIONAL_PRIOR_EXECUTION_SCOPE_SHA256
+        ),
+        "action_class": ADDITIONAL_ACTION_CLASS,
+        "required_pre_submit_gates": list(ADDITIONAL_REQUIRED_PRE_SUBMIT_GATES),
+        "additional_u8_slots": 1,
+        "subsequent_retry_or_replacement_slots": 0,
+        "authoritative_prior_spend_usd": str(REFERENCE_ADDITIONAL_PRIOR_SPEND_USD),
+        "incremental_u8_cap_usd": str(REFERENCE_ADDITIONAL_INCREMENTAL_CAP_USD),
+        "cumulative_lab_cap_usd": str(REFERENCE_ADDITIONAL_CUMULATIVE_CAP_USD),
+        "currency": "USD",
+        "gpu": "A100-80GB:1",
+        "max_concurrent_containers": 1,
+        "max_spawns": 1,
+        "timeout_seconds": 2700,
+        "provider_retries": 0,
+        "application_retries": 0,
+        "fallback_gpu_authorized": False,
+        "configured_context_tokens": 262144,
+        "proven_useful_context_tokens": None,
+        "revision_pinned_remote_public_artifact_retrieval_authorized": True,
+        "signed_cdn_size_sha256_privacy_provenance_timeout_controls_required": True,
+        "sanitized_evaluation_evidence_only": True,
+        "authenticated_local_provider_profile_only": True,
+        "credential_values_may_be_read_copied_logged_persisted_or_passed": False,
+        "provider_auth_receipt_required_before_submission_and_billing_capture": True,
+        "private_data_authorized": False,
+        "user_or_work_payloads_authorized": False,
+        "local_weight_transfer_authorized": False,
+        "secrets_passed_to_worker_authorized": False,
+        "mounts_volumes_persistent_storage_authorized": False,
+        "source_mounts_or_uploads_authorized": False,
+        "scheduling_authorized": False,
+        "destructive_cleanup_authorized": False,
+        "overlapping_reservations_authorized": False,
+        "additional_provider_actions_authorized": False,
+        "candidate_conversion_training_promotion_authorized": False,
+        "candidate_execution_authorized": False,
+        "numeric_threshold_approval_authorized": False,
+        "submitted_failed_timed_out_or_ambiguous_consumes_slot": True,
+        "authoritative_billing_settlement_required": True,
+        "tracked_repository_target_neutral_required": True,
+        "target_specific_information_ignored_local_only": True,
+        "promotion_privacy_lineage_budget_controls_may_be_weakened": False,
+        "u9_after_successful_terminal_settlement_authorized": True,
+        "u9_proposal_only": True,
     }
 
 
@@ -588,3 +677,94 @@ def validate_workspace_scope_reconciliation_authority(
     ):
         raise ReferenceAuthorityError("workspace reconciliation authority boundary has drifted")
     return authority
+
+
+def validate_reference_additional_authority(
+    root: Path,
+    authority_path: Path = ADDITIONAL_AUTHORITY_PATH,
+) -> str:
+    """Validate the exact append-only authority and its settled parent receipt."""
+    validate_reference_recovery_authority(root, RECOVERY_AUTHORITY_PATH)
+    try:
+        root = root.resolve(strict=True)
+    except OSError as exc:
+        raise ReferenceAuthorityError(
+            "additional authority repository root is unavailable"
+        ) from exc
+
+    expected_path = _confined_path(root, ADDITIONAL_AUTHORITY_PATH, "additional authority")
+    resolved_path = (
+        authority_path.resolve()
+        if authority_path.is_absolute()
+        else (root / authority_path).resolve()
+    )
+    if resolved_path != expected_path:
+        raise ReferenceAuthorityError("additional authority path is fixed")
+
+    statement = _read(
+        _confined_path(root, ADDITIONAL_STATEMENT_PATH, "additional authority statement"),
+        "additional authority statement",
+    )
+    if (
+        statement.startswith(b"\xef\xbb\xbf")
+        or not statement.endswith(b"\n")
+        or statement.endswith(b"\n\n")
+        or b"\r" in statement
+        or hashlib.sha256(statement).hexdigest() != REFERENCE_ADDITIONAL_STATEMENT_ARTIFACT_SHA256
+        or hashlib.sha256(statement[:-1]).hexdigest() != REFERENCE_ADDITIONAL_STATEMENT_SHA256
+    ):
+        raise ReferenceAuthorityError("additional authority statement bytes have drifted")
+    try:
+        statement.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as exc:
+        raise ReferenceAuthorityError("additional authority statement is not UTF-8") from exc
+
+    receipt_bytes = _read(
+        _confined_path(
+            root,
+            ADDITIONAL_SETTLEMENT_RECEIPT_PATH,
+            "settled replacement receipt",
+        ),
+        "settled replacement receipt",
+    )
+    if hashlib.sha256(receipt_bytes).hexdigest() != (
+        REFERENCE_ADDITIONAL_SETTLEMENT_RECEIPT_SHA256
+    ):
+        raise ReferenceAuthorityError("settled replacement receipt bytes have drifted")
+    try:
+        receipt = json.loads(
+            receipt_bytes.decode("utf-8", errors="strict"),
+            object_pairs_hook=_reject_duplicate_keys,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ReferenceAuthorityError("settled replacement receipt is invalid") from exc
+    if receipt.get("execution_scope_sha256") != (REFERENCE_ADDITIONAL_PRIOR_EXECUTION_SCOPE_SHA256):
+        raise ReferenceAuthorityError("settled replacement receipt execution scope has drifted")
+
+    authority_bytes = _read(resolved_path, "additional authority")
+    try:
+        authority = json.loads(
+            authority_bytes.decode("utf-8", errors="strict"),
+            object_pairs_hook=_reject_duplicate_keys,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ReferenceAuthorityError("additional authority is not valid UTF-8 JSON") from exc
+    expected = build_reference_additional_authority()
+    canonical_bytes = (canonical_json(expected) + "\n").encode("utf-8")
+    if authority_bytes != canonical_bytes:
+        raise ReferenceAuthorityError("additional authority raw bytes are not canonical")
+    if authority != expected or sha256_json(authority) != (REFERENCE_ADDITIONAL_AUTHORITY_SHA256):
+        raise ReferenceAuthorityError("additional authority boundary has drifted")
+    return REFERENCE_ADDITIONAL_AUTHORITY_SHA256
+
+
+def authorize_reference_additional_action(
+    root: Path,
+    authority_path: Path,
+    action_class: str,
+) -> str:
+    """Authorize only the separately identified final U8 action class."""
+    if action_class != ADDITIONAL_ACTION_CLASS:
+        raise ReferenceAuthorityError("additional action class is not authorized")
+    authority_sha256 = validate_reference_additional_authority(root, authority_path)
+    return sha256_json({"authority_sha256": authority_sha256, "action_class": action_class})

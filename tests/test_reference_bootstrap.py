@@ -5,6 +5,9 @@ import json
 import pytest
 
 from lowbit_lab.constants import (
+    REFERENCE_ADDITIONAL_AUTHORITY_SHA256,
+    REFERENCE_ADDITIONAL_PRIOR_EXECUTION_SCOPE_SHA256,
+    REFERENCE_ADDITIONAL_SETTLEMENT_RECEIPT_SHA256,
     REFERENCE_AUTHORITY_SHA256,
     REFERENCE_BOOTSTRAP_AUTHORITY_SHA256,
     REFERENCE_BOOTSTRAP_MERGE_COMMIT,
@@ -51,10 +54,7 @@ def _image_lock() -> dict[str, object]:
             "name": "runtime",
             "sha256": SHA_C,
             "size_bytes": 1024,
-            "url": (
-                "https://files.pythonhosted.org/packages/aa/bb/"
-                "runtime-1.0-py3-none-any.whl"
-            ),
+            "url": ("https://files.pythonhosted.org/packages/aa/bb/runtime-1.0-py3-none-any.whl"),
             "version": "1.0",
         }
     ]
@@ -179,6 +179,55 @@ def _request() -> dict[str, object]:
     }
 
 
+def _additional_request() -> dict[str, object]:
+    request = _request()
+    request["action"] = "u8_reference_additional_once"
+    request["schema_version"] = 2
+    request["authority"] = {
+        **request["authority"],  # type: ignore[dict-item]
+        "additional_sha256": REFERENCE_ADDITIONAL_AUTHORITY_SHA256,
+        "prior_execution_scope_sha256": (REFERENCE_ADDITIONAL_PRIOR_EXECUTION_SCOPE_SHA256),
+        "prior_settlement_receipt_sha256": (REFERENCE_ADDITIONAL_SETTLEMENT_RECEIPT_SHA256),
+    }
+    request["budget"] = {
+        "cumulative_cap_usd": "4.00564445",
+        "incremental_reserved_usd": "4.00",
+        "no_overlapping_reservations": True,
+        "provider_hard_dollar_cap": False,
+        "settled_before_usd": "0.00564445",
+    }
+    return request
+
+
+def test_additional_request_is_versioned_without_changing_original_schema() -> None:
+    original = validate_bootstrap_request(_request())
+    additional = validate_bootstrap_request(_additional_request())
+
+    assert json.loads(original.canonical_json)["schema_version"] == 1
+    assert json.loads(original.canonical_json)["action"] == "u8_reference_once"
+    assert json.loads(additional.canonical_json)["schema_version"] == 2
+    assert json.loads(additional.canonical_json)["action"] == ("u8_reference_additional_once")
+    assert additional.sha256 != original.sha256
+
+
+@pytest.mark.parametrize(
+    ("section", "field", "value"),
+    [
+        ("authority", "additional_sha256", SHA_A),
+        ("authority", "prior_settlement_receipt_sha256", SHA_B),
+        ("budget", "settled_before_usd", "0.00564446"),
+        ("budget", "cumulative_cap_usd", "4.00564446"),
+    ],
+)
+def test_additional_request_rejects_authority_or_settlement_drift(
+    section: str, field: str, value: str
+) -> None:
+    request = _additional_request()
+    request[section][field] = value  # type: ignore[index]
+    with pytest.raises(ReferenceBootstrapError):
+        validate_bootstrap_request(request)
+
+
 def test_valid_contract_is_bootstrap_ready_but_empirical_facts_remain_pending() -> None:
     request = _request()
     validated = validate_bootstrap_request_bytes(canonical_bytes(request))
@@ -235,10 +284,7 @@ def test_image_lock_rejects_recipe_dependency_and_builder_drift() -> None:
             "name": "unbound",
             "sha256": SHA_A,
             "size_bytes": 512,
-            "url": (
-                "https://files.pythonhosted.org/packages/aa/bb/"
-                "unbound-1.0-py3-none-any.whl"
-            ),
+            "url": ("https://files.pythonhosted.org/packages/aa/bb/unbound-1.0-py3-none-any.whl"),
             "version": "1.0",
         }
     )

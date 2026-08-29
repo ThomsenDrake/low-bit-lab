@@ -2,15 +2,21 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import dataclass
 
 from lowbit_lab.config import IMMUTABLE_REVISION_RE, SHA256_RE
+from lowbit_lab.constants import (
+    REFERENCE_ADDITIONAL_AUTHORITY_SHA256,
+    REFERENCE_ADDITIONAL_CUMULATIVE_CAP_USD,
+    REFERENCE_ADDITIONAL_INCREMENTAL_CAP_USD,
+    REFERENCE_ADDITIONAL_PRIOR_EXECUTION_SCOPE_SHA256,
+    REFERENCE_ADDITIONAL_PRIOR_SPEND_USD,
+    REFERENCE_ADDITIONAL_SETTLEMENT_RECEIPT_SHA256,
+)
+from lowbit_lab.handoff import sha256_json
 
-ORIGINAL_APPROVED_PLAN_SHA256 = (
-    "a45e791c83466f545f6ac204857722478a080a1ea4a007c47510fbc4aa2b86c4"
-)
-ORIGINAL_APPROVED_PLAN_PATH = (
-    "docs/plans/local/2026-08-21-2358-feat-full-weight-baseline-plan.md"
-)
+ORIGINAL_APPROVED_PLAN_SHA256 = "a45e791c83466f545f6ac204857722478a080a1ea4a007c47510fbc4aa2b86c4"
+ORIGINAL_APPROVED_PLAN_PATH = "docs/plans/local/2026-08-21-2358-feat-full-weight-baseline-plan.md"
 APPROVED_PROVIDER_AMENDMENT_SHA256 = (
     "0de9ff2c7ae791d524e59e6018b0356ea0d95ec9782754eaef411db8862ee114"
 )
@@ -62,6 +68,62 @@ REFERENCE_GATE_FIELDS = frozenset(
         "memory_method_sha256",
     }
 )
+
+
+@dataclass(frozen=True)
+class AdditionalReferenceBinding:
+    """Sanitized identities for the append-only additional U8 action."""
+
+    packet_sha256: str
+    challenge_sha256: str
+    capability_sha256: str
+
+
+def additional_reference_binding(
+    *,
+    config_sha256: str,
+    config_challenge_sha256: str,
+    request_sha256: str,
+    execution_scope_sha256: str,
+) -> AdditionalReferenceBinding:
+    """Derive the one additional action's packet, challenge, and capability identities."""
+    for label, value in (
+        ("config", config_sha256),
+        ("config challenge", config_challenge_sha256),
+        ("request", request_sha256),
+        ("execution scope", execution_scope_sha256),
+    ):
+        if SHA256_RE.fullmatch(value) is None:
+            raise ValueError(f"{label} must be lowercase SHA-256")
+    packet = {
+        "action": "u8_reference_additional_once",
+        "additional_authority_sha256": REFERENCE_ADDITIONAL_AUTHORITY_SHA256,
+        "config_sha256": config_sha256,
+        "cumulative_cap_usd": str(REFERENCE_ADDITIONAL_CUMULATIVE_CAP_USD),
+        "execution_scope_sha256": execution_scope_sha256,
+        "incremental_cap_usd": str(REFERENCE_ADDITIONAL_INCREMENTAL_CAP_USD),
+        "prior_execution_scope_sha256": (REFERENCE_ADDITIONAL_PRIOR_EXECUTION_SCOPE_SHA256),
+        "prior_settlement_receipt_sha256": (REFERENCE_ADDITIONAL_SETTLEMENT_RECEIPT_SHA256),
+        "prior_spend_usd": str(REFERENCE_ADDITIONAL_PRIOR_SPEND_USD),
+        "request_sha256": request_sha256,
+    }
+    packet_sha256 = sha256_json(packet)
+    challenge_sha256 = sha256_json(
+        {
+            "config_challenge_sha256": config_challenge_sha256,
+            "packet_sha256": packet_sha256,
+        }
+    )
+    capability_sha256 = sha256_json(
+        {
+            "action": "u8_reference_additional_once",
+            "additional_authority_sha256": REFERENCE_ADDITIONAL_AUTHORITY_SHA256,
+            "challenge_sha256": challenge_sha256,
+            "packet_sha256": packet_sha256,
+            "request_sha256": request_sha256,
+        }
+    )
+    return AdditionalReferenceBinding(packet_sha256, challenge_sha256, capability_sha256)
 
 
 def reference_execution_scope_sha256(

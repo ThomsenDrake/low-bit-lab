@@ -19,6 +19,12 @@ from urllib.parse import unquote, urlsplit
 
 from lowbit_lab.config import IMMUTABLE_REVISION_RE, SHA256_RE
 from lowbit_lab.constants import (
+    REFERENCE_ADDITIONAL_AUTHORITY_SHA256,
+    REFERENCE_ADDITIONAL_CUMULATIVE_CAP_USD,
+    REFERENCE_ADDITIONAL_INCREMENTAL_CAP_USD,
+    REFERENCE_ADDITIONAL_PRIOR_EXECUTION_SCOPE_SHA256,
+    REFERENCE_ADDITIONAL_PRIOR_SPEND_USD,
+    REFERENCE_ADDITIONAL_SETTLEMENT_RECEIPT_SHA256,
     REFERENCE_AUTHORITY_SHA256,
     REFERENCE_BOOTSTRAP_AUTHORITY_SHA256,
     REFERENCE_BOOTSTRAP_MERGE_COMMIT,
@@ -31,6 +37,8 @@ from lowbit_lab.constants import (
 from lowbit_lab.reference_contract import REFERENCE_RESOURCES
 
 REQUEST_KIND = "reference_bootstrap_request"
+ORIGINAL_ACTION = "u8_reference_once"
+ADDITIONAL_ACTION = "u8_reference_additional_once"
 IMAGE_LOCK_KIND = "reference_modal_image_lock"
 STAGE_KIND = "reference_bootstrap_stage_receipt"
 RECEIPT_KIND = "reference_bootstrap_receipt"
@@ -57,9 +65,7 @@ BUILD_STEPS = (
     "from_registry_by_digest",
     "install_hashed_public_python_artifacts",
 )
-DEPENDENCY_ARTIFACT_HOSTS = frozenset(
-    {"download-r2.pytorch.org", "files.pythonhosted.org"}
-)
+DEPENDENCY_ARTIFACT_HOSTS = frozenset({"download-r2.pytorch.org", "files.pythonhosted.org"})
 FUTURE_STAGE_RESERVES_SECONDS = {
     "evaluation": 840,
     "finalization": 60,
@@ -353,9 +359,7 @@ def build_image_lock_from_pylock(
     artifacts: list[dict[str, object]] = []
     for index, raw_package in enumerate(packages):
         optional_keys = (
-            {"marker"}
-            if isinstance(raw_package, Mapping) and "marker" in raw_package
-            else set()
+            {"marker"} if isinstance(raw_package, Mapping) and "marker" in raw_package else set()
         )
         package = _closed(
             raw_package,
@@ -501,31 +505,49 @@ def _validate_request_mapping(raw: object) -> BootstrapRequest:
         },
         "bootstrap request",
     )
-    if (
-        request["schema_version"] != 1
-        or request["kind"] != REQUEST_KIND
-        or request["action"] != "u8_reference_once"
-    ):
+    action = request["action"]
+    schema_version = request["schema_version"]
+    if request["kind"] != REQUEST_KIND or (schema_version, action) not in {
+        (1, ORIGINAL_ACTION),
+        (2, ADDITIONAL_ACTION),
+    }:
         raise ReferenceBootstrapError("bootstrap request identity drift")
 
+    additional = action == ADDITIONAL_ACTION
+    authority_keys = {
+        "bootstrap_sha256",
+        "merge_commit",
+        "parent_sha256",
+        "signed_cdn_merge_commit",
+        "signed_cdn_sha256",
+    }
+    if additional:
+        authority_keys |= {
+            "additional_sha256",
+            "prior_execution_scope_sha256",
+            "prior_settlement_receipt_sha256",
+        }
     authority = _closed(
         request["authority"],
-        {
-            "bootstrap_sha256",
-            "merge_commit",
-            "parent_sha256",
-            "signed_cdn_merge_commit",
-            "signed_cdn_sha256",
-        },
+        authority_keys,
         "bootstrap authority binding",
     )
-    if authority != {
+    expected_authority = {
         "bootstrap_sha256": REFERENCE_BOOTSTRAP_AUTHORITY_SHA256,
         "merge_commit": REFERENCE_BOOTSTRAP_MERGE_COMMIT,
         "parent_sha256": REFERENCE_AUTHORITY_SHA256,
         "signed_cdn_merge_commit": REFERENCE_SIGNED_CDN_MERGE_COMMIT,
         "signed_cdn_sha256": REFERENCE_SIGNED_CDN_AUTHORITY_SHA256,
-    }:
+    }
+    if additional:
+        expected_authority.update(
+            {
+                "additional_sha256": REFERENCE_ADDITIONAL_AUTHORITY_SHA256,
+                "prior_execution_scope_sha256": (REFERENCE_ADDITIONAL_PRIOR_EXECUTION_SCOPE_SHA256),
+                "prior_settlement_receipt_sha256": (REFERENCE_ADDITIONAL_SETTLEMENT_RECEIPT_SHA256),
+            }
+        )
+    if authority != expected_authority:
         raise ReferenceBootstrapError("bootstrap authority binding drift")
 
     lineage = _closed(
@@ -560,9 +582,7 @@ def _validate_request_mapping(raw: object) -> BootstrapRequest:
         raise ReferenceBootstrapError("source artifact list hash mismatch")
 
     image_lock_raw = request["image_lock"]
-    image_binding = _closed(
-        image_lock_raw, {"recipe_sha256", "sha256"}, "image lock binding"
-    )
+    image_binding = _closed(image_lock_raw, {"recipe_sha256", "sha256"}, "image lock binding")
     image_lock_sha256 = _sha256(image_binding["sha256"], "image lock hash")
     recipe_sha256 = _sha256(image_binding["recipe_sha256"], "image recipe hash")
     capability = _closed(
@@ -606,15 +626,23 @@ def _validate_request_mapping(raw: object) -> BootstrapRequest:
         "bootstrap budget",
     )
     expected_budget = {
-        "cumulative_cap_usd": str(REFERENCE_CUMULATIVE_CAP_USD),
-        "incremental_reserved_usd": str(REFERENCE_INCREMENTAL_CAP_USD),
+        "cumulative_cap_usd": str(
+            REFERENCE_ADDITIONAL_CUMULATIVE_CAP_USD if additional else REFERENCE_CUMULATIVE_CAP_USD
+        ),
+        "incremental_reserved_usd": str(
+            REFERENCE_ADDITIONAL_INCREMENTAL_CAP_USD
+            if additional
+            else REFERENCE_INCREMENTAL_CAP_USD
+        ),
         "no_overlapping_reservations": True,
         "provider_hard_dollar_cap": False,
-        "settled_before_usd": str(REFERENCE_SETTLED_SMOKE_USD),
+        "settled_before_usd": str(
+            REFERENCE_ADDITIONAL_PRIOR_SPEND_USD if additional else REFERENCE_SETTLED_SMOKE_USD
+        ),
     }
-    if budget != expected_budget or Decimal(
-        str(budget["incremental_reserved_usd"])
-    ) != Decimal("4.00"):
+    if budget != expected_budget or Decimal(str(budget["incremental_reserved_usd"])) != Decimal(
+        "4.00"
+    ):
         raise ReferenceBootstrapError("bootstrap budget drift")
 
     if request["configured_context_tokens"] != CONFIGURED_CONTEXT_TOKENS:
@@ -624,8 +652,7 @@ def _validate_request_mapping(raw: object) -> BootstrapRequest:
         not isinstance(raw_ladder, list)
         or not raw_ladder
         or any(
-            not isinstance(item, int) or isinstance(item, bool) or item <= 0
-            for item in raw_ladder
+            not isinstance(item, int) or isinstance(item, bool) or item <= 0 for item in raw_ladder
         )
         or raw_ladder != sorted(set(raw_ladder))
         or raw_ladder[-1] != CONFIGURED_CONTEXT_TOKENS
@@ -735,9 +762,7 @@ def validate_bootstrap_request_bytes(content: bytes) -> BootstrapRequest:
     return _validate_request_mapping(_parse_canonical(content, "bootstrap request"))
 
 
-def validate_request_image_lock(
-    request: BootstrapRequest, image_lock: ImageLock
-) -> None:
+def validate_request_image_lock(request: BootstrapRequest, image_lock: ImageLock) -> None:
     """Prove that the separately persisted image lock is the request's exact lock."""
     raw = json.loads(request.canonical_json)
     binding = raw["image_lock"]
@@ -918,10 +943,7 @@ def _validate_receipt_mapping(raw: object, request: BootstrapRequest) -> Bootstr
     if status == "failed":
         failure = _closed(terminal_failure, {"code", "stage"}, "terminal failure")
         failed_stage = json.loads(failures[0].canonical_json)
-        if (
-            failure["stage"] != failures[0].stage
-            or failure["code"] != failed_stage["failure_code"]
-        ):
+        if failure["stage"] != failures[0].stage or failure["code"] != failed_stage["failure_code"]:
             raise ReferenceBootstrapError("terminal failure does not match the failed stage")
 
     facts = _closed(receipt["empirical_facts"], set(EMPIRICAL_FACTS), "empirical facts")
@@ -933,9 +955,7 @@ def _validate_receipt_mapping(raw: object, request: BootstrapRequest) -> Bootstr
         "runtime_allocator_overhead",
         "usable_gpu_memory",
     )
-    if status == "succeeded" and any(
-        facts[fact] is not True for fact in required_provider_facts
-    ):
+    if status == "succeeded" and any(facts[fact] is not True for fact in required_provider_facts):
         raise ReferenceBootstrapError("successful receipt is missing provider-derived facts")
     maximum = _nonnegative_int(receipt["max_completed_context_tokens"], "maximum completed context")
     if maximum not in {0, *request.context_ladder_tokens}:

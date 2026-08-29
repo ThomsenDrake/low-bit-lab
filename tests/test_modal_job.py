@@ -12,10 +12,12 @@ import yaml
 
 import lowbit_lab.modal_job as modal_job
 from lowbit_lab import reference_gates
+from lowbit_lab.constants import REFERENCE_ADDITIONAL_AUTHORITY_SHA256
 from lowbit_lab.modal_job import (
     ReferenceJobError,
     load_reference_job_config,
     main,
+    plan_reference_additional_preview,
     plan_reference_bootstrap_preview,
     plan_reference_dry_run,
     plan_reference_preview,
@@ -804,6 +806,65 @@ def test_bootstrap_preview_filters_only_empirical_precontact_blockers(
     assert stopped["blockers"] == ["review_tree_dirty"]
 
 
+def test_additional_preview_binds_closed_authority_and_never_proves_context(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    request_path = Path("additional-request.json")
+    (tmp_path / request_path).write_bytes(b"request")
+    config = SimpleNamespace(
+        sha256="1" * 64,
+        challenge_sha256="2" * 64,
+        reference_execution_scope_sha256="3" * 64,
+    )
+    monkeypatch.setattr(
+        modal_job,
+        "plan_reference_bootstrap_preview",
+        lambda *args, **kwargs: {
+            "bootstrap_ready": True,
+            "blockers": [],
+            "configured_context_tokens": 262144,
+            "proven_useful_context_tokens": None,
+        },
+    )
+    monkeypatch.setattr(
+        modal_job,
+        "validate_bootstrap_request_bytes",
+        lambda content: SimpleNamespace(
+            canonical_json='{"action":"u8_reference_additional_once"}',
+            sha256="4" * 64,
+        ),
+    )
+    monkeypatch.setattr(
+        modal_job,
+        "validate_reference_additional_authority",
+        lambda root, path: REFERENCE_ADDITIONAL_AUTHORITY_SHA256,
+    )
+
+    result = plan_reference_additional_preview(
+        config,
+        root=tmp_path,
+        request_path=request_path,
+        request_sha256="4" * 64,
+        image_lock_path=Path("image.json"),
+        image_lock_sha256="5" * 64,
+        provider_capability_path=Path("capability.json"),
+        provider_capability_sha256="6" * 64,
+        billing_authority_path=Path("billing-authority.json"),
+        billing_receipt_path=Path("billing-receipt.json"),
+        billing_report_path=Path("billing-report.json"),
+        publication_manifest_path=Path("publication.yaml"),
+    )
+
+    assert result["action"] == "u8_reference_additional_once"
+    assert result["additional_authority_sha256"] == REFERENCE_ADDITIONAL_AUTHORITY_SHA256
+    assert result["packet_sha256"] is not None
+    assert result["challenge_sha256"] is not None
+    assert result["capability_sha256"] is not None
+    assert result["configured_context_tokens"] == 262144
+    assert result["proven_useful_context_tokens"] is None
+    assert result["bootstrap_ready"] is True
+
+
 def test_provider_output_is_bounded_and_redacted() -> None:
     output = redact_provider_output(
         "modal_token_id="
@@ -1039,11 +1100,12 @@ def test_u8_submission_primitives_are_absent() -> None:
             assert sorted(violations) == [
                 "App",
                 "modal",
-                    "modal._serialization",
-                    "modal._vendor",
-                    "modal._vendor",
-                    "modal.config",
-                    "spawn",
+                "modal._serialization",
+                "modal._vendor",
+                "modal._vendor",
+                "modal.client",
+                "modal.config",
+                "spawn",
             ], path
             source = path.read_text(encoding="utf-8")
             assert source.count("modal.App(") == 1
@@ -1052,7 +1114,7 @@ def test_u8_submission_primitives_are_absent() -> None:
             assert source.count("image.build(") == 1
             assert "include_source=False" in source
             assert "retries=0" in source
-            assert "gpu=\"A100-80GB:1\"" in source
+            assert 'gpu="A100-80GB:1"' in source
             for forbidden in (".deploy(", "modal.Secret", "modal.Volume", "mounts=", "schedule="):
                 assert forbidden not in source, forbidden
         else:

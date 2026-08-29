@@ -7,11 +7,14 @@ from datetime import UTC, datetime
 import pytest
 
 from lowbit_lab.reference_replacement_settlement import (
+    ADDITIONAL_RECEIPT_KIND,
+    ADDITIONAL_REPORT_KIND,
     APP_KIND,
     RECEIPT_KIND,
     REPORT_KIND,
     ReplacementSettlementError,
     canonical_bytes,
+    validate_additional_settlement,
     validate_replacement_settlement,
 )
 from lowbit_lab.reference_settlement import AUTH_METHOD_SHA256
@@ -261,3 +264,142 @@ def test_replacement_integer_fields_reject_type_drift(
     receipt = canonical_bytes(parts["receipt"])
     with pytest.raises(ReplacementSettlementError):
         _validate((receipt, app, report, pre, post))
+
+
+def _additional_evidence(
+    mode: str = "call", *, actual_cost: str = "0.375"
+) -> tuple[bytes, bytes, bytes, bytes, bytes]:
+    provider_identity = None if mode == "workspace_zero_preidentity" else "fc-" + "A" * 22
+    if mode in {"app", "billing_only"}:
+        provider_identity = "ap-" + "A" * 22
+    kind, source = {
+        "app": ("reference_additional_app_identity", "durable_app_identity"),
+        "billing_only": (
+            "reference_additional_billing_identity",
+            "authoritative_filtered_billing_report",
+        ),
+        "call": ("reference_additional_call_identity", "durable_call_identity"),
+        "workspace_zero_preidentity": (
+            "reference_additional_workspace_zero_identity",
+            "complete_workspace_billing",
+        ),
+    }[mode]
+    identity = canonical_bytes(
+        {
+            "identity_source": source,
+            "kind": kind,
+            "provider_identity": provider_identity,
+            "schema_version": 1,
+        }
+    )
+    rows = []
+    if provider_identity is not None:
+        rows = [
+            {
+                "cost": actual_cost,
+                "interval_start": "2026-08-27T14:00:00+00:00",
+                "object_id": provider_identity,
+                "resource": "gpu",
+            }
+        ]
+    report = canonical_bytes(
+        {"kind": ADDITIONAL_REPORT_KIND, "rows": rows, "schema_version": 1}
+    )
+    pre, post = _auth("a"), _auth("b")
+    execution_receipt = None if mode in {"billing_only", "workspace_zero_preidentity"} else "b" * 64
+    receipt = canonical_bytes(
+        {
+            "acquired_at": "2026-08-27T17:01:00+00:00",
+            "actual_cost_usd": "0" if mode == "workspace_zero_preidentity" else actual_cost,
+            "additional_authority_sha256": "c" * 64,
+            "attribution_mode": mode,
+            "authenticated_workspace_identity_sha256": DIGESTS["workspace"],
+            "authoritative_report_identity_sha256": DIGESTS["report"],
+            "billing_authority_sha256": DIGESTS["billing"],
+            "billing_method_sha256": DIGESTS["method"],
+            "captured_at": "2026-08-27T17:00:30+00:00",
+            "completeness_delay_seconds": 3600,
+            "environment_scope_sha256": DIGESTS["environment"],
+            "execution_manifest_sha256": None if execution_receipt is None else "d" * 64,
+            "execution_receipt_sha256": execution_receipt,
+            "execution_scope_sha256": DIGESTS["scope"],
+            "filtered_report_sha256": hashlib.sha256(report).hexdigest(),
+            "filtered_report_size_bytes": len(report),
+            "identity_evidence_sha256": hashlib.sha256(identity).hexdigest(),
+            "kind": ADDITIONAL_RECEIPT_KIND,
+            "post_auth_receipt_sha256": hashlib.sha256(post).hexdigest(),
+            "pre_auth_receipt_sha256": hashlib.sha256(pre).hexdigest(),
+            "provider": "modal",
+            "query_end": "2026-08-27T16:00:00+00:00",
+            "query_start": "2026-08-27T14:00:00+00:00",
+            "reservation_id": "additional-one",
+            "schema_version": 1,
+        }
+    )
+    return receipt, identity, report, pre, post
+
+
+def _validate_additional(parts: tuple[bytes, bytes, bytes, bytes, bytes]):
+    receipt, identity, report, pre, post = parts
+    return validate_additional_settlement(
+        receipt,
+        identity,
+        report,
+        pre_auth_receipt_bytes=pre,
+        post_auth_receipt_bytes=post,
+        expected_reservation_id="additional-one",
+        expected_execution_scope_sha256=DIGESTS["scope"],
+        expected_additional_authority_sha256="c" * 64,
+        expected_environment_scope_sha256=DIGESTS["environment"],
+        expected_original_workspace_scope_sha256=DIGESTS["original"],
+        expected_workspace_identity_sha256=DIGESTS["workspace"],
+        expected_reconciliation_authority_sha256=DIGESTS["reconciliation"],
+        expected_auth_binding_sha256=DIGESTS["binding"],
+        expected_billing_authority_sha256=DIGESTS["billing"],
+        expected_billing_method_sha256=DIGESTS["method"],
+        expected_report_identity_sha256=DIGESTS["report"],
+        action_consumed_at=datetime(2026, 8, 27, 14, 27, 54, tzinfo=UTC),
+        latest_boundary_at=datetime(2026, 8, 27, 14, 29, 27, tzinfo=UTC),
+        maximum_action_seconds=2700,
+        expected_completeness_delay_seconds=3600,
+        validated_at=datetime(2026, 8, 27, 17, 1, 1, tzinfo=UTC),
+    )
+
+
+@pytest.mark.parametrize(
+    "mode", ["call", "app", "billing_only", "workspace_zero_preidentity"]
+)
+def test_additional_settlement_accepts_each_factual_identity_mode(mode: str) -> None:
+    evidence = _validate_additional(_additional_evidence(mode))
+    assert evidence.attribution_mode == mode
+    assert (evidence.provider_identity is None) == (mode == "workspace_zero_preidentity")
+
+
+@pytest.mark.parametrize(
+    "mutation", ["multiple", "nonzero_zero", "stale", "auth", "capture", "lineage"]
+)
+def test_additional_settlement_rejects_ambiguous_or_incomplete_evidence(mutation: str) -> None:
+    receipt, identity, report, pre, post = _additional_evidence()
+    raw_receipt = json.loads(receipt)
+    raw_report = json.loads(report)
+    if mutation == "multiple":
+        raw_report["rows"].append({**raw_report["rows"][0], "object_id": "fc-" + "B" * 22})
+    elif mutation == "nonzero_zero":
+        receipt, identity, report, pre, post = _additional_evidence("workspace_zero_preidentity")
+        raw_receipt, raw_report = json.loads(receipt), json.loads(report)
+        raw_receipt["actual_cost_usd"] = "0.01"
+    elif mutation == "stale":
+        raw_receipt["query_end"] = "2026-08-27T15:00:00+00:00"
+    elif mutation == "auth":
+        post = pre
+    elif mutation == "capture":
+        raw_receipt["captured_at"] = "2026-08-27T16:59:59+00:00"
+    else:
+        raw_receipt["additional_authority_sha256"] = "e" * 64
+    report = canonical_bytes(raw_report)
+    raw_receipt["filtered_report_sha256"] = hashlib.sha256(report).hexdigest()
+    raw_receipt["filtered_report_size_bytes"] = len(report)
+    raw_receipt["post_auth_receipt_sha256"] = hashlib.sha256(post).hexdigest()
+    receipt = canonical_bytes(raw_receipt)
+    with pytest.raises(ReplacementSettlementError):
+        _validate_additional((receipt, identity, report, pre, post))

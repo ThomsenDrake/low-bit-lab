@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -7,7 +8,15 @@ from types import SimpleNamespace
 import pytest
 import yaml
 
+import lowbit_lab.reference_modal_adapter as modal_adapter
 import lowbit_lab.reference_orchestrator as orchestrator
+from lowbit_lab.constants import (
+    REFERENCE_ADDITIONAL_AUTHORITY_SHA256,
+    REFERENCE_ADDITIONAL_PRIOR_EXECUTION_SCOPE_SHA256,
+    REFERENCE_ADDITIONAL_SETTLEMENT_RECEIPT_SHA256,
+)
+from lowbit_lab.db import ResultsDatabase
+from lowbit_lab.reference_contract import additional_reference_binding
 from lowbit_lab.reference_modal_adapter import (
     PreparedModalGraph,
     ReferenceModalCapability,
@@ -423,7 +432,6 @@ def test_capability_canonicalizes_verified_local_evaluation_lock(tmp_path: Path)
     observed: dict[str, object] = {}
 
     with pytest.MonkeyPatch.context() as monkeypatch:
-
         monkeypatch.setattr(
             orchestrator,
             "validate_bootstrap_request_bytes",
@@ -494,6 +502,130 @@ def test_prepare_writes_only_ignored_request_and_does_not_touch_database(
     assert result is capability
     assert (tmp_path / orchestrator.REQUEST_PATH).read_bytes() == b"request"
     assert not (tmp_path / orchestrator.DATABASE_PATH).exists()
+
+
+def test_additional_binding_is_reproducible_and_authority_bound() -> None:
+    inputs = {
+        "config_sha256": "1" * 64,
+        "config_challenge_sha256": "2" * 64,
+        "request_sha256": "3" * 64,
+        "execution_scope_sha256": "4" * 64,
+    }
+    first = additional_reference_binding(**inputs)
+    second = additional_reference_binding(**inputs)
+
+    assert first == second
+    assert first.packet_sha256 != first.challenge_sha256
+    assert first.challenge_sha256 != first.capability_sha256
+    assert additional_reference_binding(**{**inputs, "request_sha256": "5" * 64}) != first
+
+
+def test_prepare_additional_is_local_and_binds_available_grant(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = SimpleNamespace(
+        sha256="1" * 64,
+        challenge_sha256="2" * 64,
+        reference_execution_scope_sha256="3" * 64,
+    )
+    capability = _capability(tmp_path)
+    monkeypatch.setattr(orchestrator, "refresh_local_config", lambda root: config)
+    monkeypatch.setattr(
+        orchestrator,
+        "validate_reference_additional_authority",
+        lambda root, path: REFERENCE_ADDITIONAL_AUTHORITY_SHA256,
+    )
+
+    class Database:
+        def __init__(self, path: Path) -> None:
+            self.path = path
+
+        def initialize(self) -> None:
+            return None
+
+        def reference_additional_grant(self) -> dict[str, object]:
+            return {
+                "state": "available",
+                "authority_sha256": REFERENCE_ADDITIONAL_AUTHORITY_SHA256,
+                "prior_settlement_receipt_sha256": (REFERENCE_ADDITIONAL_SETTLEMENT_RECEIPT_SHA256),
+                "prior_execution_scope_sha256": (REFERENCE_ADDITIONAL_PRIOR_EXECUTION_SCOPE_SHA256),
+                "prior_actual_cost_usd": "0.00564445",
+                "active_reservation_id": None,
+            }
+
+    monkeypatch.setattr(orchestrator, "ResultsDatabase", Database)
+    monkeypatch.setattr(
+        orchestrator,
+        "build_bootstrap_request",
+        lambda root, value, *, additional=False: b"additional-request"
+        if additional
+        else b"original-request",
+    )
+    monkeypatch.setattr(orchestrator, "validate_reproduced_request", lambda *a, **k: None)
+    monkeypatch.setattr(
+        orchestrator,
+        "plan_reference_additional_preview",
+        lambda *args, **kwargs: {"bootstrap_ready": True, "blockers": []},
+    )
+    monkeypatch.setattr(orchestrator, "_capability", lambda root, value, request: capability)
+    for path in (orchestrator.IMAGE_LOCK_PATH, orchestrator.PROVIDER_CAPABILITY_PATH):
+        full = tmp_path / path
+        full.parent.mkdir(parents=True, exist_ok=True)
+        full.write_bytes(b"evidence")
+
+    prepared, request, result, binding = orchestrator.prepare_additional(tmp_path)
+
+    assert prepared is config
+    assert request == b"additional-request"
+    assert result.request_path == orchestrator.ADDITIONAL_REQUEST_PATH
+    assert result.bootstrap_request_bytes == capability.bootstrap_request_bytes
+    assert (tmp_path / orchestrator.ADDITIONAL_REQUEST_PATH).read_bytes() == request
+    assert binding == additional_reference_binding(
+        config_sha256=config.sha256,
+        config_challenge_sha256=config.challenge_sha256,
+        request_sha256=orchestrator._sha(request),
+        execution_scope_sha256=config.reference_execution_scope_sha256,
+    )
+
+
+def test_status_reports_additional_state_without_implying_proven_context(
+    tmp_path: Path,
+) -> None:
+    database = ResultsDatabase(tmp_path / orchestrator.DATABASE_PATH)
+    database.initialize()
+
+    status = orchestrator.reference_status(tmp_path)
+
+    assert status["additional"] == {
+        "authority_sha256": REFERENCE_ADDITIONAL_AUTHORITY_SHA256,
+        "billing_state": None,
+        "execution_evidence_recorded": False,
+        "experiment_state": None,
+        "state": "available",
+    }
+    assert status["cumulative_actual_cost_usd"] == "0"
+    assert status["configured_context_tokens"] == 262144
+    assert status["proven_useful_context_tokens"] is None
+
+
+@pytest.mark.parametrize(
+    ("grant", "reservation", "experiment", "expected"),
+    [
+        ("available", None, None, "available"),
+        ("available", "reserved", "created", "reserved"),
+        ("consumed", "submission_pending", "created", "consumed"),
+        ("consumed", "audit_blocked", "failed", "audit-blocked"),
+        ("consumed", "settled", "completed", "settled-success"),
+        ("consumed", "failed", "failed", "settled-failure"),
+    ],
+)
+def test_additional_status_state_is_explicit(
+    grant: str,
+    reservation: str | None,
+    experiment: str | None,
+    expected: str,
+) -> None:
+    assert orchestrator._additional_status_state(grant, reservation, experiment) == expected
 
 
 def test_paid_request_reproduction_rejects_artifact_drift(
@@ -703,6 +835,178 @@ def test_replacement_capture_cli_reports_read_only_provider_contact(
 
 
 @pytest.mark.parametrize(
+    ("case", "mode", "provider_job_id", "app_identity", "object_id", "empty"),
+    (
+        ("success", "call", "fc-" + "C" * 22, None, "fc-" + "C" * 22, False),
+        ("failure", "call", "fc-" + "D" * 22, None, "fc-" + "D" * 22, False),
+        ("app", "app", None, "ap-" + "A" * 22, "ap-" + "A" * 22, False),
+        (
+            "dual_call",
+            "call",
+            "fc-" + "E" * 22,
+            "ap-" + "E" * 22,
+            "fc-" + "E" * 22,
+            False,
+        ),
+        (
+            "dual_app",
+            "app",
+            "fc-" + "F" * 22,
+            "ap-" + "F" * 22,
+            "ap-" + "F" * 22,
+            False,
+        ),
+        ("billing", "billing_only", None, None, "ap-" + "B" * 22, False),
+        ("zero", "workspace_zero_preidentity", None, None, None, True),
+    ),
+)
+def test_additional_capture_builds_closed_modes_consumed_by_settlement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+    mode: str,
+    provider_job_id: str | None,
+    app_identity: str | None,
+    object_id: str | None,
+    empty: bool,
+) -> None:
+    workspace = "1" * 64
+    binding = "2" * 64
+    authority_sha = "3" * 64
+    report_identity = "4" * 64
+    environment_scope = "5" * 64
+    pre_bytes = b'{"pre":true}'
+    post_bytes = b'{"post":true}'
+    pre_sha = hashlib.sha256(pre_bytes).hexdigest()
+    post_sha = hashlib.sha256(post_bytes).hexdigest()
+    for digest, content in ((pre_sha, pre_bytes), (post_sha, post_bytes)):
+        path = tmp_path / auth_receipt_path(digest)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+    request = tmp_path / orchestrator.ADDITIONAL_REQUEST_PATH
+    request.parent.mkdir(parents=True, exist_ok=True)
+    request.write_bytes(b"request")
+    remote_receipt = None
+    if case in {"success", "failure"}:
+        remote_receipt = json.dumps({"status": case}, sort_keys=True).encode()
+        remote_path = tmp_path / "reports/local/u8-bootstrap-receipt-test.json"
+        remote_path.parent.mkdir(parents=True, exist_ok=True)
+        remote_path.write_bytes(remote_receipt)
+    billing_authority = tmp_path / orchestrator.DEFAULT_BILLING_AUTHORITY
+    billing_authority.parent.mkdir(parents=True, exist_ok=True)
+    billing_authority.write_bytes(b"authority")
+    monkeypatch.setattr(orchestrator, "provider_environment_overrides_present", lambda: False)
+    monkeypatch.setattr(
+        orchestrator,
+        "load_reference_job_config",
+        lambda *args, **kwargs: SimpleNamespace(
+            provider={"environment_scope_sha256": environment_scope}
+        ),
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "_validated_provider_capability",
+        lambda *args: {"provider_environment": "low-bit-lab"},
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "verify_provider_billing_authority",
+        lambda *args, **kwargs: {
+            "attribution_method_sha256": "6" * 64,
+            "authoritative_report_identity_sha256": report_identity,
+            "billing_completeness_delay_seconds": 1,
+        },
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "_additional_audit_row",
+        lambda database: {
+            "reservation_id": "reservation",
+            "run_id": "run",
+            "reference_execution_scope_sha256": "7" * 64,
+            "billing_authority_sha256": authority_sha,
+            "authoritative_report_identity_sha256": report_identity,
+            "billing_completeness_delay_seconds": 1,
+            "heartbeat_at": "2026-08-28T12:30:00+00:00",
+            "provider_job_id": provider_job_id,
+            "app_identity": app_identity,
+            "authority_sha256": orchestrator.REFERENCE_ADDITIONAL_AUTHORITY_SHA256,
+            "consumed_at": "2026-08-28T12:00:00+00:00",
+            "auth_binding_sha256": binding,
+            "original_workspace_scope_sha256": "8" * 64,
+            "authenticated_workspace_identity_sha256": workspace,
+            "execution_receipt_sha256": (
+                None if remote_receipt is None else hashlib.sha256(remote_receipt).hexdigest()
+            ),
+            "execution_manifest_sha256": None,
+        },
+    )
+    auths = iter(
+        (
+            {
+                "authenticated_workspace_identity_sha256": workspace,
+                "binding_sha256": binding,
+                "receipt_sha256": pre_sha,
+            },
+            {
+                "authenticated_workspace_identity_sha256": workspace,
+                "binding_sha256": binding,
+                "receipt_sha256": post_sha,
+            },
+        )
+    )
+    monkeypatch.setattr(orchestrator, "verify_workspace_auth", lambda *a, **k: next(auths))
+    rows = []
+    if not empty:
+        rows.append(
+            {
+                "cost": "0.25",
+                "description": orchestrator.REFERENCE_APP_NAME,
+                "environment": "low-bit-lab",
+                "interval_start": "2026-08-28T13:00:00Z",
+                "object_id": object_id,
+                "resource": "A100-80GB",
+            }
+        )
+    raw = orchestrator.CANONICAL_EMPTY_REPORT if empty else (json.dumps(rows) + "\n").encode()
+    monkeypatch.setattr(
+        orchestrator,
+        "_run_modal_cli",
+        lambda *args, **kwargs: raw,
+    )
+
+    result = orchestrator.capture_additional_billing(
+        tmp_path,
+        query_start="2026-08-28T12:00:00Z",
+        query_end="2026-08-28T16:00:00Z",
+    )
+
+    receipt = json.loads((tmp_path / orchestrator.ADDITIONAL_SETTLEMENT_RECEIPT_PATH).read_bytes())
+    assert result["attribution_mode"] == receipt["attribution_mode"] == mode
+    assert receipt["pre_auth_receipt_sha256"] == pre_sha
+    assert receipt["post_auth_receipt_sha256"] == post_sha
+    observed: dict[str, object] = {}
+
+    class FakeDatabase:
+        def settle_reference_additional_billing(self, *args: object, **kwargs: object) -> str:
+            observed["args"] = args
+            observed["kwargs"] = kwargs
+            return "9" * 64
+
+    monkeypatch.setattr(orchestrator, "ResultsDatabase", lambda path: FakeDatabase())
+    settled = orchestrator.settle_additional_billing(tmp_path)
+    assert settled["settlement_receipt_sha256"] == "9" * 64
+    assert observed["args"] == (
+        (tmp_path / orchestrator.ADDITIONAL_SETTLEMENT_RECEIPT_PATH).read_bytes(),
+        (tmp_path / orchestrator.ADDITIONAL_IDENTITY_EVIDENCE_PATH).read_bytes(),
+        (tmp_path / orchestrator.ADDITIONAL_BILLING_REPORT_PATH).read_bytes(),
+    )
+    assert observed["kwargs"]["pre_auth_receipt_bytes"] == pre_bytes
+    assert observed["kwargs"]["post_auth_receipt_bytes"] == post_bytes
+    assert observed["kwargs"]["remote_receipt_bytes"] == remote_receipt
+
+
+@pytest.mark.parametrize(
     "outputs",
     (
         (" M tracked.py\n", "main\n", "a" * 40 + "\n", "a" * 40 + "\n"),
@@ -719,9 +1023,7 @@ def test_live_gate_rejects_dirty_nonmain_or_unmerged_checkout(
     monkeypatch.setattr(
         orchestrator.subprocess,
         "run",
-        lambda *args, **kwargs: SimpleNamespace(
-            returncode=0, stdout=next(responses), stderr=""
-        ),
+        lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout=next(responses), stderr=""),
     )
     with pytest.raises(orchestrator.ReferenceOrchestratorError, match="clean merged"):
         _REAL_MERGED_MAIN_GATE(tmp_path)
@@ -735,9 +1037,7 @@ def test_live_gate_accepts_exact_clean_origin_main(
     monkeypatch.setattr(
         orchestrator.subprocess,
         "run",
-        lambda *args, **kwargs: SimpleNamespace(
-            returncode=0, stdout=next(responses), stderr=""
-        ),
+        lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout=next(responses), stderr=""),
     )
     assert _REAL_MERGED_MAIN_GATE(tmp_path) == head
 
@@ -847,6 +1147,17 @@ def test_workspace_probe_accepts_pinned_modal_shape_and_strips_auth_overrides(
     assert orchestrator._current_workspace_digest(runner=runner) == orchestrator._sha(
         profile.encode()
     )
+
+
+def test_workspace_probe_is_credential_opaque_and_uses_pinned_client_rpc() -> None:
+    script = orchestrator._ACTIVE_WORKSPACE_DIGEST_SCRIPT
+    assert "_Client.from_env()" in script
+    assert "client.server_url==DEFAULT_SERVER_URL" in script
+    assert "WorkspaceNameLookup(Empty(),retry=None,timeout=3)" in script
+    assert "from modal_proto.api_pb2 import Empty" in script
+    assert "_lookup_workspace" not in script
+    assert "token_id" not in script
+    assert "token_secret" not in script
 
 
 @pytest.mark.parametrize(
@@ -1042,9 +1353,7 @@ def test_replacement_capture_filters_private_workspace_rows(
             "bootstrap_authority_sha256": orchestrator.REFERENCE_BOOTSTRAP_AUTHORITY_SHA256,
             "config_sha256": config_sha256,
             "request_sha256": orchestrator._sha(request_bytes),
-            "signed_cdn_authority_sha256": (
-                orchestrator.REFERENCE_SIGNED_CDN_AUTHORITY_SHA256
-            ),
+            "signed_cdn_authority_sha256": (orchestrator.REFERENCE_SIGNED_CDN_AUTHORITY_SHA256),
             "standing_authority_sha256": orchestrator.REFERENCE_AUTHORITY_SHA256,
         }
     )
@@ -1107,9 +1416,7 @@ def test_replacement_capture_filters_private_workspace_rows(
         )
         return {"provider_environment": "low-bit-lab"}
 
-    monkeypatch.setattr(
-        orchestrator, "validate_provider_capability_receipt", validate_provider
-    )
+    monkeypatch.setattr(orchestrator, "validate_provider_capability_receipt", validate_provider)
     auth_count = 0
 
     def auth(
@@ -1164,9 +1471,8 @@ def test_replacement_capture_filters_private_workspace_rows(
             "resource": "cpu",
         },
     ]
-    def modal_runner(
-        rows: list[dict[str, object]], apps: list[dict[str, object]] = app_rows
-    ):
+
+    def modal_runner(rows: list[dict[str, object]], apps: list[dict[str, object]] = app_rows):
         def run(arguments: list[str], *, runner: object | None = None) -> bytes:
             assert runner is None
             observed_commands.append(arguments)
@@ -1258,9 +1564,7 @@ def test_replacement_capture_filters_private_workspace_rows(
 
     duplicate_apps = [dict(app_rows[0]), {**app_rows[0], "app_id": "ap-" + "D" * 22}]
     observed_commands.clear()
-    monkeypatch.setattr(
-        orchestrator, "_run_modal_cli", modal_runner(billing_rows, duplicate_apps)
-    )
+    monkeypatch.setattr(orchestrator, "_run_modal_cli", modal_runner(billing_rows, duplicate_apps))
     with pytest.raises(
         orchestrator.ReferenceOrchestratorError, match="unique stopped replacement app"
     ):
@@ -1278,9 +1582,7 @@ def test_replacement_capture_filters_private_workspace_rows(
         query_start="2026-08-26T14:00:00Z",
         query_end="2026-08-26T16:00:00Z",
     )
-    app_evidence = json.loads(
-        (tmp_path / orchestrator.REPLACEMENT_APP_EVIDENCE_PATH).read_bytes()
-    )
+    app_evidence = json.loads((tmp_path / orchestrator.REPLACEMENT_APP_EVIDENCE_PATH).read_bytes())
     assert billing_only["actual_cost_usd"] == "0.01"
     assert app_evidence == {
         "app_id": app_id,
@@ -1390,9 +1692,7 @@ def test_replacement_capture_rejects_local_lineage_before_provider_contact(
             raise ValueError("capability drift")
         return {"provider_environment": "low-bit-lab"}
 
-    monkeypatch.setattr(
-        orchestrator, "validate_provider_capability_receipt", validate_provider
-    )
+    monkeypatch.setattr(orchestrator, "validate_provider_capability_receipt", validate_provider)
 
     def forbid_auth(
         root: Path, *, runner: object | None = None, write_latest: bool = True
@@ -1416,9 +1716,7 @@ def test_replacement_capture_rejects_local_lineage_before_provider_contact(
             "bootstrap_authority_sha256": orchestrator.REFERENCE_BOOTSTRAP_AUTHORITY_SHA256,
             "config_sha256": config_sha256,
             "request_sha256": orchestrator._sha(request_bytes),
-            "signed_cdn_authority_sha256": (
-                orchestrator.REFERENCE_SIGNED_CDN_AUTHORITY_SHA256
-            ),
+            "signed_cdn_authority_sha256": (orchestrator.REFERENCE_SIGNED_CDN_AUTHORITY_SHA256),
             "standing_authority_sha256": orchestrator.REFERENCE_AUTHORITY_SHA256,
         }
     )
@@ -1480,6 +1778,64 @@ def test_replacement_settlement_rejects_oversized_report_before_database_write(
         orchestrator.settle_replacement_billing(tmp_path)
 
 
+def test_additional_settlement_is_local_and_passes_exact_evidence_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(orchestrator, "_require_merged_clean_main", lambda root: "a" * 40)
+    pre, post = "a" * 64, "b" * 64
+    remote = b'{"remote":"receipt"}'
+    receipt = json.dumps(
+        {
+            "actual_cost_usd": "0.25",
+            "execution_receipt_sha256": hashlib.sha256(remote).hexdigest(),
+            "post_auth_receipt_sha256": post,
+            "pre_auth_receipt_sha256": pre,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    bodies = {
+        orchestrator.ADDITIONAL_SETTLEMENT_RECEIPT_PATH: receipt,
+        orchestrator.ADDITIONAL_IDENTITY_EVIDENCE_PATH: b'{"identity":true}',
+        orchestrator.ADDITIONAL_BILLING_REPORT_PATH: b'{"rows":[]}',
+        orchestrator.DEFAULT_BILLING_AUTHORITY: b'{"authority":true}',
+        orchestrator.ADDITIONAL_REQUEST_PATH: b'{"request":true}',
+        orchestrator.auth_receipt_path(pre): b'{"pre":true}',
+        orchestrator.auth_receipt_path(post): b'{"post":true}',
+        Path("reports/local/u8-bootstrap-receipt-fixed.json"): remote,
+    }
+    for relative, content in bodies.items():
+        output = tmp_path / relative
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_bytes(content)
+    observed: dict[str, object] = {}
+
+    class FakeDatabase:
+        def settle_reference_additional_billing(self, *args: object, **kwargs: object) -> str:
+            observed["args"] = args
+            observed["kwargs"] = kwargs
+            return "c" * 64
+
+    monkeypatch.setattr(orchestrator, "ResultsDatabase", lambda path: FakeDatabase())
+    result = orchestrator.settle_additional_billing(tmp_path)
+
+    assert result == {
+        "actual_cost_usd": "0.25",
+        "provider_contacted": False,
+        "settlement_receipt_sha256": "c" * 64,
+    }
+    assert observed["args"] == (
+        receipt,
+        b'{"identity":true}',
+        b'{"rows":[]}',
+    )
+    kwargs = observed["kwargs"]
+    assert isinstance(kwargs, dict)
+    assert kwargs["remote_receipt_bytes"] == remote
+    assert kwargs["pre_auth_receipt_bytes"] == b'{"pre":true}'
+    assert kwargs["post_auth_receipt_bytes"] == b'{"post":true}'
+
+
 def test_recovery_authority_materialization_is_create_once_and_offline(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1525,3 +1881,582 @@ def test_recovery_authority_repairs_only_exact_legacy_missing_newline(
 
     assert output.read_bytes() == legacy + b"\n"
     assert result == {"recovery_authority_sha256": orchestrator.REFERENCE_RECOVERY_AUTHORITY_SHA256}
+
+
+def _sqlite_fixture(path: Path, value: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    import sqlite3
+
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute("CREATE TABLE state(value TEXT NOT NULL)")
+        connection.execute("INSERT INTO state VALUES (?)", (value,))
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def test_wsl_transfer_marker_precedes_import_and_resumes_same_owner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    durable = tmp_path / "durable"
+    mirror = tmp_path / "mirror"
+    durable.mkdir()
+    mirror.mkdir()
+    _sqlite_fixture(durable / orchestrator.DATABASE_PATH, "durable")
+    _sqlite_fixture(mirror / orchestrator.DATABASE_PATH, "prior-mirror")
+    monkeypatch.setattr(orchestrator, "_require_wsl_ext4_root", lambda root: None)
+
+    result = orchestrator.begin_wsl_state_transfer(durable, mirror)
+
+    marker = durable / orchestrator.WSL_TRANSFER_MARKER_PATH
+    assert marker.exists()
+    assert result["marker_sha256"] == hashlib.sha256(marker.read_bytes()).hexdigest()
+    assert (mirror / orchestrator.DATABASE_PATH).read_bytes() == (
+        durable / orchestrator.DATABASE_PATH
+    ).read_bytes()
+    backups = list((mirror / orchestrator.WSL_DATABASE_BACKUP_ROOT).glob("*.sqlite"))
+    assert len(backups) == 1
+    assert orchestrator._database_integrity(backups[0]) == "ok"
+    resumed = orchestrator.begin_wsl_state_transfer(durable, mirror)
+    assert resumed["resumed"] is True
+    assert resumed["transfer_id"] == result["transfer_id"]
+
+
+def test_paid_state_owner_rejects_native_windows(tmp_path: Path) -> None:
+    with pytest.raises(orchestrator.ReferenceOrchestratorError, match="WSL2 ext4"):
+        orchestrator._require_wsl_ext4_root(tmp_path)
+
+
+def test_paid_state_owner_rejects_wsl_drvfs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(orchestrator.sys, "platform", "linux")
+    monkeypatch.setattr(Path, "read_text", lambda self, **kwargs: "microsoft-standard-WSL2")
+    monkeypatch.setattr(orchestrator, "_linux_filesystem_type", lambda root: "9p")
+    with pytest.raises(orchestrator.ReferenceOrchestratorError, match="WSL2 ext4"):
+        orchestrator._require_wsl_ext4_root(tmp_path)
+
+
+def test_interrupted_wsl_import_preserves_durable_state_and_active_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    durable = tmp_path / "durable"
+    mirror = tmp_path / "mirror"
+    durable.mkdir()
+    mirror.mkdir()
+    durable_db = durable / orchestrator.DATABASE_PATH
+    _sqlite_fixture(durable_db, "durable")
+    before = durable_db.read_bytes()
+    monkeypatch.setattr(orchestrator, "_require_wsl_ext4_root", lambda root: None)
+    real_copy = orchestrator._copy_database_atomic
+
+    def fail_import(source: Path, destination: Path) -> None:
+        if destination == mirror / orchestrator.DATABASE_PATH:
+            raise OSError("injected interruption")
+        real_copy(source, destination)
+
+    monkeypatch.setattr(orchestrator, "_copy_database_atomic", fail_import)
+    with pytest.raises(OSError, match="interruption"):
+        orchestrator.begin_wsl_state_transfer(durable, mirror)
+
+    assert durable_db.read_bytes() == before
+    assert (durable / orchestrator.WSL_TRANSFER_MARKER_PATH).exists()
+    monkeypatch.setattr(orchestrator, "_copy_database_atomic", real_copy)
+    resumed = orchestrator.begin_wsl_state_transfer(durable, mirror)
+    assert resumed["resumed"] is True
+    assert (mirror / orchestrator.DATABASE_PATH).read_bytes() == before
+
+
+def test_wsl_reparity_is_append_only_after_contact_free_release(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    durable = tmp_path / "durable"
+    mirror = tmp_path / "mirror"
+    durable.mkdir()
+    mirror.mkdir()
+    _sqlite_fixture(durable / orchestrator.DATABASE_PATH, "durable")
+    monkeypatch.setattr(orchestrator, "_require_wsl_ext4_root", lambda root: None)
+    orchestrator.begin_wsl_state_transfer(durable, mirror)
+    first = mirror / orchestrator.WSL_PARITY_RECEIPT_PATH
+    first.parent.mkdir(parents=True, exist_ok=True)
+    first.write_bytes(b'{"generation":"original"}')
+    with pytest.raises(orchestrator.ReferenceOrchestratorError, match="WSL owns"):
+        orchestrator.begin_wsl_state_transfer(durable, mirror)
+    assert first.read_bytes() == b'{"generation":"original"}'
+
+
+@pytest.mark.parametrize(
+    ("reservation_status", "provider_job_id", "allowed"),
+    (("released", None, True), ("audit_blocked", None, False), ("released", "fc-x", False)),
+)
+def test_wsl_reparity_requires_all_released_and_no_provider_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    reservation_status: str,
+    provider_job_id: str | None,
+    allowed: bool,
+) -> None:
+    class Result:
+        def __init__(self, value: object) -> None:
+            self.value = value
+
+        def fetchone(self) -> object:
+            return self.value
+
+        def fetchall(self) -> object:
+            return self.value
+
+    class Connection:
+        def __enter__(self) -> Connection:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            return None
+
+        def execute(self, query: str) -> Result:
+            if "reference_additional_grants" in query:
+                return Result(
+                    {
+                        "state": "available",
+                        "active_reservation_id": None,
+                        "active_execution_scope_sha256": None,
+                        "consumed_at": None,
+                        "consumed_auth_receipt_sha256": None,
+                    }
+                )
+            return Result(
+                [
+                    {
+                        "status": reservation_status,
+                        "provider_job_id": provider_job_id,
+                        "app_identity": None,
+                        "submitted_at": None,
+                        "provider_actual_cost_usd": None,
+                    }
+                ]
+            )
+
+    class Database:
+        def connect_readonly(self) -> Connection:
+            return Connection()
+
+    monkeypatch.setattr(orchestrator, "ResultsDatabase", lambda path: Database())
+    monkeypatch.setattr(orchestrator, "confine_results_db", lambda root, path: tmp_path / path)
+    if allowed:
+        orchestrator._validate_wsl_reparity_state(tmp_path)
+    else:
+        with pytest.raises(orchestrator.ReferenceOrchestratorError, match="contact-free"):
+            orchestrator._validate_wsl_reparity_state(tmp_path)
+
+
+def test_prepare_additional_rejects_active_windows_ownership_marker(
+    tmp_path: Path,
+) -> None:
+    marker = tmp_path / orchestrator.WSL_TRANSFER_MARKER_PATH
+    marker.parent.mkdir(parents=True)
+    mirror = "/srv/low-bit-lab"
+    marker.write_bytes(
+        orchestrator.canonical_bytes(
+            {
+                "database_sha256": "1" * 64,
+                "database_size_bytes": 1,
+                "kind": "reference_wsl_ownership_transfer",
+                "schema_version": 1,
+                "transfer_id": "00000000-0000-0000-0000-000000000001",
+                "wsl_mirror_path": mirror,
+                "wsl_mirror_path_sha256": hashlib.sha256(mirror.encode()).hexdigest(),
+            }
+        )
+    )
+
+    with pytest.raises(orchestrator.ReferenceOrchestratorError, match="WSL owns"):
+        orchestrator.prepare_additional(tmp_path)
+    assert not (tmp_path / orchestrator.DATABASE_PATH).exists()
+
+
+def test_wsl_parity_binds_all_paid_lineage_and_exact_payload_twice(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    durable = tmp_path / "durable"
+    mirror = tmp_path / "mirror"
+    durable.mkdir()
+    mirror.mkdir()
+    _sqlite_fixture(durable / orchestrator.DATABASE_PATH, "durable")
+    monkeypatch.setattr(orchestrator, "_require_wsl_ext4_root", lambda root: None)
+    orchestrator.begin_wsl_state_transfer(durable, mirror)
+    monkeypatch.setattr(orchestrator, "_tracked_tree_sha256", lambda root: "2" * 64)
+    monkeypatch.setattr(
+        orchestrator,
+        "validate_reference_additional_authority",
+        lambda root, path: orchestrator.REFERENCE_ADDITIONAL_AUTHORITY_SHA256,
+    )
+    monkeypatch.setattr(orchestrator, "validate_reproduced_request", lambda *a, **k: None)
+    files = {
+        "eval.json": b'{"evaluation":true}',
+        "provenance.json": b'{"provenance":true}',
+        "runtime.json": b'{"runtime":true}',
+    }
+    for name, content in files.items():
+        (mirror / name).write_bytes(content)
+    workspace = "4" * 64
+    scope = "5" * 64
+    auth_binding = {
+        "authenticated_workspace_identity_sha256": workspace,
+        "kind": "reference_modal_workspace_auth_binding",
+        "original_workspace_scope_sha256": scope,
+        "provider": "modal",
+        "reconciliation_authority_sha256": (
+            orchestrator.REFERENCE_WORKSPACE_RECONCILIATION_AUTHORITY_SHA256
+        ),
+        "schema_version": 2,
+    }
+    auth_binding_bytes = orchestrator.canonical_bytes(auth_binding)
+    auth = {
+        "binding_sha256": hashlib.sha256(auth_binding_bytes).hexdigest(),
+        "kind": "reference_modal_workspace_auth_receipt",
+    }
+    provider = {"sdk_version": "1.2.3"}
+    for relative, value in (
+        (orchestrator.AUTH_BINDING_PATH, auth_binding),
+        (orchestrator.AUTH_RECEIPT_PATH, auth),
+        (orchestrator.PROVIDER_CAPABILITY_PATH, provider),
+    ):
+        path = mirror / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(orchestrator.canonical_bytes(value))
+    monkeypatch.setattr(orchestrator, "_configured_workspace_scope", lambda root: scope)
+    monkeypatch.setattr(
+        orchestrator,
+        "validate_workspace_scope_reconciliation_authority",
+        lambda root: {
+            "authenticated_workspace_identity_sha256": workspace,
+            "original_workspace_scope_sha256": scope,
+        },
+    )
+    monkeypatch.setattr(orchestrator, "_validate_fresh_auth_receipt", lambda *a, **k: None)
+    monkeypatch.setattr(
+        orchestrator,
+        "_validated_provider_capability",
+        lambda root, request: {"sdk_version": "1.2.3"},
+    )
+    monkeypatch.setattr(orchestrator, "_manifest_identity", lambda value: "6" * 64)
+    evaluation_sha = hashlib.sha256(files["eval.json"]).hexdigest()
+    runtime_sha = hashlib.sha256(files["runtime.json"]).hexdigest()
+    config = SimpleNamespace(
+        challenge_sha256="7" * 64,
+        reference_execution_scope_sha256="8" * 64,
+        sha256="3" * 64,
+        authority_files={
+            "evaluation_lock_path": "eval.json",
+            "provenance_manifest_path": "provenance.json",
+            "runtime_receipt_path": "runtime.json",
+        },
+        inputs={
+            "evaluation_lock_sha256": evaluation_sha,
+            "provenance_manifest_sha256": "6" * 64,
+            "reviewed_commit_sha256": "f" * 40,
+            "runtime_receipt_sha256": runtime_sha,
+        },
+    )
+    payload = b"exact-modal-hydration"
+
+    receipt = orchestrator.record_wsl_execution_parity(
+        mirror,
+        durable,
+        config=config,
+        request_bytes=b"request",
+        serialized_payload=payload,
+        serialized_payload_confirmation=payload,
+    )
+
+    assert receipt["database_integrity"] == "ok"
+    assert receipt["git_head"] == "f" * 40
+    assert receipt["git_tracked_tree_sha256"] == "2" * 64
+    assert receipt["serialized_payload_sha256"] == hashlib.sha256(payload).hexdigest()
+    assert receipt["serialized_payload_size_bytes"] == len(payload)
+    assert receipt["provider_sdk_version"] == "1.2.3"
+    assert receipt["provider_contacted"] is False
+    with pytest.raises(orchestrator.ReferenceOrchestratorError, match="reproduction drift"):
+        orchestrator.record_wsl_execution_parity(
+            mirror,
+            durable,
+            config=config,
+            request_bytes=b"request",
+            serialized_payload=payload,
+            serialized_payload_confirmation=b"drift",
+        )
+
+
+def test_terminal_wsl_return_is_hash_verified_recoverable_and_clears_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    durable = tmp_path / "durable"
+    mirror = tmp_path / "mirror"
+    durable.mkdir()
+    mirror.mkdir()
+    durable_db = durable / orchestrator.DATABASE_PATH
+    _sqlite_fixture(durable_db, "durable")
+    durable_before = durable_db.read_bytes()
+    monkeypatch.setattr(orchestrator, "_require_wsl_ext4_root", lambda root: None)
+    transfer = orchestrator.begin_wsl_state_transfer(durable, mirror)
+    marker_bytes = (durable / orchestrator.WSL_TRANSFER_MARKER_PATH).read_bytes()
+    scope = "7" * 64
+    request = b'{"request":true}'
+    parity = {
+        "kind": "reference_wsl_execution_parity_receipt",
+        "marker_sha256": transfer["marker_sha256"],
+        "request_sha256": hashlib.sha256(request).hexdigest(),
+        "schema_version": 1,
+        "transfer_id": transfer["transfer_id"],
+        "execution_scope_sha256": scope,
+    }
+    parity_bytes = orchestrator.canonical_bytes(parity)
+    parity_path = mirror / orchestrator.WSL_PARITY_RECEIPT_PATH
+    parity_path.parent.mkdir(parents=True, exist_ok=True)
+    parity_path.write_bytes(parity_bytes)
+    parity_generation = (
+        mirror
+        / orchestrator.WSL_PARITY_HISTORY_ROOT
+        / f"{hashlib.sha256(parity_bytes).hexdigest()}.json"
+    )
+    parity_generation.parent.mkdir(parents=True)
+    parity_generation.write_bytes(parity_bytes)
+    identity = orchestrator.canonical_bytes({"identity": True})
+    report = orchestrator.canonical_bytes({"rows": []})
+    pre = orchestrator.canonical_bytes({"pre": True})
+    post = orchestrator.canonical_bytes({"post": True})
+    settlement = orchestrator.canonical_bytes(
+        {
+            "additional_authority_sha256": orchestrator.REFERENCE_ADDITIONAL_AUTHORITY_SHA256,
+            "execution_manifest_sha256": None,
+            "execution_receipt_sha256": None,
+            "execution_scope_sha256": scope,
+            "filtered_report_sha256": hashlib.sha256(report).hexdigest(),
+            "identity_evidence_sha256": hashlib.sha256(identity).hexdigest(),
+            "kind": orchestrator.ADDITIONAL_RECEIPT_KIND,
+            "post_auth_receipt_sha256": hashlib.sha256(post).hexdigest(),
+            "pre_auth_receipt_sha256": hashlib.sha256(pre).hexdigest(),
+            "schema_version": 1,
+        }
+    )
+    for relative, content in (
+        (orchestrator.ADDITIONAL_REQUEST_PATH, request),
+        (orchestrator.ADDITIONAL_IDENTITY_EVIDENCE_PATH, identity),
+        (orchestrator.ADDITIONAL_BILLING_REPORT_PATH, report),
+        (orchestrator.ADDITIONAL_SETTLEMENT_RECEIPT_PATH, settlement),
+        (orchestrator.auth_receipt_path(hashlib.sha256(pre).hexdigest()), pre),
+        (orchestrator.auth_receipt_path(hashlib.sha256(post).hexdigest()), post),
+    ):
+        path = mirror / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+    mirror_db = mirror / orchestrator.DATABASE_PATH
+    import sqlite3
+
+    connection = sqlite3.connect(mirror_db)
+    connection.execute("UPDATE state SET value = 'settled' WHERE value = 'durable'")
+    connection.commit()
+    connection.close()
+    monkeypatch.setattr(
+        orchestrator,
+        "reference_status",
+        lambda root: {
+            "additional": {"state": "settled-failure", "execution_scope_sha256": scope}
+        },
+    )
+
+    returned = orchestrator.return_wsl_state(durable, mirror)
+
+    assert returned["terminal_state"] == "settled-failure"
+    assert returned["database_sha256"] == hashlib.sha256(mirror_db.read_bytes()).hexdigest()
+    assert durable_db.read_bytes() == mirror_db.read_bytes()
+    assert not (durable / orchestrator.WSL_TRANSFER_MARKER_PATH).exists()
+    history = durable / orchestrator.WSL_TRANSFER_HISTORY_ROOT / f"{transfer['transfer_id']}.json"
+    assert history.read_bytes() == marker_bytes
+    backups = list((durable / orchestrator.WSL_DATABASE_BACKUP_ROOT).glob("*.sqlite"))
+    assert len(backups) == 1
+    assert backups[0].read_bytes() == durable_before
+    assert (durable / orchestrator.ADDITIONAL_SETTLEMENT_RECEIPT_PATH).read_bytes() == settlement
+    assert (
+        durable / orchestrator.WSL_PARITY_HISTORY_ROOT / parity_generation.name
+    ).read_bytes() == parity_bytes
+    assert not (durable / "weights").exists()
+
+    monkeypatch.setattr(
+        orchestrator,
+        "reference_status",
+        lambda root: {
+            "additional": {"state": "settled-success", "execution_evidence_recorded": True},
+            "proven_useful_context_tokens": None,
+        },
+    )
+    proposal = orchestrator.compile_u9_proposal(durable)
+    assert proposal["status"] == "proposal"
+    assert proposal["configured_context_tokens"] == 262144
+    assert proposal["proven_useful_context_tokens"] is None
+
+
+def test_nonterminal_wsl_state_cannot_clear_ownership_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    durable = tmp_path / "durable"
+    mirror = tmp_path / "mirror"
+    durable.mkdir()
+    mirror.mkdir()
+    _sqlite_fixture(durable / orchestrator.DATABASE_PATH, "durable")
+    monkeypatch.setattr(orchestrator, "_require_wsl_ext4_root", lambda root: None)
+    transfer = orchestrator.begin_wsl_state_transfer(durable, mirror)
+    parity_path = mirror / orchestrator.WSL_PARITY_RECEIPT_PATH
+    parity_path.parent.mkdir(parents=True, exist_ok=True)
+    parity_path.write_bytes(
+        orchestrator.canonical_bytes(
+            {
+                "marker_sha256": transfer["marker_sha256"],
+                "transfer_id": transfer["transfer_id"],
+            }
+        )
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "reference_status",
+        lambda root: {"additional": {"state": "audit-blocked"}},
+    )
+
+    with pytest.raises(orchestrator.ReferenceOrchestratorError, match="not terminal"):
+        orchestrator.return_wsl_state(durable, mirror)
+    assert (durable / orchestrator.WSL_TRANSFER_MARKER_PATH).exists()
+
+
+def test_execute_additional_proves_parity_before_reservation_and_submits_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "mirror"
+    durable = tmp_path / "durable"
+    root.mkdir()
+    durable.mkdir()
+    config_path = root / orchestrator.CONFIG_PATH
+    config_path.parent.mkdir(parents=True)
+    config_path.write_bytes(b"config")
+    events: list[str] = []
+    config = SimpleNamespace(
+        experiment_id="experiment",
+        sha256="1" * 64,
+        challenge_sha256="2" * 64,
+        canonical_json=json.dumps(
+            {
+                "inputs": {},
+                "gates": {"formula_approval_sha256": "3" * 64},
+                "provider": {"trust_override_sha256": "4" * 64},
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        inputs={"runtime_receipt_sha256": "5" * 64},
+        reference_execution_scope_sha256="6" * 64,
+    )
+    capability = _capability(root)
+    binding = additional_reference_binding(
+        config_sha256=config.sha256,
+        config_challenge_sha256=config.challenge_sha256,
+        request_sha256=hashlib.sha256(b"request").hexdigest(),
+        execution_scope_sha256=config.reference_execution_scope_sha256,
+    )
+    graphs = [
+        PreparedModalGraph(
+            SerializedRemoteCallable(lambda: None, b"payload"), object(), object(), object()
+        )
+        for _ in range(2)
+    ]
+
+    class Database:
+        def __init__(self, path: Path) -> None:
+            pass
+
+        def initialize(self) -> None:
+            events.append("initialize")
+
+        def reserve_reference_run(self, **kwargs: object) -> None:
+            assert kwargs["additional_authority_sha256"] == REFERENCE_ADDITIONAL_AUTHORITY_SHA256
+            assert kwargs["total_cap_usd"] == "4.00564445"
+            events.append("reserve")
+
+    monkeypatch.setattr(orchestrator, "ResultsDatabase", Database)
+    monkeypatch.setattr(orchestrator, "_watchdog_ready", lambda: None)
+    monkeypatch.setattr(orchestrator, "provider_environment_overrides_present", lambda: False)
+    monkeypatch.setattr(
+        orchestrator,
+        "prepare_additional",
+        lambda root: (config, b"request", capability, binding),
+    )
+    monkeypatch.setattr(orchestrator, "observe_topology", lambda path: events.append("topology"))
+    monkeypatch.setattr(
+        orchestrator,
+        "verify_workspace_auth",
+        lambda root: {"authenticated_workspace_identity_sha256": "7" * 64},
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "record_wsl_execution_parity",
+        lambda *args, **kwargs: events.append("parity") or {"parity_receipt_sha256": "8" * 64},
+    )
+    monkeypatch.setattr(modal_adapter, "validate_reference_preflight", lambda cap: None)
+    monkeypatch.setattr(modal_adapter, "prepare_local_modal_graph", lambda cap: graphs.pop(0))
+    monkeypatch.setattr(
+        modal_adapter,
+        "submit_reference",
+        lambda cap, graph: events.append("submit")
+        or {
+            "status": "failed",
+            "full_context_usefulness_proven": False,
+        },
+    )
+
+    result = orchestrator.execute_additional(
+        root, durable, confirm_request_sha256=hashlib.sha256(b"request").hexdigest()
+    )
+
+    assert result["status"] == "failed"
+    assert events.count("submit") == 1
+    assert events.index("parity") < events.index("reserve") < events.index("submit")
+
+
+def test_u9_proposal_is_locked_until_successful_settlement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        orchestrator,
+        "reference_status",
+        lambda root: {"additional": {"state": "settled-failure"}},
+    )
+    with pytest.raises(orchestrator.ReferenceOrchestratorError, match="successful settled"):
+        orchestrator.compile_u9_proposal(tmp_path)
+    assert not (tmp_path / orchestrator.U9_PROPOSAL_PATH).exists()
+
+
+def test_u9_success_emits_proposal_only_without_candidate_authority(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    receipt = tmp_path / orchestrator.ADDITIONAL_SETTLEMENT_RECEIPT_PATH
+    receipt.parent.mkdir(parents=True)
+    receipt.write_bytes(b'{"settled":true}')
+    monkeypatch.setattr(
+        orchestrator,
+        "reference_status",
+        lambda root: {
+            "additional": {
+                "state": "settled-success",
+                "execution_evidence_recorded": True,
+            },
+            "proven_useful_context_tokens": None,
+        },
+    )
+
+    proposal = orchestrator.compile_u9_proposal(tmp_path)
+
+    assert proposal["status"] == "proposal"
+    assert proposal["thresholds"] == {}
+    assert proposal["candidate_execution_authorized"] is False
+    assert proposal["numeric_threshold_approval_authorized"] is False
+    assert proposal["configured_context_tokens"] == 262144
+    assert proposal["proven_useful_context_tokens"] is None
