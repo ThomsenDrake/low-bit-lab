@@ -377,7 +377,14 @@ def _validate_additional_parity(
     expected_receipt_sha256 = capability.additional_wsl_parity_receipt_sha256
     if expected_receipt_sha256 is None or SHA256_RE.fullmatch(expected_receipt_sha256) is None:
         raise ReferenceModalError("additional WSL parity binding is unavailable")
-    path = capability.root.resolve() / "reports/local/reference-wsl-parity-receipt.json"
+    root = capability.root.resolve()
+    path = (
+        root
+        / "reports/local/reference-wsl-parity-history"
+        / f"{expected_receipt_sha256}.json"
+    )
+    if not path.exists():
+        path = root / "reports/local/reference-wsl-parity-receipt.json"
     try:
         content = path.read_bytes()
         raw = json.loads(content.decode("utf-8"))
@@ -720,6 +727,8 @@ def _mark_submission_pending(
             capability.reservation_id,
             owner_id=capability.owner_id,
             additional_authority_sha256=additional_authority_sha256,
+            request_sha256=_sha(capability.bootstrap_request_bytes),
+            parity_receipt_sha256=capability.additional_wsl_parity_receipt_sha256 or "",
             auth_receipt_bytes=additional_auth_receipt_bytes or b"",
             authority_root=capability.authority_root,
             occurred_at=occurred_at,

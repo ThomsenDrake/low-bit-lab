@@ -15,10 +15,14 @@ from typing import Any
 from lowbit_lab.config import IMMUTABLE_REVISION_RE, SHA256_RE
 from lowbit_lab.constants import (
     REFERENCE_ADDITIONAL_AUTHORITY_SHA256,
+    REFERENCE_ADDITIONAL_CORRECTED_PREFLIGHT_REQUEST_SHA256,
     REFERENCE_ADDITIONAL_CUMULATIVE_CAP_USD,
+    REFERENCE_ADDITIONAL_FORFEITED_REQUEST_SHA256,
     REFERENCE_ADDITIONAL_INCREMENTAL_CAP_USD,
     REFERENCE_ADDITIONAL_PRIOR_EXECUTION_SCOPE_SHA256,
     REFERENCE_ADDITIONAL_PRIOR_SPEND_USD,
+    REFERENCE_ADDITIONAL_REPLACEMENT_AUTHORITY_SHA256,
+    REFERENCE_ADDITIONAL_REPLACEMENT_FORFEIT_RECEIPT_SHA256,
     REFERENCE_ADDITIONAL_SETTLEMENT_RECEIPT_SHA256,
     REFERENCE_AUTHORITY_SHA256,
     REFERENCE_BOOTSTRAP_AUTHORITY_SHA256,
@@ -32,12 +36,14 @@ from lowbit_lab.handoff import sha256_json
 from lowbit_lab.jsonio import emit
 from lowbit_lab.reference_authority import (
     ADDITIONAL_AUTHORITY_PATH,
+    ADDITIONAL_REPLACEMENT_AUTHORITY_PATH,
     AUTHORITY_PATH,
     BOOTSTRAP_AUTHORITY_PATH,
     RECOVERY_AUTHORITY_PATH,
     WORKSPACE_RECONCILIATION_AUTHORITY_PATH,
     ReferenceAuthorityError,
     validate_reference_additional_authority,
+    validate_reference_additional_replacement_authority,
     validate_reference_authority,
     validate_reference_bootstrap_authority,
     validate_reference_recovery_authority,
@@ -65,7 +71,15 @@ from lowbit_lab.reference_settlement import (
     validate_workspace_zero_settlement_evidence,
 )
 
-SCHEMA_VERSION = 15
+SCHEMA_VERSION = 16
+_V15_SCHEMA_SHA256 = {
+    "80c56b3a50100e72477b1157271e35e08a2cdfaeb8e97ce49335599c27032f9a",
+    "b4004e5880ed89e0720a047a971a433b4198b1f050a539b7f80e3c90674fda0e",
+    "957cb9e6d7d8816441e1035ec68a4b71dfba5b7296286e1b73378b75448bb3ba",
+    "6859de9966cf39b535a0379e593118266cbcad951d05e167ea21f25c4790964d",
+    "bde609583a53d6b2aa2f751c302c834773929d3d09a09b4d25d30458462cc99f",
+    "47cf9f895c5b77d344dffa88b5955d6c6189b0d8f51629a308bf135c6edbe3bb",
+}
 _V14_SCHEMA_SHA256 = {
     # Fresh, deployed, and supported legacy-migration v14 shapes.
     "afd74c9a39fd96ee08ab4f2564b714800def48a1e975bcfb9e3f08d80fd1c301",
@@ -468,6 +482,53 @@ CREATE TABLE IF NOT EXISTS reference_additional_grants (
           OR (active_reservation_id IS NOT NULL
               AND active_execution_scope_sha256 IS NOT NULL AND reserved_at IS NOT NULL))
 );
+CREATE TABLE IF NOT EXISTS reference_additional_replacement_entitlements (
+    singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+    entitlement_sha256 TEXT NOT NULL UNIQUE CHECK(length(entitlement_sha256) = 64),
+    authority_sha256 TEXT NOT NULL UNIQUE CHECK(length(authority_sha256) = 64),
+    forfeit_receipt_sha256 TEXT NOT NULL UNIQUE CHECK(length(forfeit_receipt_sha256) = 64),
+    parent_additional_authority_sha256 TEXT NOT NULL CHECK(
+        length(parent_additional_authority_sha256) = 64
+    ),
+    failed_request_sha256 TEXT NOT NULL UNIQUE CHECK(length(failed_request_sha256) = 64),
+    corrected_preflight_request_sha256 TEXT NOT NULL UNIQUE CHECK(
+        length(corrected_preflight_request_sha256) = 64
+    ),
+    state TEXT NOT NULL CHECK(state IN ('available', 'claimed', 'consumed')),
+    claimed_execution_scope_sha256 TEXT CHECK(
+        claimed_execution_scope_sha256 IS NULL OR length(claimed_execution_scope_sha256) = 64
+    ),
+    claimed_request_sha256 TEXT CHECK(
+        claimed_request_sha256 IS NULL OR length(claimed_request_sha256) = 64
+    ),
+    claimed_parity_receipt_sha256 TEXT CHECK(
+        claimed_parity_receipt_sha256 IS NULL OR length(claimed_parity_receipt_sha256) = 64
+    ),
+    claimed_at TEXT,
+    reservation_id TEXT UNIQUE
+        REFERENCES budget_reservations(reservation_id) ON DELETE RESTRICT,
+    consumed_at TEXT,
+    consumed_auth_receipt_sha256 TEXT CHECK(
+        consumed_auth_receipt_sha256 IS NULL OR length(consumed_auth_receipt_sha256) = 64
+    ),
+    created_at TEXT NOT NULL,
+    CHECK(
+        (state = 'available' AND claimed_execution_scope_sha256 IS NULL
+         AND claimed_request_sha256 IS NULL AND claimed_parity_receipt_sha256 IS NULL
+         AND claimed_at IS NULL AND reservation_id IS NULL AND consumed_at IS NULL
+         AND consumed_auth_receipt_sha256 IS NULL)
+        OR
+        (state = 'claimed' AND claimed_execution_scope_sha256 IS NOT NULL
+         AND claimed_request_sha256 IS NOT NULL AND claimed_parity_receipt_sha256 IS NOT NULL
+         AND claimed_at IS NOT NULL AND consumed_at IS NULL
+         AND consumed_auth_receipt_sha256 IS NULL)
+        OR
+        (state = 'consumed' AND claimed_execution_scope_sha256 IS NOT NULL
+         AND claimed_request_sha256 IS NOT NULL AND claimed_parity_receipt_sha256 IS NOT NULL
+         AND claimed_at IS NOT NULL AND reservation_id IS NOT NULL
+         AND consumed_at IS NOT NULL AND consumed_auth_receipt_sha256 IS NOT NULL)
+    )
+);
 CREATE TABLE IF NOT EXISTS controller_cycles (
     cycle_id TEXT PRIMARY KEY,
     workspace_id TEXT NOT NULL,
@@ -734,10 +795,22 @@ def _reference_boundary_consumed(
             and replacement["replacement_execution_scope_sha256"] == execution_scope_sha256
         )
     if additional is not None:
+        additional_replacement = connection.execute(
+            """SELECT state, claimed_execution_scope_sha256, consumed_auth_receipt_sha256
+            FROM reference_additional_replacement_entitlements
+            WHERE singleton = 1 AND reservation_id = ?""",
+            (reservation_id,),
+        ).fetchone()
         return (
             additional["state"] == "consumed"
             and additional["active_execution_scope_sha256"] == execution_scope_sha256
             and additional["consumed_auth_receipt_sha256"] is not None
+            and additional_replacement is not None
+            and additional_replacement["state"] == "consumed"
+            and additional_replacement["claimed_execution_scope_sha256"]
+            == execution_scope_sha256
+            and additional_replacement["consumed_auth_receipt_sha256"]
+            == additional["consumed_auth_receipt_sha256"]
         )
     return original is not None
 
@@ -1277,6 +1350,9 @@ class ResultsDatabase:
             if existing == 14:
                 self._migrate_v14_to_v15(connection)
                 existing = 15
+            if existing == 15:
+                self._migrate_v15_to_v16(connection)
+                existing = 16
             if existing != SCHEMA_VERSION:
                 raise DatabaseError(f"database schema {existing} != supported {SCHEMA_VERSION}")
 
@@ -1298,6 +1374,79 @@ class ResultsDatabase:
                 str(REFERENCE_ADDITIONAL_CUMULATIVE_CAP_USD),
             ),
         )
+
+    def _migrate_v15_to_v16(self, connection: sqlite3.Connection) -> None:
+        """Add an empty, explicitly activated pre-provider replacement slot."""
+        if _schema_sha256(connection) not in _V15_SCHEMA_SHA256:
+            raise DatabaseError("schema v15 shape is unknown")
+        try:
+            connection.commit()
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """CREATE TABLE reference_additional_replacement_entitlements (
+                    singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                    entitlement_sha256 TEXT NOT NULL UNIQUE
+                        CHECK(length(entitlement_sha256) = 64),
+                    authority_sha256 TEXT NOT NULL UNIQUE CHECK(length(authority_sha256) = 64),
+                    forfeit_receipt_sha256 TEXT NOT NULL UNIQUE
+                        CHECK(length(forfeit_receipt_sha256) = 64),
+                    parent_additional_authority_sha256 TEXT NOT NULL
+                        CHECK(length(parent_additional_authority_sha256) = 64),
+                    failed_request_sha256 TEXT NOT NULL UNIQUE
+                        CHECK(length(failed_request_sha256) = 64),
+                    corrected_preflight_request_sha256 TEXT NOT NULL UNIQUE
+                        CHECK(length(corrected_preflight_request_sha256) = 64),
+                    state TEXT NOT NULL CHECK(state IN ('available', 'claimed', 'consumed')),
+                    claimed_execution_scope_sha256 TEXT CHECK(
+                        claimed_execution_scope_sha256 IS NULL
+                        OR length(claimed_execution_scope_sha256) = 64
+                    ),
+                    claimed_request_sha256 TEXT CHECK(
+                        claimed_request_sha256 IS NULL OR length(claimed_request_sha256) = 64
+                    ),
+                    claimed_parity_receipt_sha256 TEXT CHECK(
+                        claimed_parity_receipt_sha256 IS NULL
+                        OR length(claimed_parity_receipt_sha256) = 64
+                    ),
+                    claimed_at TEXT,
+                    reservation_id TEXT UNIQUE REFERENCES budget_reservations(reservation_id)
+                        ON DELETE RESTRICT,
+                    consumed_at TEXT,
+                    consumed_auth_receipt_sha256 TEXT CHECK(
+                        consumed_auth_receipt_sha256 IS NULL
+                        OR length(consumed_auth_receipt_sha256) = 64
+                    ),
+                    created_at TEXT NOT NULL,
+                    CHECK(
+                        (state = 'available' AND claimed_execution_scope_sha256 IS NULL
+                         AND claimed_request_sha256 IS NULL
+                         AND claimed_parity_receipt_sha256 IS NULL
+                         AND claimed_at IS NULL AND reservation_id IS NULL
+                         AND consumed_at IS NULL AND consumed_auth_receipt_sha256 IS NULL)
+                        OR
+                        (state = 'claimed' AND claimed_execution_scope_sha256 IS NOT NULL
+                         AND claimed_request_sha256 IS NOT NULL
+                         AND claimed_parity_receipt_sha256 IS NOT NULL
+                         AND claimed_at IS NOT NULL AND consumed_at IS NULL
+                         AND consumed_auth_receipt_sha256 IS NULL)
+                        OR
+                        (state = 'consumed' AND claimed_execution_scope_sha256 IS NOT NULL
+                         AND claimed_request_sha256 IS NOT NULL
+                         AND claimed_parity_receipt_sha256 IS NOT NULL
+                         AND claimed_at IS NOT NULL AND reservation_id IS NOT NULL
+                         AND consumed_at IS NOT NULL
+                         AND consumed_auth_receipt_sha256 IS NOT NULL)
+                    )
+                )"""
+            )
+            if connection.execute("PRAGMA foreign_key_check").fetchall():
+                raise DatabaseError("schema v16 foreign-key validation failed")
+            connection.execute(
+                """INSERT INTO schema_info(version, applied_at)
+                VALUES (16, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))"""
+            )
+        except Exception as exc:
+            raise DatabaseError(f"database schema v16 migration failed: {exc}") from exc
 
     def _migrate_v14_to_v15(self, connection: sqlite3.Connection) -> None:
         """Append the final one-shot grant after fingerprinting all v14 objects."""
@@ -3584,6 +3733,10 @@ class ResultsDatabase:
         additional_prior_settlement_receipt_sha256: str | None = None,
         additional_prior_execution_scope_sha256: str | None = None,
         additional_authority_path: Path = ADDITIONAL_AUTHORITY_PATH,
+        additional_replacement_entitlement_sha256: str | None = None,
+        additional_replacement_authority_sha256: str | None = None,
+        additional_replacement_request_sha256: str | None = None,
+        additional_replacement_authority_path: Path = ADDITIONAL_REPLACEMENT_AUTHORITY_PATH,
     ) -> None:
         requested = _database_money(requested_cost_usd, "requested_cost_usd")
         phase_cap = _database_money(phase_cap_usd, "phase_cap_usd")
@@ -3626,6 +3779,25 @@ class ResultsDatabase:
         )
         if additional_mode and not all(value is not None for value in additional_lineage):
             raise DatabaseError("reference additional authority is incomplete")
+        additional_replacement_mode = any(
+            value is not None
+            for value in (
+                additional_replacement_entitlement_sha256,
+                additional_replacement_authority_sha256,
+                additional_replacement_request_sha256,
+            )
+        )
+        if additional_replacement_mode and not additional_mode:
+            raise DatabaseError("additional replacement requires the parent additional authority")
+        if additional_replacement_mode and not all(
+            value is not None
+            for value in (
+                additional_replacement_entitlement_sha256,
+                additional_replacement_authority_sha256,
+                additional_replacement_request_sha256,
+            )
+        ):
+            raise DatabaseError("additional replacement authority is incomplete")
         if additional_mode:
             _database_sha256(additional_authority_sha256, "additional_authority_sha256")
             _database_sha256(
@@ -3650,6 +3822,22 @@ class ResultsDatabase:
             _database_sha256(replacement_entitlement_sha256, "replacement_entitlement_sha256")
             if recovery_authority_sha256 != REFERENCE_RECOVERY_AUTHORITY_SHA256:
                 raise DatabaseError("reference recovery authority is invalid")
+        if additional_replacement_mode:
+            _database_sha256(
+                additional_replacement_entitlement_sha256,
+                "additional_replacement_entitlement_sha256",
+            )
+            _database_sha256(
+                additional_replacement_request_sha256,
+                "additional_replacement_request_sha256",
+            )
+            if (
+                additional_replacement_entitlement_sha256
+                != self._additional_replacement_entitlement_sha256()
+                or additional_replacement_authority_sha256
+                != REFERENCE_ADDITIONAL_REPLACEMENT_AUTHORITY_SHA256
+            ):
+                raise DatabaseError("additional replacement authority lineage is invalid")
         try:
             validated_authority_sha256 = validate_reference_authority(
                 authority_root, authority_path
@@ -3667,6 +3855,11 @@ class ResultsDatabase:
                 if additional_mode
                 else None
             )
+            validated_additional_replacement_sha256 = (
+                validate_reference_additional_replacement_authority(authority_root)
+                if additional_replacement_mode
+                else None
+            )
         except ReferenceAuthorityError as exc:
             raise DatabaseError(
                 "reference standing or bootstrap authority files are invalid"
@@ -3679,6 +3872,12 @@ class ResultsDatabase:
             raise DatabaseError("reference recovery authority digest does not match its files")
         if additional_mode and validated_additional_sha256 != additional_authority_sha256:
             raise DatabaseError("reference additional authority digest does not match its files")
+        if (
+            additional_replacement_mode
+            and validated_additional_replacement_sha256
+            != additional_replacement_authority_sha256
+        ):
+            raise DatabaseError("additional replacement authority digest does not match its files")
         if not owner_id or not idempotency_key:
             raise DatabaseError("reference reservation requires owner and idempotency key")
         standing_setup = (
@@ -3820,6 +4019,35 @@ class ResultsDatabase:
                 if additional_grant is None:
                     raise DatabaseError("reference additional grant is unavailable")
                 _validate_reference_additional_prior_lineage(connection)
+                replacement_rows = connection.execute(
+                    "SELECT * FROM reference_additional_replacement_entitlements LIMIT 2"
+                ).fetchall()
+                if not additional_replacement_mode:
+                    raise DatabaseError("activated additional replacement authority is required")
+                if len(replacement_rows) != 1:
+                    raise DatabaseError("additional replacement entitlement is unavailable")
+                entitlement = replacement_rows[0]
+                if (
+                    entitlement["state"] != "claimed"
+                    or entitlement["entitlement_sha256"]
+                    != additional_replacement_entitlement_sha256
+                    or entitlement["authority_sha256"]
+                    != additional_replacement_authority_sha256
+                    or entitlement["forfeit_receipt_sha256"]
+                    != REFERENCE_ADDITIONAL_REPLACEMENT_FORFEIT_RECEIPT_SHA256
+                    or entitlement["parent_additional_authority_sha256"]
+                    != REFERENCE_ADDITIONAL_AUTHORITY_SHA256
+                    or entitlement["failed_request_sha256"]
+                    != REFERENCE_ADDITIONAL_FORFEITED_REQUEST_SHA256
+                    or entitlement["corrected_preflight_request_sha256"]
+                    != REFERENCE_ADDITIONAL_CORRECTED_PREFLIGHT_REQUEST_SHA256
+                    or entitlement["claimed_execution_scope_sha256"]
+                    != execution_scope_sha256
+                    or entitlement["claimed_request_sha256"]
+                    != additional_replacement_request_sha256
+                    or entitlement["reservation_id"] is not None
+                ):
+                    raise DatabaseError("additional replacement entitlement is not claimed")
             prior_scope_rows = connection.execute(
                 """SELECT br.reservation_id, br.status, e.config_json,
                     rac.challenge_sha256, rac.approval_digest
@@ -3993,6 +4221,16 @@ class ResultsDatabase:
                 )
                 if cursor.rowcount != 1:
                     raise DatabaseError("reference additional grant reservation lost its race")
+                if additional_replacement_mode:
+                    cursor = connection.execute(
+                        """UPDATE reference_additional_replacement_entitlements
+                        SET reservation_id = ?
+                        WHERE singleton = 1 AND state = 'claimed'
+                          AND entitlement_sha256 = ? AND reservation_id IS NULL""",
+                        (reservation_id, additional_replacement_entitlement_sha256),
+                    )
+                    if cursor.rowcount != 1:
+                        raise DatabaseError("additional replacement reservation lost its race")
             cursor = connection.execute(
                 """UPDATE reference_approval_challenges SET consumed_at = ?, run_id = ?
                 WHERE challenge_sha256 = ? AND approval_digest = ? AND consumed_at IS NULL""",
@@ -4010,6 +4248,134 @@ class ResultsDatabase:
         if len(rows) != 1:
             raise DatabaseError("reference additional grant cardinality is invalid")
         return dict(rows[0])
+
+    @staticmethod
+    def _additional_replacement_entitlement_sha256() -> str:
+        return sha256_json(
+            {
+                "authority_sha256": REFERENCE_ADDITIONAL_REPLACEMENT_AUTHORITY_SHA256,
+                "failed_request_sha256": REFERENCE_ADDITIONAL_FORFEITED_REQUEST_SHA256,
+                "forfeit_receipt_sha256": (
+                    REFERENCE_ADDITIONAL_REPLACEMENT_FORFEIT_RECEIPT_SHA256
+                ),
+                "parent_additional_authority_sha256": REFERENCE_ADDITIONAL_AUTHORITY_SHA256,
+                "corrected_preflight_request_sha256": (
+                    REFERENCE_ADDITIONAL_CORRECTED_PREFLIGHT_REQUEST_SHA256
+                ),
+                "slots": 1,
+            }
+        )
+
+    def reference_additional_replacement_entitlement(self) -> dict[str, Any] | None:
+        """Return the explicitly activated one-use amendment, if present."""
+        with self.connect_readonly() as connection:
+            rows = connection.execute(
+                "SELECT * FROM reference_additional_replacement_entitlements LIMIT 2"
+            ).fetchall()
+        if len(rows) > 1:
+            raise DatabaseError("additional replacement entitlement cardinality is invalid")
+        return None if not rows else dict(rows[0])
+
+    def activate_reference_additional_replacement(
+        self,
+        *,
+        authority_root: Path,
+        occurred_at: str,
+    ) -> str:
+        """Record the truthful pre-provider forfeit and mint its sole child entitlement."""
+        _database_timestamp(occurred_at, "occurred_at")
+        try:
+            validated = validate_reference_additional_replacement_authority(authority_root)
+        except ReferenceAuthorityError as exc:
+            raise DatabaseError("additional replacement amendment files are invalid") from exc
+        if validated != REFERENCE_ADDITIONAL_REPLACEMENT_AUTHORITY_SHA256:
+            raise DatabaseError("additional replacement amendment digest drifted")
+        entitlement_sha256 = self._additional_replacement_entitlement_sha256()
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            grant = connection.execute(
+                """SELECT state, active_reservation_id FROM reference_additional_grants
+                WHERE singleton = 1 AND authority_sha256 = ?""",
+                (REFERENCE_ADDITIONAL_AUTHORITY_SHA256,),
+            ).fetchone()
+            if grant is None or grant["state"] != "available" or grant["active_reservation_id"]:
+                raise DatabaseError("forfeited additional grant is not pre-provider available")
+            _validate_reference_additional_prior_lineage(connection)
+            rows = connection.execute(
+                "SELECT * FROM reference_additional_replacement_entitlements LIMIT 2"
+            ).fetchall()
+            if rows:
+                row = rows[0]
+                exact = (
+                    len(rows) == 1
+                    and row["state"] == "available"
+                    and row["entitlement_sha256"] == entitlement_sha256
+                    and row["authority_sha256"]
+                    == REFERENCE_ADDITIONAL_REPLACEMENT_AUTHORITY_SHA256
+                    and row["forfeit_receipt_sha256"]
+                    == REFERENCE_ADDITIONAL_REPLACEMENT_FORFEIT_RECEIPT_SHA256
+                    and row["parent_additional_authority_sha256"]
+                    == REFERENCE_ADDITIONAL_AUTHORITY_SHA256
+                    and row["failed_request_sha256"]
+                    == REFERENCE_ADDITIONAL_FORFEITED_REQUEST_SHA256
+                    and row["corrected_preflight_request_sha256"]
+                    == REFERENCE_ADDITIONAL_CORRECTED_PREFLIGHT_REQUEST_SHA256
+                )
+                if not exact:
+                    raise DatabaseError("additional replacement activation conflicts with lineage")
+                return entitlement_sha256
+            connection.execute(
+                """INSERT INTO reference_additional_replacement_entitlements(
+                    singleton, entitlement_sha256, authority_sha256,
+                    forfeit_receipt_sha256, parent_additional_authority_sha256,
+                    failed_request_sha256, corrected_preflight_request_sha256,
+                    state, created_at
+                ) VALUES (1, ?, ?, ?, ?, ?, ?, 'available', ?)""",
+                (
+                    entitlement_sha256,
+                    REFERENCE_ADDITIONAL_REPLACEMENT_AUTHORITY_SHA256,
+                    REFERENCE_ADDITIONAL_REPLACEMENT_FORFEIT_RECEIPT_SHA256,
+                    REFERENCE_ADDITIONAL_AUTHORITY_SHA256,
+                    REFERENCE_ADDITIONAL_FORFEITED_REQUEST_SHA256,
+                    REFERENCE_ADDITIONAL_CORRECTED_PREFLIGHT_REQUEST_SHA256,
+                    occurred_at,
+                ),
+            )
+        return entitlement_sha256
+
+    def claim_reference_additional_replacement(
+        self,
+        *,
+        request_sha256: str,
+        parity_receipt_sha256: str,
+        execution_scope_sha256: str,
+        occurred_at: str,
+    ) -> str:
+        """Irreversibly claim the final action immediately before reservation."""
+        _database_timestamp(occurred_at, "occurred_at")
+        _database_sha256(request_sha256, "request_sha256")
+        _database_sha256(parity_receipt_sha256, "parity_receipt_sha256")
+        _database_sha256(execution_scope_sha256, "execution_scope_sha256")
+        entitlement_sha256 = self._additional_replacement_entitlement_sha256()
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """UPDATE reference_additional_replacement_entitlements
+                SET state = 'claimed', claimed_execution_scope_sha256 = ?,
+                    claimed_request_sha256 = ?, claimed_parity_receipt_sha256 = ?, claimed_at = ?
+                WHERE singleton = 1 AND entitlement_sha256 = ? AND state = 'available'
+                  AND corrected_preflight_request_sha256 = ?""",
+                (
+                    execution_scope_sha256,
+                    request_sha256,
+                    parity_receipt_sha256,
+                    occurred_at,
+                    entitlement_sha256,
+                    REFERENCE_ADDITIONAL_CORRECTED_PREFLIGHT_REQUEST_SHA256,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise DatabaseError("additional replacement entitlement is unavailable")
+        return entitlement_sha256
 
     def release_reference_additional_reservation(
         self,
@@ -4079,6 +4445,8 @@ class ResultsDatabase:
         *,
         owner_id: str,
         additional_authority_sha256: str,
+        request_sha256: str,
+        parity_receipt_sha256: str,
         auth_receipt_bytes: bytes,
         authority_root: Path,
         occurred_at: str,
@@ -4086,6 +4454,8 @@ class ResultsDatabase:
     ) -> None:
         """Consume the final grant atomically at the reservation-specific boundary."""
         occurred = _database_timestamp(occurred_at, "occurred_at")
+        _database_sha256(request_sha256, "request_sha256")
+        _database_sha256(parity_receipt_sha256, "parity_receipt_sha256")
         if not owner_id or additional_authority_sha256 != REFERENCE_ADDITIONAL_AUTHORITY_SHA256:
             raise DatabaseError("reference additional boundary authority is invalid")
         try:
@@ -4096,17 +4466,35 @@ class ResultsDatabase:
             raise DatabaseError("reference additional authority file is invalid") from exc
         if validated != additional_authority_sha256:
             raise DatabaseError("reference additional authority digest does not match its files")
+        try:
+            replacement_validated = validate_reference_additional_replacement_authority(
+                authority_root
+            )
+        except ReferenceAuthorityError as exc:
+            raise DatabaseError("additional replacement authority file is invalid") from exc
+        if replacement_validated != REFERENCE_ADDITIONAL_REPLACEMENT_AUTHORITY_SHA256:
+            raise DatabaseError("additional replacement boundary authority drifted")
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
                 """SELECT br.reference_execution_scope_sha256, br.lease_expires_at,
-                    br.heartbeat_at, rag.active_execution_scope_sha256
+                    br.heartbeat_at, rag.active_execution_scope_sha256,
+                    rare.claimed_execution_scope_sha256, rare.claimed_request_sha256,
+                    rare.claimed_parity_receipt_sha256
                 FROM budget_reservations AS br
                 JOIN reference_additional_grants AS rag
                   ON rag.active_reservation_id = br.reservation_id
+                JOIN reference_additional_replacement_entitlements AS rare
+                  ON rare.reservation_id = br.reservation_id
                 WHERE br.reservation_id = ? AND br.owner_id = ?
                   AND br.status = 'reserved' AND rag.singleton = 1
                   AND rag.authority_sha256 = ? AND rag.state = 'available'
+                  AND rare.singleton = 1 AND rare.state = 'claimed'
+                  AND rare.authority_sha256 = ?
+                  AND rare.forfeit_receipt_sha256 = ?
+                  AND rare.parent_additional_authority_sha256 = ?
+                  AND rare.failed_request_sha256 = ?
+                  AND rare.corrected_preflight_request_sha256 = ?
                   AND rag.prior_settlement_receipt_sha256 = ?
                   AND rag.prior_execution_scope_sha256 = ?
                   AND rag.prior_actual_cost_usd = '0.00564445'""",
@@ -4114,6 +4502,11 @@ class ResultsDatabase:
                     reservation_id,
                     owner_id,
                     additional_authority_sha256,
+                    REFERENCE_ADDITIONAL_REPLACEMENT_AUTHORITY_SHA256,
+                    REFERENCE_ADDITIONAL_REPLACEMENT_FORFEIT_RECEIPT_SHA256,
+                    REFERENCE_ADDITIONAL_AUTHORITY_SHA256,
+                    REFERENCE_ADDITIONAL_FORFEITED_REQUEST_SHA256,
+                    REFERENCE_ADDITIONAL_CORRECTED_PREFLIGHT_REQUEST_SHA256,
                     REFERENCE_ADDITIONAL_SETTLEMENT_RECEIPT_SHA256,
                     REFERENCE_ADDITIONAL_PRIOR_EXECUTION_SCOPE_SHA256,
                 ),
@@ -4121,6 +4514,10 @@ class ResultsDatabase:
             if (
                 row is None
                 or row["reference_execution_scope_sha256"] != row["active_execution_scope_sha256"]
+                or row["reference_execution_scope_sha256"]
+                != row["claimed_execution_scope_sha256"]
+                or row["claimed_request_sha256"] != request_sha256
+                or row["claimed_parity_receipt_sha256"] != parity_receipt_sha256
             ):
                 raise DatabaseError("reference additional grant is not ready for provider contact")
             auth_receipt_sha256 = _validate_additional_provider_auth_receipt(
@@ -4166,6 +4563,24 @@ class ResultsDatabase:
             )
             if cursor.rowcount != 1:
                 raise DatabaseError("reference additional grant was already consumed")
+            cursor = connection.execute(
+                """UPDATE reference_additional_replacement_entitlements
+                SET state = 'consumed', consumed_at = ?,
+                    consumed_auth_receipt_sha256 = ?
+                WHERE singleton = 1 AND state = 'claimed' AND reservation_id = ?
+                  AND entitlement_sha256 = ? AND claimed_request_sha256 = ?
+                  AND claimed_parity_receipt_sha256 = ?""",
+                (
+                    occurred_at,
+                    auth_receipt_sha256,
+                    reservation_id,
+                    self._additional_replacement_entitlement_sha256(),
+                    request_sha256,
+                    parity_receipt_sha256,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise DatabaseError("additional replacement entitlement was already consumed")
             cursor = connection.execute(
                 """UPDATE budget_reservations
                 SET status = 'submission_pending', heartbeat_at = ?, updated_at = ?

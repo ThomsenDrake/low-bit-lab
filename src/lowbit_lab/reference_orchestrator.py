@@ -28,10 +28,14 @@ import yaml
 from lowbit_lab.config import SHA256_RE
 from lowbit_lab.constants import (
     REFERENCE_ADDITIONAL_AUTHORITY_SHA256,
+    REFERENCE_ADDITIONAL_CORRECTED_PREFLIGHT_REQUEST_SHA256,
     REFERENCE_ADDITIONAL_CUMULATIVE_CAP_USD,
     REFERENCE_ADDITIONAL_INCREMENTAL_CAP_USD,
     REFERENCE_ADDITIONAL_PRIOR_EXECUTION_SCOPE_SHA256,
     REFERENCE_ADDITIONAL_PRIOR_SPEND_USD,
+    REFERENCE_ADDITIONAL_REPLACEMENT_AUTHORITY_SHA256,
+    REFERENCE_ADDITIONAL_REPLACEMENT_FORFEIT_RECEIPT_SHA256,
+    REFERENCE_ADDITIONAL_REPLACEMENT_STATEMENT_ARTIFACT_SHA256,
     REFERENCE_ADDITIONAL_SETTLEMENT_RECEIPT_SHA256,
     REFERENCE_AUTHORITY_SHA256,
     REFERENCE_BOOTSTRAP_AUTHORITY_SHA256,
@@ -68,12 +72,18 @@ from lowbit_lab.provider_evidence import (
 )
 from lowbit_lab.reference_authority import (
     ADDITIONAL_AUTHORITY_PATH,
+    ADDITIONAL_REPLACEMENT_AUTHORITY_PATH,
+    ADDITIONAL_REPLACEMENT_FORFEIT_RECEIPT_PATH,
+    ADDITIONAL_REPLACEMENT_STATEMENT_PATH,
     RECOVERY_AUTHORITY_PATH,
     WORKSPACE_RECONCILIATION_AUTHORITY_PATH,
     ReferenceAuthorityError,
+    build_reference_additional_forfeit_receipt,
+    build_reference_additional_replacement_authority,
     build_reference_recovery_authority,
     build_workspace_scope_reconciliation_authority,
     validate_reference_additional_authority,
+    validate_reference_additional_replacement_authority,
     validate_reference_recovery_authority,
     validate_workspace_scope_reconciliation_authority,
 )
@@ -628,8 +638,15 @@ def return_wsl_state(durable_root: Path, wsl_root: Path) -> Mapping[str, object]
     marker, marker_bytes = _read_transfer_marker(durable_root)
     if marker["wsl_mirror_path"] != _canonical_local_path(wsl_root):
         raise ReferenceOrchestratorError("active WSL state owner mismatch")
-    state = reference_status(wsl_root)["additional"]
+    status = reference_status(wsl_root)
+    state = status["additional"]
+    additional_replacement = status.get("additional_replacement")
     scope = state.get("execution_scope_sha256") if isinstance(state, Mapping) else None
+    claimed_parity_sha256 = (
+        additional_replacement.get("claimed_parity_receipt_sha256")
+        if isinstance(additional_replacement, Mapping)
+        else None
+    )
     parity_candidates = [wsl_root / WSL_PARITY_RECEIPT_PATH]
     parity_root = wsl_root / WSL_PARITY_HISTORY_ROOT
     if parity_root.exists():
@@ -643,6 +660,10 @@ def return_wsl_state(durable_root: Path, wsl_root: Path) -> Mapping[str, object]
             candidate.get("marker_sha256") == _sha(marker_bytes)
             and candidate.get("transfer_id") == marker["transfer_id"]
             and (scope is None or candidate.get("execution_scope_sha256") == scope)
+            and (
+                claimed_parity_sha256 is None
+                or _sha(candidate_bytes) == claimed_parity_sha256
+            )
             and all(candidate_bytes != existing[1] for existing in matches)
         ):
             matches.append((candidate, candidate_bytes))
@@ -654,17 +675,63 @@ def return_wsl_state(durable_root: Path, wsl_root: Path) -> Mapping[str, object]
         or parity.get("transfer_id") != marker["transfer_id"]
     ):
         raise ReferenceOrchestratorError("WSL parity receipt lineage drift")
-    if not isinstance(state, Mapping) or state.get("state") not in {
+    terminal_state = state.get("state") if isinstance(state, Mapping) else None
+    if terminal_state not in {
         "settled-success",
         "settled-failure",
+        "forfeited-preprovider",
     }:
         raise ReferenceOrchestratorError("WSL state is not terminal")
-    _copy_terminal_wsl_evidence(
-        durable_root,
-        wsl_root,
-        execution_scope_sha256=str(scope),
-        parity_bytes=parity_bytes,
-    )
+    if terminal_state == "forfeited-preprovider":
+        try:
+            validate_reference_additional_replacement_authority(wsl_root)
+        except ReferenceAuthorityError as exc:
+            raise ReferenceOrchestratorError(
+                "additional pre-provider forfeit evidence is invalid"
+            ) from exc
+        for relative, expected, label in (
+            (
+                ADDITIONAL_REPLACEMENT_STATEMENT_PATH,
+                REFERENCE_ADDITIONAL_REPLACEMENT_STATEMENT_ARTIFACT_SHA256,
+                "additional replacement statement",
+            ),
+            (
+                ADDITIONAL_REPLACEMENT_AUTHORITY_PATH,
+                _sha(canonical_bytes(build_reference_additional_replacement_authority()) + b"\n"),
+                "additional replacement authority",
+            ),
+            (
+                ADDITIONAL_REPLACEMENT_FORFEIT_RECEIPT_PATH,
+                _sha(canonical_bytes(build_reference_additional_forfeit_receipt()) + b"\n"),
+                "additional pre-provider forfeit receipt",
+            ),
+        ):
+            _copy_verified_return_file(
+                durable_root,
+                wsl_root,
+                relative,
+                expected_sha256=expected,
+                label=label,
+            )
+        if not isinstance(additional_replacement, Mapping) or not isinstance(
+            additional_replacement.get("claimed_request_sha256"), str
+        ):
+            raise ReferenceOrchestratorError("claimed replacement request is unavailable")
+        _copy_wsl_request_and_parity(
+            durable_root,
+            wsl_root,
+            parity_bytes,
+            expected_request_sha256=str(
+                additional_replacement["claimed_request_sha256"]
+            ),
+        )
+    else:
+        _copy_terminal_wsl_evidence(
+            durable_root,
+            wsl_root,
+            execution_scope_sha256=str(scope),
+            parity_bytes=parity_bytes,
+        )
     source = confine_results_db(wsl_root, DATABASE_PATH)
     source_sha256 = _database_snapshot_sha256(source)
     destination = confine_results_db(durable_root, DATABASE_PATH)
@@ -684,7 +751,7 @@ def return_wsl_state(durable_root: Path, wsl_root: Path) -> Mapping[str, object]
         "marker_sha256": _sha(marker_bytes),
         "parity_receipt_sha256": _sha(parity_bytes),
         "schema_version": 1,
-        "terminal_state": state["state"],
+        "terminal_state": terminal_state,
         "transfer_id": transfer_id,
     }
     receipt_bytes = canonical_bytes(receipt)
@@ -737,6 +804,38 @@ def _copy_verified_return_file(
         except SafeFileError as exc:
             raise ReferenceOrchestratorError(f"{label} return path is unsafe") from exc
     return content
+
+
+def _copy_wsl_request_and_parity(
+    durable_root: Path,
+    wsl_root: Path,
+    parity_bytes: bytes,
+    *,
+    expected_request_sha256: str | None = None,
+) -> None:
+    """Return the exact paid request and selected parity generation."""
+    try:
+        parity = json.loads(parity_bytes)
+        request_sha256 = str(parity["request_sha256"])
+    except (KeyError, TypeError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ReferenceOrchestratorError("WSL parity request binding is invalid") from exc
+    if expected_request_sha256 is not None and request_sha256 != expected_request_sha256:
+        raise ReferenceOrchestratorError("claimed request and WSL parity have drifted")
+    _copy_verified_return_file(
+        durable_root,
+        wsl_root,
+        ADDITIONAL_REQUEST_PATH,
+        expected_sha256=request_sha256,
+        label="additional bootstrap request",
+    )
+    parity_sha256 = _sha(parity_bytes)
+    _copy_verified_return_file(
+        durable_root,
+        wsl_root,
+        WSL_PARITY_HISTORY_ROOT / f"{parity_sha256}.json",
+        expected_sha256=parity_sha256,
+        label="WSL parity generation",
+    )
 
 
 def _unique_hash_bound_evidence(
@@ -819,26 +918,7 @@ def _copy_terminal_wsl_evidence(
             label=label,
         )
 
-    try:
-        parity = json.loads(parity_bytes)
-        request_sha256 = str(parity["request_sha256"])
-    except (KeyError, TypeError, UnicodeError, json.JSONDecodeError) as exc:
-        raise ReferenceOrchestratorError("WSL parity request binding is invalid") from exc
-    _copy_verified_return_file(
-        durable_root,
-        wsl_root,
-        ADDITIONAL_REQUEST_PATH,
-        expected_sha256=request_sha256,
-        label="additional bootstrap request",
-    )
-    parity_sha256 = _sha(parity_bytes)
-    _copy_verified_return_file(
-        durable_root,
-        wsl_root,
-        WSL_PARITY_HISTORY_ROOT / f"{parity_sha256}.json",
-        expected_sha256=parity_sha256,
-        label="WSL parity generation",
-    )
+    _copy_wsl_request_and_parity(durable_root, wsl_root, parity_bytes)
     for field, pattern, label in (
         ("execution_receipt_sha256", "u8-bootstrap-receipt-*.json", "execution receipt"),
         ("execution_manifest_sha256", "u8-reference-manifest-*.json", "execution manifest"),
@@ -2186,6 +2266,56 @@ def materialize_recovery_authority(root: Path) -> Mapping[str, str]:
     return {"recovery_authority_sha256": validated}
 
 
+def activate_additional_preprovider_replacement(root: Path) -> Mapping[str, object]:
+    """Materialize the approved forfeit and atomically mint its sole replacement."""
+    root = root.resolve(strict=True)
+    request_path = root / ADDITIONAL_REQUEST_PATH
+    if not request_path.is_file() or _sha(request_path.read_bytes()) != (
+        REFERENCE_ADDITIONAL_CORRECTED_PREFLIGHT_REQUEST_SHA256
+    ):
+        raise ReferenceOrchestratorError("corrected additional request bytes are unavailable")
+    authority_bytes = canonical_bytes(build_reference_additional_replacement_authority()) + b"\n"
+    receipt_bytes = canonical_bytes(build_reference_additional_forfeit_receipt()) + b"\n"
+    for path, content in (
+        (ADDITIONAL_REPLACEMENT_AUTHORITY_PATH, authority_bytes),
+        (ADDITIONAL_REPLACEMENT_FORFEIT_RECEIPT_PATH, receipt_bytes),
+    ):
+        output = root / path
+        if output.exists() and output.read_bytes() != content:
+            raise ReferenceOrchestratorError("additional replacement artifact is immutable")
+        if not output.exists():
+            try:
+                atomic_write(root, path, content, replace=False)
+            except SafeFileError as exc:
+                raise ReferenceOrchestratorError(
+                    "additional replacement artifact path is unsafe"
+                ) from exc
+    try:
+        validated = validate_reference_additional_replacement_authority(root)
+    except ReferenceAuthorityError as exc:
+        raise ReferenceOrchestratorError("additional replacement authority is invalid") from exc
+    if validated != REFERENCE_ADDITIONAL_REPLACEMENT_AUTHORITY_SHA256:
+        raise ReferenceOrchestratorError("additional replacement authority lineage drift")
+    database = ResultsDatabase(confine_results_db(root, DATABASE_PATH))
+    database.initialize()
+    entitlement_sha256 = database.activate_reference_additional_replacement(
+        authority_root=root,
+        occurred_at=datetime.now(UTC).isoformat(),
+    )
+    return {
+        "amendment_authority_sha256": validated,
+        "entitlement_sha256": entitlement_sha256,
+        "failed_incremental_spend_usd": "0",
+        "forfeit_receipt_sha256": REFERENCE_ADDITIONAL_REPLACEMENT_FORFEIT_RECEIPT_SHA256,
+        "provider_contacted": False,
+        "reservation_created": False,
+        "corrected_preflight_request_sha256": (
+            REFERENCE_ADDITIONAL_CORRECTED_PREFLIGHT_REQUEST_SHA256
+        ),
+        "weight_transfer": False,
+    }
+
+
 def _additional_status_state(
     grant_state: str, reservation_status: str | None, experiment_status: str | None
 ) -> str:
@@ -2246,6 +2376,18 @@ def reference_status(root: Path) -> Mapping[str, object]:
             LEFT JOIN experiments AS e ON e.run_id = br.run_id
             LIMIT 2"""
         ).fetchall()
+        additional_replacements = connection.execute(
+            """SELECT entitlement_sha256, authority_sha256, forfeit_receipt_sha256,
+                failed_request_sha256, corrected_preflight_request_sha256, state,
+                claimed_execution_scope_sha256, claimed_request_sha256,
+                claimed_parity_receipt_sha256,
+                rare.reservation_id,
+                br.status AS reservation_status, br.provider_job_id,
+                br.app_identity, br.submitted_at
+            FROM reference_additional_replacement_entitlements AS rare
+            LEFT JOIN budget_reservations AS br ON br.reservation_id = rare.reservation_id
+            LIMIT 2"""
+        ).fetchall()
         actual_rows = connection.execute(
             """SELECT provider_actual_cost_usd FROM budget_reservations
             WHERE provider_actual_cost_usd IS NOT NULL
@@ -2257,13 +2399,29 @@ def reference_status(root: Path) -> Mapping[str, object]:
         raise ReferenceOrchestratorError("multiple replacement entitlements are invalid")
     if len(additional) != 1:
         raise ReferenceOrchestratorError("reference additional grant cardinality is invalid")
+    if len(additional_replacements) > 1:
+        raise ReferenceOrchestratorError(
+            "additional replacement entitlement cardinality is invalid"
+        )
     entitlement = None if not entitlements else entitlements[0]
     additional_row = additional[0]
+    additional_replacement = (
+        None if not additional_replacements else additional_replacements[0]
+    )
     reservation_status = additional_row["reservation_status"]
     experiment_status = additional_row["experiment_status"]
     additional_state = _additional_status_state(
         str(additional_row["state"]), reservation_status, experiment_status
     )
+    if (
+        additional_replacement is not None
+        and additional_replacement["state"] == "claimed"
+        and additional_replacement["reservation_status"] in {None, "released"}
+        and additional_replacement["provider_job_id"] is None
+        and additional_replacement["app_identity"] is None
+        and additional_replacement["submitted_at"] is None
+    ):
+        additional_state = "forfeited-preprovider"
     proven_context = (
         262144
         if experiment_status == "completed" and additional_row["proven_context"] == "262144"
@@ -2285,6 +2443,43 @@ def reference_status(root: Path) -> Mapping[str, object]:
                 if additional_row["active_execution_scope_sha256"] is not None
                 else {}
             ),
+        },
+        "additional_replacement": None
+        if additional_replacement is None
+        else {
+            "authority_sha256": additional_replacement["authority_sha256"],
+            "entitlement_sha256": additional_replacement["entitlement_sha256"],
+            "failed_request_sha256": additional_replacement["failed_request_sha256"],
+            "forfeit_receipt_sha256": additional_replacement["forfeit_receipt_sha256"],
+            "corrected_preflight_request_sha256": additional_replacement[
+                "corrected_preflight_request_sha256"
+            ],
+            "claimed_request_sha256": additional_replacement["claimed_request_sha256"],
+            "claimed_parity_receipt_sha256": additional_replacement[
+                "claimed_parity_receipt_sha256"
+            ],
+            "reservation_status": additional_replacement["reservation_status"],
+            "state": additional_replacement["state"],
+            **(
+                {
+                    "execution_scope_sha256": additional_replacement[
+                        "claimed_execution_scope_sha256"
+                    ]
+                }
+                if additional_replacement["claimed_execution_scope_sha256"] is not None
+                else {}
+            ),
+        },
+        "additional_preprovider_forfeit": None
+        if additional_replacement is None
+        else {
+            "failed_request_sha256": additional_replacement["failed_request_sha256"],
+            "forfeit_receipt_sha256": additional_replacement["forfeit_receipt_sha256"],
+            "incremental_spend_usd": "0",
+            "provider_submitted": False,
+            "reservation_created": False,
+            "state": "forfeited-preprovider",
+            "weight_transfer": False,
         },
         "cumulative_actual_cost_usd": format(cumulative_actual, "f"),
         "configured_context_tokens": 262144,
@@ -2858,6 +3053,15 @@ def prepare_additional(
         or grant["active_reservation_id"] is not None
     ):
         raise ReferenceOrchestratorError("additional grant is not locally available")
+    entitlement = database.reference_additional_replacement_entitlement()
+    if entitlement is None or (
+        entitlement["state"] != "available"
+        or entitlement["authority_sha256"]
+        != REFERENCE_ADDITIONAL_REPLACEMENT_AUTHORITY_SHA256
+        or entitlement["corrected_preflight_request_sha256"]
+        != REFERENCE_ADDITIONAL_CORRECTED_PREFLIGHT_REQUEST_SHA256
+    ):
+        raise ReferenceOrchestratorError("additional replacement entitlement is unavailable")
     request = build_bootstrap_request(root, config, additional=True)
     validate_reproduced_request(root, config, request, additional=True)
     _write_atomic(root, root / ADDITIONAL_REQUEST_PATH, request)
@@ -3102,10 +3306,20 @@ def execute_additional(
     owner_id = str(uuid.uuid4())
     attempt_id = str(uuid.uuid4())
     run_id = str(uuid.uuid4())
+    entitlement_sha256 = database.claim_reference_additional_replacement(
+        request_sha256=request_sha256,
+        parity_receipt_sha256=str(parity["parity_receipt_sha256"]),
+        execution_scope_sha256=str(config.reference_execution_scope_sha256),
+        occurred_at=now.isoformat(),
+    )
     approval_digest = canonical_sha256(
         {
             "action": "u8_reference_additional_once",
             "additional_authority_sha256": REFERENCE_ADDITIONAL_AUTHORITY_SHA256,
+            "additional_replacement_authority_sha256": (
+                REFERENCE_ADDITIONAL_REPLACEMENT_AUTHORITY_SHA256
+            ),
+            "additional_replacement_entitlement_sha256": entitlement_sha256,
             "capability_sha256": binding.capability_sha256,
             "challenge_sha256": binding.challenge_sha256,
             "packet_sha256": binding.packet_sha256,
@@ -3146,6 +3360,11 @@ def execute_additional(
         additional_authority_sha256=REFERENCE_ADDITIONAL_AUTHORITY_SHA256,
         additional_prior_settlement_receipt_sha256=(REFERENCE_ADDITIONAL_SETTLEMENT_RECEIPT_SHA256),
         additional_prior_execution_scope_sha256=(REFERENCE_ADDITIONAL_PRIOR_EXECUTION_SCOPE_SHA256),
+        additional_replacement_entitlement_sha256=entitlement_sha256,
+        additional_replacement_authority_sha256=(
+            REFERENCE_ADDITIONAL_REPLACEMENT_AUTHORITY_SHA256
+        ),
+        additional_replacement_request_sha256=request_sha256,
     )
     capability = replace(
         unreserved,
@@ -3192,6 +3411,7 @@ def _parser() -> argparse.ArgumentParser:
     sub.add_parser("compile-u9-proposal")
     sub.add_parser("prepare-replacement")
     sub.add_parser("prepare-additional")
+    sub.add_parser("activate-additional-replacement")
     transfer_begin = sub.add_parser("wsl-transfer-begin")
     transfer_begin.add_argument("--durable-root", type=Path, required=True)
     transfer_return = sub.add_parser("wsl-transfer-return")
@@ -3227,6 +3447,14 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if command == "status":
             emit({"ok": True, **reference_status(args.root)})
+            return 0
+        if command == "activate-additional-replacement":
+            emit(
+                {
+                    "ok": True,
+                    **activate_additional_preprovider_replacement(args.root),
+                }
+            )
             return 0
         if command == "auth-bind":
             emit(

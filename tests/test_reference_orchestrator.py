@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import sqlite3
 import subprocess
 import sys
 from pathlib import Path
@@ -554,6 +555,15 @@ def test_prepare_additional_is_local_and_binds_available_grant(
                 "prior_execution_scope_sha256": (REFERENCE_ADDITIONAL_PRIOR_EXECUTION_SCOPE_SHA256),
                 "prior_actual_cost_usd": "0.00564445",
                 "active_reservation_id": None,
+            }
+
+        def reference_additional_replacement_entitlement(self) -> dict[str, object]:
+            return {
+                "state": "available",
+                "authority_sha256": orchestrator.REFERENCE_ADDITIONAL_REPLACEMENT_AUTHORITY_SHA256,
+                "corrected_preflight_request_sha256": (
+                    orchestrator.REFERENCE_ADDITIONAL_CORRECTED_PREFLIGHT_REQUEST_SHA256
+                ),
             }
 
     monkeypatch.setattr(orchestrator, "ResultsDatabase", Database)
@@ -2358,6 +2368,99 @@ def test_nonterminal_wsl_state_cannot_clear_ownership_marker(
     assert (durable / orchestrator.WSL_TRANSFER_MARKER_PATH).exists()
 
 
+def test_forfeited_preprovider_wsl_return_selects_claimed_parity_and_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    durable = tmp_path / "durable"
+    mirror = tmp_path / "mirror"
+    durable.mkdir()
+    mirror.mkdir()
+    _sqlite_fixture(durable / orchestrator.DATABASE_PATH, "durable")
+    monkeypatch.setattr(orchestrator, "_require_wsl_ext4_root", lambda root: None)
+    transfer = orchestrator.begin_wsl_state_transfer(durable, mirror)
+    marker_bytes = (durable / orchestrator.WSL_TRANSFER_MARKER_PATH).read_bytes()
+    request = b'{"request":"claimed"}'
+    request_sha256 = hashlib.sha256(request).hexdigest()
+    claimed_parity = orchestrator.canonical_bytes(
+        {
+            "execution_scope_sha256": "7" * 64,
+            "marker_sha256": transfer["marker_sha256"],
+            "request_sha256": request_sha256,
+            "transfer_id": transfer["transfer_id"],
+        }
+    )
+    stale_parity = orchestrator.canonical_bytes(
+        {
+            "execution_scope_sha256": "7" * 64,
+            "marker_sha256": transfer["marker_sha256"],
+            "request_sha256": "f" * 64,
+            "transfer_id": transfer["transfer_id"],
+        }
+    )
+    claimed_parity_sha256 = hashlib.sha256(claimed_parity).hexdigest()
+    parity_root = mirror / orchestrator.WSL_PARITY_HISTORY_ROOT
+    parity_root.mkdir(parents=True)
+    (parity_root / f"{claimed_parity_sha256}.json").write_bytes(claimed_parity)
+    (parity_root / f"{hashlib.sha256(stale_parity).hexdigest()}.json").write_bytes(stale_parity)
+    request_path = mirror / orchestrator.ADDITIONAL_REQUEST_PATH
+    request_path.parent.mkdir(parents=True, exist_ok=True)
+    request_path.write_bytes(request)
+
+    statement = b"test exact amendment statement"
+    monkeypatch.setattr(
+        orchestrator,
+        "REFERENCE_ADDITIONAL_REPLACEMENT_STATEMENT_ARTIFACT_SHA256",
+        hashlib.sha256(statement).hexdigest(),
+    )
+    for relative, content in (
+        (orchestrator.ADDITIONAL_REPLACEMENT_STATEMENT_PATH, statement),
+        (
+            orchestrator.ADDITIONAL_REPLACEMENT_AUTHORITY_PATH,
+            orchestrator.canonical_bytes(
+                orchestrator.build_reference_additional_replacement_authority()
+            )
+            + b"\n",
+        ),
+        (
+            orchestrator.ADDITIONAL_REPLACEMENT_FORFEIT_RECEIPT_PATH,
+            orchestrator.canonical_bytes(orchestrator.build_reference_additional_forfeit_receipt())
+            + b"\n",
+        ),
+    ):
+        path = mirror / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+    monkeypatch.setattr(
+        orchestrator, "validate_reference_additional_replacement_authority", lambda root: "ok"
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "reference_status",
+        lambda root: {
+            "additional": {"state": "forfeited-preprovider"},
+            "additional_replacement": {
+                "claimed_parity_receipt_sha256": claimed_parity_sha256,
+                "claimed_request_sha256": request_sha256,
+            },
+        },
+    )
+    with sqlite3.connect(mirror / orchestrator.DATABASE_PATH) as connection:
+        connection.execute("UPDATE state SET value = 'forfeited' WHERE value = 'durable'")
+
+    returned = orchestrator.return_wsl_state(durable, mirror)
+
+    assert returned["terminal_state"] == "forfeited-preprovider"
+    assert returned["parity_receipt_sha256"] == claimed_parity_sha256
+    assert (durable / orchestrator.ADDITIONAL_REQUEST_PATH).read_bytes() == request
+    assert (
+        durable / orchestrator.WSL_PARITY_HISTORY_ROOT / f"{claimed_parity_sha256}.json"
+    ).read_bytes() == claimed_parity
+    assert not (durable / orchestrator.WSL_TRANSFER_MARKER_PATH).exists()
+    assert (
+        durable / orchestrator.WSL_TRANSFER_HISTORY_ROOT / f"{transfer['transfer_id']}.json"
+    ).read_bytes() == marker_bytes
+
+
 def test_execute_additional_proves_parity_before_reservation_and_submits_once(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2406,8 +2509,17 @@ def test_execute_additional_proves_parity_before_reservation_and_submits_once(
         def initialize(self) -> None:
             events.append("initialize")
 
+        def reference_additional_replacement_entitlement(self) -> dict[str, object]:
+            return {"state": "available"}
+
+        def claim_reference_additional_replacement(self, **kwargs: object) -> str:
+            assert kwargs["request_sha256"] == hashlib.sha256(b"request").hexdigest()
+            events.append("claim")
+            return "9" * 64
+
         def reserve_reference_run(self, **kwargs: object) -> None:
             assert kwargs["additional_authority_sha256"] == REFERENCE_ADDITIONAL_AUTHORITY_SHA256
+            assert kwargs["additional_replacement_entitlement_sha256"] == "9" * 64
             assert kwargs["total_cap_usd"] == "4.00564445"
             events.append("reserve")
 
@@ -2448,7 +2560,12 @@ def test_execute_additional_proves_parity_before_reservation_and_submits_once(
 
     assert result["status"] == "failed"
     assert events.count("submit") == 1
-    assert events.index("parity") < events.index("reserve") < events.index("submit")
+    assert (
+        events.index("parity")
+        < events.index("claim")
+        < events.index("reserve")
+        < events.index("submit")
+    )
 
 
 def test_u9_proposal_is_locked_until_successful_settlement(

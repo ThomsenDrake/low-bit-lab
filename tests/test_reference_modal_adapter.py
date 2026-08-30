@@ -1107,6 +1107,8 @@ def test_additional_boundary_consumes_exact_grant_with_auth_receipt(tmp_path: Pa
         owner_id="owner",
         authority_root=tmp_path,
         additional_authority_sha256="b" * 64,
+        additional_wsl_parity_receipt_sha256="c" * 64,
+        bootstrap_request_bytes=b"request",
         replacement_entitlement_sha256=None,
     )
     receipt = b'{"sanitized":true}'
@@ -1120,6 +1122,8 @@ def test_additional_boundary_consumes_exact_grant_with_auth_receipt(tmp_path: Pa
 
     assert [name for name, _ in calls] == ["additional"]
     assert calls[0][1]["additional_authority_sha256"] == "b" * 64
+    assert calls[0][1]["request_sha256"] == hashlib.sha256(b"request").hexdigest()
+    assert calls[0][1]["parity_receipt_sha256"] == "c" * 64
     assert calls[0][1]["auth_receipt_bytes"] == receipt
 
 
@@ -1377,14 +1381,21 @@ def test_additional_parity_binds_exact_hydration_payload(tmp_path: Path) -> None
         "serialized_payload_size_bytes": len(payload),
     }
     content = adapter._canonical_json(receipt)
-    path = tmp_path / "reports/local/reference-wsl-parity-receipt.json"
-    path.parent.mkdir(parents=True)
-    path.write_bytes(content)
+    receipt_sha256 = adapter._sha(content)
+    history = (
+        tmp_path
+        / "reports/local/reference-wsl-parity-history"
+        / f"{receipt_sha256}.json"
+    )
+    history.parent.mkdir(parents=True)
+    history.write_bytes(content)
+    legacy = tmp_path / "reports/local/reference-wsl-parity-receipt.json"
+    legacy.write_bytes(adapter._canonical_json({**receipt, "request_sha256": "f" * 64}))
     capability = SimpleNamespace(
         root=tmp_path,
         bootstrap_request_bytes=request,
         additional_authority_sha256=adapter.REFERENCE_ADDITIONAL_AUTHORITY_SHA256,
-        additional_wsl_parity_receipt_sha256=adapter._sha(content),
+        additional_wsl_parity_receipt_sha256=receipt_sha256,
     )
 
     adapter._validate_additional_parity(

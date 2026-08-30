@@ -15,6 +15,7 @@ import pytest
 from lowbit_lab.constants import (
     REFERENCE_ADDITIONAL_AUTHORITY_SHA256,
     REFERENCE_ADDITIONAL_PRIOR_EXECUTION_SCOPE_SHA256,
+    REFERENCE_ADDITIONAL_REPLACEMENT_AUTHORITY_SHA256,
     REFERENCE_ADDITIONAL_SETTLEMENT_RECEIPT_SHA256,
     REFERENCE_AUTHORITY_SHA256,
     REFERENCE_BOOTSTRAP_AUTHORITY_SHA256,
@@ -29,6 +30,9 @@ from lowbit_lab.db import (
 from lowbit_lab.handoff import sha256_json
 from lowbit_lab.reference_authority import (
     ADDITIONAL_AUTHORITY_PATH,
+    ADDITIONAL_REPLACEMENT_AUTHORITY_PATH,
+    ADDITIONAL_REPLACEMENT_FORFEIT_RECEIPT_PATH,
+    ADDITIONAL_REPLACEMENT_STATEMENT_PATH,
     ADDITIONAL_SETTLEMENT_RECEIPT_PATH,
     ADDITIONAL_STATEMENT_PATH,
     AUTHORITY_PATH,
@@ -40,6 +44,8 @@ from lowbit_lab.reference_authority import (
     SIGNED_CDN_AUTHORITY_PATH,
     SIGNED_CDN_STATEMENT_PATH,
     STATEMENT_PATH,
+    build_reference_additional_forfeit_receipt,
+    build_reference_additional_replacement_authority,
     build_reference_recovery_authority,
 )
 from lowbit_lab.reference_contract import (
@@ -73,6 +79,9 @@ def _authority_root(database: ResultsDatabase) -> Path:
         ADDITIONAL_STATEMENT_PATH,
         ADDITIONAL_AUTHORITY_PATH,
         ADDITIONAL_SETTLEMENT_RECEIPT_PATH,
+        ADDITIONAL_REPLACEMENT_STATEMENT_PATH,
+        ADDITIONAL_REPLACEMENT_AUTHORITY_PATH,
+        ADDITIONAL_REPLACEMENT_FORFEIT_RECEIPT_PATH,
     ]
     relative_paths.extend(path for path, _ in CONTROLLING_PLANS.values())
     for relative_path in relative_paths:
@@ -87,6 +96,28 @@ def _authority_root(database: ResultsDatabase) -> Path:
                         sort_keys=True,
                         separators=(",", ":"),
                         ensure_ascii=True,
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                    newline="\n",
+                )
+            elif relative_path == ADDITIONAL_REPLACEMENT_AUTHORITY_PATH:
+                destination.write_text(
+                    json.dumps(
+                        build_reference_additional_replacement_authority(),
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                    newline="\n",
+                )
+            elif relative_path == ADDITIONAL_REPLACEMENT_FORFEIT_RECEIPT_PATH:
+                destination.write_text(
+                    json.dumps(
+                        build_reference_additional_forfeit_receipt(),
+                        sort_keys=True,
+                        separators=(",", ":"),
                     )
                     + "\n",
                     encoding="utf-8",
@@ -457,6 +488,9 @@ def _reserve(
     approval_expires_at: str = "2026-08-22T01:00:00+00:00",
     total_cap_usd: str = "4.00270969",
     additional_authority_sha256: str | None = None,
+    additional_replacement_entitlement_sha256: str | None = None,
+    additional_replacement_authority_sha256: str | None = None,
+    additional_replacement_request_sha256: str | None = None,
 ) -> None:
     if settled_smoke_actual_usd is not None:
         with database.connect_readonly() as connection:
@@ -635,6 +669,13 @@ def _reserve(
             if additional_authority_sha256 is not None
             else None
         ),
+        additional_replacement_entitlement_sha256=(
+            additional_replacement_entitlement_sha256
+        ),
+        additional_replacement_authority_sha256=(
+            additional_replacement_authority_sha256
+        ),
+        additional_replacement_request_sha256=additional_replacement_request_sha256,
     )
 
 
@@ -687,22 +728,24 @@ def test_standing_reference_setup_rolls_back_with_failed_reservation(tmp_path: P
 
 def _downgrade_v9_to_v8(path: Path) -> None:
     with sqlite3.connect(path) as connection:
+        connection.execute("DROP TABLE reference_additional_replacement_entitlements")
         connection.execute("DROP TABLE reference_additional_grants")
         connection.execute("DROP TABLE reference_authority_slots")
         connection.execute(
-            "UPDATE schema_info SET version = 8 WHERE version IN (10, 11, 12, 13, 14, 15)"
+            "UPDATE schema_info SET version = 8 WHERE version IN (10, 11, 12, 13, 14, 15, 16)"
         )
 
 
 def _downgrade_v10_to_v9(path: Path) -> None:
     with sqlite3.connect(path) as connection:
         connection.execute("PRAGMA foreign_keys = OFF")
+        connection.execute("DROP TABLE reference_additional_replacement_entitlements")
         connection.execute("DROP TABLE reference_additional_grants")
         connection.execute("DROP TABLE reference_replacement_entitlements")
         connection.execute("DROP TABLE reference_preidentity_settlements")
         connection.execute("DROP TABLE reference_workspace_scope_reconciliations")
         connection.execute(
-            "UPDATE schema_info SET version = 9 WHERE version IN (10, 11, 12, 13, 14, 15)"
+            "UPDATE schema_info SET version = 9 WHERE version IN (10, 11, 12, 13, 14, 15, 16)"
         )
 
 
@@ -848,6 +891,7 @@ def _downgrade_populated_database_to_v4(path: Path) -> None:
             DROP TABLE reference_replacement_entitlements;
             DROP TABLE reference_preidentity_settlements;
             DROP TABLE reference_workspace_scope_reconciliations;
+            DROP TABLE reference_additional_replacement_entitlements;
             DROP TABLE reference_additional_grants;
             DROP TABLE controller_cycle_transitions;
             DROP TABLE controller_cycles;
@@ -2901,13 +2945,14 @@ def test_v12_to_v13_migration_preserves_rows_and_adds_recovery_tables(tmp_path: 
             END"""
         )
         connection.execute("DROP TABLE reference_additional_grants")
+        connection.execute("DROP TABLE reference_additional_replacement_entitlements")
         connection.execute("DELETE FROM schema_info WHERE version >= 13")
         connection.execute(
             "INSERT INTO schema_info(version, applied_at) VALUES (12, '2026-08-26T00:00:00Z')"
         )
     ResultsDatabase(path).initialize()
     with ResultsDatabase(path).connect_readonly() as connection:
-        assert connection.execute("SELECT max(version) FROM schema_info").fetchone()[0] == 15
+        assert connection.execute("SELECT max(version) FROM schema_info").fetchone()[0] == 16
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
         assert (
             connection.execute("SELECT count(*) FROM provider_smoke_reservations").fetchone()[0]
@@ -3014,7 +3059,40 @@ def _settle_replacement_history(database: ResultsDatabase, suffix: str) -> None:
         assert _committed_provider_cost(connection) == Decimal("0.00564445")
 
 
-def _reserve_additional(database: ResultsDatabase, suffix: str) -> None:
+def _reserve_additional(
+    database: ResultsDatabase,
+    suffix: str,
+    *,
+    mutate_config: Callable[[dict[str, object]], None] | None = None,
+) -> None:
+    root = _authority_root(database)
+    entitlement = database.reference_additional_replacement_entitlement()
+    if entitlement is None:
+        database.activate_reference_additional_replacement(
+            authority_root=root,
+            occurred_at="2026-08-22T04:58:00+00:00",
+        )
+        entitlement = database.reference_additional_replacement_entitlement()
+    assert entitlement is not None
+    request_sha256 = hashlib.sha256(f"request-{suffix}".encode()).hexdigest()
+    parity_receipt_sha256 = hashlib.sha256(f"parity-{suffix}".encode()).hexdigest()
+    execution_scope_sha256 = reference_execution_scope_sha256(
+        source_revision="d" * 40,
+        weight_inventory_sha256="1" * 64,
+        evaluation_lock_sha256="4" * 64,
+        formula_authority_sha256="5" * 64,
+        formula_approval_sha256="8" * 64,
+        trust_override_sha256="3" * 64,
+    )
+    if entitlement["state"] == "available":
+        entitlement_sha256 = database.claim_reference_additional_replacement(
+            request_sha256=request_sha256,
+            parity_receipt_sha256=parity_receipt_sha256,
+            execution_scope_sha256=execution_scope_sha256,
+            occurred_at="2026-08-22T04:59:00+00:00",
+        )
+    else:
+        entitlement_sha256 = str(entitlement["entitlement_sha256"])
     _reserve(
         database,
         suffix=suffix,
@@ -3025,7 +3103,117 @@ def _reserve_additional(database: ResultsDatabase, suffix: str) -> None:
         lease_expires_at="2026-08-22T05:30:00+00:00",
         approval_expires_at="2026-08-22T06:00:00+00:00",
         observation_receipt_sha256=hashlib.sha256(suffix.encode()).hexdigest(),
+        additional_replacement_entitlement_sha256=entitlement_sha256,
+        additional_replacement_authority_sha256=(
+            REFERENCE_ADDITIONAL_REPLACEMENT_AUTHORITY_SHA256
+        ),
+        additional_replacement_request_sha256=request_sha256,
+        mutate_config=mutate_config,
     )
+
+
+def _additional_boundary_binding(database: ResultsDatabase) -> dict[str, str]:
+    entitlement = database.reference_additional_replacement_entitlement()
+    assert entitlement is not None
+    return {
+        "request_sha256": str(entitlement["claimed_request_sha256"]),
+        "parity_receipt_sha256": str(entitlement["claimed_parity_receipt_sha256"]),
+    }
+
+
+def test_additional_preprovider_replacement_is_explicit_and_claims_once(
+    tmp_path: Path,
+) -> None:
+    database = ResultsDatabase(tmp_path / "replacement.sqlite")
+    database.initialize()
+    _settle_replacement_history(database, "replacement-history")
+    root = _authority_root(database)
+    entitlement_sha256 = database.activate_reference_additional_replacement(
+        authority_root=root,
+        occurred_at="2026-08-30T09:00:00+00:00",
+    )
+    entitlement = database.reference_additional_replacement_entitlement()
+    assert entitlement is not None
+    assert entitlement["state"] == "available"
+    assert entitlement["entitlement_sha256"] == entitlement_sha256
+
+    execution_scope_sha256 = reference_execution_scope_sha256(
+        source_revision="d" * 40,
+        weight_inventory_sha256="1" * 64,
+        evaluation_lock_sha256="4" * 64,
+        formula_authority_sha256="5" * 64,
+        formula_approval_sha256="8" * 64,
+        trust_override_sha256="3" * 64,
+    )
+    assert database.claim_reference_additional_replacement(
+        request_sha256="a" * 64,
+        parity_receipt_sha256="b" * 64,
+        execution_scope_sha256=execution_scope_sha256,
+        occurred_at="2026-08-30T09:01:00+00:00",
+    ) == entitlement_sha256
+    with pytest.raises(DatabaseError, match="unavailable"):
+        database.claim_reference_additional_replacement(
+            request_sha256="a" * 64,
+            parity_receipt_sha256="b" * 64,
+            execution_scope_sha256=execution_scope_sha256,
+            occurred_at="2026-08-30T09:02:00+00:00",
+        )
+
+    _reserve(
+        database,
+        suffix="replacement-final",
+        settled_smoke_actual_usd=None,
+        total_cap_usd="4.00564445",
+        additional_authority_sha256=REFERENCE_ADDITIONAL_AUTHORITY_SHA256,
+        additional_replacement_entitlement_sha256=entitlement_sha256,
+        additional_replacement_authority_sha256=(
+            REFERENCE_ADDITIONAL_REPLACEMENT_AUTHORITY_SHA256
+        ),
+        additional_replacement_request_sha256="a" * 64,
+        started_at="2026-08-30T09:01:00+00:00",
+        lease_expires_at="2026-08-30T09:31:00+00:00",
+        approval_expires_at="2026-08-30T10:00:00+00:00",
+    )
+    reserved = database.reference_additional_replacement_entitlement()
+    assert reserved is not None
+    assert reserved["state"] == "claimed"
+    assert reserved["reservation_id"] == "reservation-replacement-final"
+    database.release_reference_additional_reservation(
+        "reservation-replacement-final",
+        owner_id="owner",
+        reason="deterministic final-boundary failure",
+        occurred_at="2026-08-30T09:02:00+00:00",
+    )
+    terminal = database.reference_additional_replacement_entitlement()
+    assert terminal is not None
+    assert terminal["state"] == "claimed"
+    assert terminal["reservation_id"] == "reservation-replacement-final"
+    assert database.reference_additional_grant()["state"] == "available"
+    with pytest.raises(DatabaseError, match="additional replacement"):
+        _reserve_additional(database, "replacement-final-retry")
+
+
+def test_activated_additional_replacement_cannot_use_parent_grant_directly(
+    tmp_path: Path,
+) -> None:
+    database = ResultsDatabase(tmp_path / "replacement-bypass.sqlite")
+    database.initialize()
+    _settle_replacement_history(database, "replacement-bypass-history")
+    database.activate_reference_additional_replacement(
+        authority_root=_authority_root(database),
+        occurred_at="2026-08-30T09:00:00+00:00",
+    )
+    with pytest.raises(DatabaseError, match="additional replacement"):
+        _reserve(
+            database,
+            suffix="replacement-bypass",
+            settled_smoke_actual_usd=None,
+            total_cap_usd="4.00564445",
+            additional_authority_sha256=REFERENCE_ADDITIONAL_AUTHORITY_SHA256,
+            started_at="2026-08-30T09:01:00+00:00",
+            lease_expires_at="2026-08-30T09:31:00+00:00",
+            approval_expires_at="2026-08-30T10:00:00+00:00",
+        )
 
 
 def test_v14_to_v15_migration_preserves_historical_cells_and_appends_grant(
@@ -3046,6 +3234,7 @@ def test_v14_to_v15_migration_preserves_historical_cells_and_appends_grant(
             )
         }
         connection.execute("DROP TABLE reference_additional_grants")
+        connection.execute("DROP TABLE reference_additional_replacement_entitlements")
         connection.execute("DELETE FROM schema_info")
         connection.execute(
             "INSERT INTO schema_info(version, applied_at) VALUES (14, '2026-08-29T00:00:00Z')"
@@ -3058,9 +3247,50 @@ def test_v14_to_v15_migration_preserves_historical_cells_and_appends_grant(
             table: [tuple(row) for row in connection.execute(f"SELECT * FROM {table}")]
             for table in before
         }
-        assert connection.execute("SELECT max(version) FROM schema_info").fetchone()[0] == 15
+        assert connection.execute("SELECT max(version) FROM schema_info").fetchone()[0] == 16
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
     assert after == before
+
+
+def _downgrade_v16_to_exact_v15(path: Path) -> None:
+    database = ResultsDatabase(path)
+    database.initialize()
+    with database.connect() as connection:
+        connection.execute("DROP TABLE reference_additional_replacement_entitlements")
+        connection.execute("DELETE FROM schema_info")
+        connection.execute(
+            "INSERT INTO schema_info(version, applied_at) VALUES (15, '2026-08-30T00:00:00Z')"
+        )
+
+
+def test_v15_to_v16_migration_adds_empty_explicit_activation_slot(tmp_path: Path) -> None:
+    path = tmp_path / "v15.sqlite"
+    _downgrade_v16_to_exact_v15(path)
+    ResultsDatabase(path).initialize()
+    with ResultsDatabase(path).connect_readonly() as connection:
+        assert connection.execute("SELECT max(version) FROM schema_info").fetchone()[0] == 16
+        assert connection.execute(
+            "SELECT count(*) FROM reference_additional_replacement_entitlements"
+        ).fetchone()[0] == 0
+
+
+def test_v15_migration_rejects_unknown_authority_table_without_ddl(tmp_path: Path) -> None:
+    path = tmp_path / "v15-unknown.sqlite"
+    _downgrade_v16_to_exact_v15(path)
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "CREATE TABLE reference_additional_replacement_entitlements(blocker INTEGER)"
+        )
+    with pytest.raises(DatabaseError, match="schema v15 shape is unknown"):
+        ResultsDatabase(path).initialize()
+    with sqlite3.connect(path) as connection:
+        sql = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE name = ?",
+            ("reference_additional_replacement_entitlements",),
+        ).fetchone()[0]
+        version = connection.execute("SELECT max(version) FROM schema_info").fetchone()[0]
+    assert sql == "CREATE TABLE reference_additional_replacement_entitlements(blocker INTEGER)"
+    assert version == 15
     grant = ResultsDatabase(path).reference_additional_grant()
     assert grant["authority_sha256"] == REFERENCE_ADDITIONAL_AUTHORITY_SHA256
     assert grant["prior_settlement_receipt_sha256"] == (
@@ -3155,35 +3385,8 @@ def test_additional_preboundary_release_preserves_grant_but_consumption_is_perma
     assert released["state"] == "available"
     assert released["active_reservation_id"] is None
 
-    _reserve_additional(database, "release-second")
-    release_scope = database.get_reservation("reservation-release-second")[
-        "reference_execution_scope_sha256"
-    ]
-    database.mark_reference_additional_submission_pending(
-        "reservation-release-second",
-        owner_id="owner",
-        additional_authority_sha256=REFERENCE_ADDITIONAL_AUTHORITY_SHA256,
-        auth_receipt_bytes=_additional_boundary_auth_receipt(
-            "reservation-release-second", release_scope
-        ),
-        authority_root=_authority_root(database),
-        occurred_at="2026-08-22T05:01:00+00:00",
-    )
-    consumed = database.reference_additional_grant()
-    assert consumed["state"] == "consumed"
-    assert consumed["active_reservation_id"] == "reservation-release-second"
-    assert database.get_reservation("reservation-release-second")["status"] == (
-        "submission_pending"
-    )
-    with pytest.raises(DatabaseError, match="not releasable"):
-        database.release_reference_additional_reservation(
-            "reservation-release-second",
-            owner_id="owner",
-            reason="must not restore",
-            occurred_at="2026-08-22T05:02:00+00:00",
-        )
-    with pytest.raises(DatabaseError, match="unavailable"):
-        _reserve_additional(database, "release-third")
+    with pytest.raises(DatabaseError, match="not claimed"):
+        _reserve_additional(database, "release-second")
 
 
 def _additional_boundary_auth_receipt(reservation_id: str, scope: str) -> bytes:
@@ -3220,12 +3423,17 @@ def test_additional_boundary_binds_auth_receipt_and_grant_through_provider_ident
         reservation_id,
         owner_id="owner",
         additional_authority_sha256=REFERENCE_ADDITIONAL_AUTHORITY_SHA256,
+        **_additional_boundary_binding(database),
         auth_receipt_bytes=receipt,
         authority_root=_authority_root(database),
         occurred_at="2026-08-22T05:01:00+00:00",
     )
     grant = database.reference_additional_grant()
     assert grant["consumed_auth_receipt_sha256"] == hashlib.sha256(receipt).hexdigest()
+    child = database.reference_additional_replacement_entitlement()
+    assert child is not None
+    assert child["state"] == "consumed"
+    assert child["consumed_auth_receipt_sha256"] == hashlib.sha256(receipt).hexdigest()
 
     database.mark_reference_app_identity(
         reservation_id,
@@ -3266,6 +3474,7 @@ def test_additional_provider_transition_rejects_grant_reservation_pair_drift(
         reservation_id,
         owner_id="owner",
         additional_authority_sha256=REFERENCE_ADDITIONAL_AUTHORITY_SHA256,
+        **_additional_boundary_binding(database),
         auth_receipt_bytes=_additional_boundary_auth_receipt(reservation_id, scope),
         authority_root=_authority_root(database),
         occurred_at="2026-08-22T05:01:00+00:00",
@@ -3305,6 +3514,7 @@ def test_additional_boundary_database_failure_rolls_back_grant_and_receipt(
             reservation_id,
             owner_id="owner",
             additional_authority_sha256=REFERENCE_ADDITIONAL_AUTHORITY_SHA256,
+            **_additional_boundary_binding(database),
             auth_receipt_bytes=_additional_boundary_auth_receipt(reservation_id, scope),
             authority_root=_authority_root(database),
             occurred_at="2026-08-22T05:01:00+00:00",
@@ -3312,6 +3522,40 @@ def test_additional_boundary_database_failure_rolls_back_grant_and_receipt(
     grant = database.reference_additional_grant()
     assert grant["state"] == "available"
     assert grant["consumed_auth_receipt_sha256"] is None
+    child = database.reference_additional_replacement_entitlement()
+    assert child is not None
+    assert child["state"] == "claimed"
+    assert child["consumed_auth_receipt_sha256"] is None
+    assert database.get_reservation(reservation_id)["status"] == "reserved"
+
+
+@pytest.mark.parametrize("field", ("claimed_request_sha256", "claimed_parity_receipt_sha256"))
+def test_additional_boundary_rejects_claim_binding_drift(
+    tmp_path: Path, field: str
+) -> None:
+    database = ResultsDatabase(tmp_path / f"additional-{field}-drift.sqlite")
+    database.initialize()
+    _settle_replacement_history(database, f"additional-{field}-drift-history")
+    _reserve_additional(database, f"additional-{field}-drift")
+    reservation_id = f"reservation-additional-{field}-drift"
+    binding = _additional_boundary_binding(database)
+    with database.connect() as connection:
+        connection.execute(
+            f"UPDATE reference_additional_replacement_entitlements SET {field} = ?",
+            ("f" * 64,),
+        )
+    scope = database.get_reservation(reservation_id)["reference_execution_scope_sha256"]
+    with pytest.raises(DatabaseError, match="not ready for provider contact"):
+        database.mark_reference_additional_submission_pending(
+            reservation_id,
+            owner_id="owner",
+            additional_authority_sha256=REFERENCE_ADDITIONAL_AUTHORITY_SHA256,
+            **binding,
+            auth_receipt_bytes=_additional_boundary_auth_receipt(reservation_id, scope),
+            authority_root=_authority_root(database),
+            occurred_at="2026-08-22T05:01:00+00:00",
+        )
+    assert database.reference_additional_grant()["state"] == "available"
     assert database.get_reservation(reservation_id)["status"] == "reserved"
 
 
@@ -3382,15 +3626,9 @@ def _additional_settlement_database(
         assert isinstance(provider, dict)
         provider["billing_authority_sha256"] = billing_hash
 
-    _reserve(
+    _reserve_additional(
         database,
-        suffix=f"settle-{outcome}-{actual_cost}",
-        settled_smoke_actual_usd=None,
-        total_cap_usd="4.00564445",
-        additional_authority_sha256=REFERENCE_ADDITIONAL_AUTHORITY_SHA256,
-        started_at="2026-08-22T05:00:00+00:00",
-        lease_expires_at="2026-08-22T05:30:00+00:00",
-        approval_expires_at="2026-08-22T06:00:00+00:00",
+        f"settle-{outcome}-{actual_cost}",
         mutate_config=bind_billing,
     )
     reservation_id = f"reservation-settle-{outcome}-{actual_cost}"
@@ -3400,6 +3638,7 @@ def _additional_settlement_database(
         reservation_id,
         owner_id="owner",
         additional_authority_sha256=REFERENCE_ADDITIONAL_AUTHORITY_SHA256,
+        **_additional_boundary_binding(database),
         auth_receipt_bytes=_additional_boundary_auth_receipt(reservation_id, scope),
         authority_root=_authority_root(database),
         occurred_at="2026-08-22T05:01:00+00:00",
