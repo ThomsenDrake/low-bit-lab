@@ -11,10 +11,17 @@ from lowbit_lab.config import SHA256_RE
 from lowbit_lab.constants import (
     REFERENCE_ADDITIONAL_AUTHORITY_SHA256,
     REFERENCE_ADDITIONAL_BASE_COMMIT,
+    REFERENCE_ADDITIONAL_CORRECTED_PREFLIGHT_REQUEST_SHA256,
     REFERENCE_ADDITIONAL_CUMULATIVE_CAP_USD,
+    REFERENCE_ADDITIONAL_FORFEITED_REQUEST_SHA256,
     REFERENCE_ADDITIONAL_INCREMENTAL_CAP_USD,
     REFERENCE_ADDITIONAL_PRIOR_EXECUTION_SCOPE_SHA256,
     REFERENCE_ADDITIONAL_PRIOR_SPEND_USD,
+    REFERENCE_ADDITIONAL_REPLACEMENT_AUTHORITY_SHA256,
+    REFERENCE_ADDITIONAL_REPLACEMENT_BASE_COMMIT,
+    REFERENCE_ADDITIONAL_REPLACEMENT_FORFEIT_RECEIPT_SHA256,
+    REFERENCE_ADDITIONAL_REPLACEMENT_STATEMENT_ARTIFACT_SHA256,
+    REFERENCE_ADDITIONAL_REPLACEMENT_STATEMENT_SHA256,
     REFERENCE_ADDITIONAL_SETTLEMENT_RECEIPT_SHA256,
     REFERENCE_ADDITIONAL_STATEMENT_ARTIFACT_SHA256,
     REFERENCE_ADDITIONAL_STATEMENT_SHA256,
@@ -62,6 +69,15 @@ ADDITIONAL_STATEMENT_PATH = Path("configs/local/reference-additional-u8-standing
 ADDITIONAL_AUTHORITY_PATH = Path("configs/local/reference-additional-u8-authority.json")
 ADDITIONAL_SETTLEMENT_RECEIPT_PATH = Path(
     "reports/local/reference-replacement-settlement-receipt.json"
+)
+ADDITIONAL_REPLACEMENT_STATEMENT_PATH = Path(
+    "configs/local/reference-additional-preprovider-replacement-statement.txt"
+)
+ADDITIONAL_REPLACEMENT_AUTHORITY_PATH = Path(
+    "configs/local/reference-additional-preprovider-replacement-authority.json"
+)
+ADDITIONAL_REPLACEMENT_FORFEIT_RECEIPT_PATH = Path(
+    "reports/local/reference-additional-preprovider-forfeit-receipt.json"
 )
 CONTROLLING_PLANS = {
     "original_reference_baseline": (
@@ -336,6 +352,77 @@ def build_reference_additional_authority() -> dict[str, Any]:
         "promotion_privacy_lineage_budget_controls_may_be_weakened": False,
         "u9_after_successful_terminal_settlement_authorized": True,
         "u9_proposal_only": True,
+    }
+
+
+def build_reference_additional_replacement_authority() -> dict[str, Any]:
+    """Return the closed amendment for one pre-provider-failure replacement."""
+    return {
+        "schema_version": 1,
+        "kind": "reference_additional_preprovider_replacement_authority",
+        "statement_sha256": REFERENCE_ADDITIONAL_REPLACEMENT_STATEMENT_SHA256,
+        "statement_artifact_sha256": (
+            REFERENCE_ADDITIONAL_REPLACEMENT_STATEMENT_ARTIFACT_SHA256
+        ),
+        "approved_base_commit": REFERENCE_ADDITIONAL_REPLACEMENT_BASE_COMMIT,
+        "parent_additional_authority_sha256": REFERENCE_ADDITIONAL_AUTHORITY_SHA256,
+        "failed_request_sha256": REFERENCE_ADDITIONAL_FORFEITED_REQUEST_SHA256,
+        "corrected_preflight_request_sha256": (
+            REFERENCE_ADDITIONAL_CORRECTED_PREFLIGHT_REQUEST_SHA256
+        ),
+        "corrected_preflight_is_parent_evidence": True,
+        "paid_child_regenerated_after_merge": True,
+        "paid_child_irreversible_bindings": [
+            "execution_scope_sha256",
+            "request_sha256",
+            "wsl_parity_receipt_sha256",
+        ],
+        "failed_command_disposition": "consumed_preprovider_forfeit",
+        "failed_incremental_spend_usd": "0",
+        "failed_reservation_created": False,
+        "failed_provider_submitted": False,
+        "failed_weight_transfer": False,
+        "replacement_slots": 1,
+        "subsequent_retry_or_replacement_slots": 0,
+        "claim_is_irreversible": True,
+        "incremental_u8_cap_usd": str(REFERENCE_ADDITIONAL_INCREMENTAL_CAP_USD),
+        "cumulative_lab_cap_usd": str(REFERENCE_ADDITIONAL_CUMULATIVE_CAP_USD),
+        "authoritative_prior_spend_usd": str(REFERENCE_ADDITIONAL_PRIOR_SPEND_USD),
+        "currency": "USD",
+        "gpu": "A100-80GB:1",
+        "max_concurrent_containers": 1,
+        "max_spawns": 1,
+        "timeout_seconds": 2700,
+        "provider_retries": 0,
+        "application_retries": 0,
+        "fallback_gpu_authorized": False,
+        "configured_context_tokens": 262144,
+        "proven_useful_context_tokens": None,
+        "all_parent_privacy_provenance_transport_controls_unchanged": True,
+        "private_data_or_local_weight_transfer_authorized": False,
+        "mounts_volumes_storage_scheduling_authorized": False,
+        "candidate_conversion_training_promotion_authorized": False,
+        "u9_proposal_only": True,
+    }
+
+
+def build_reference_additional_forfeit_receipt() -> dict[str, Any]:
+    """Return the deterministic receipt for the failure before mutable boundaries."""
+    return {
+        "schema_version": 1,
+        "kind": "reference_additional_preprovider_forfeit_receipt",
+        "amendment_authority_sha256": REFERENCE_ADDITIONAL_REPLACEMENT_AUTHORITY_SHA256,
+        "parent_additional_authority_sha256": REFERENCE_ADDITIONAL_AUTHORITY_SHA256,
+        "failed_request_sha256": REFERENCE_ADDITIONAL_FORFEITED_REQUEST_SHA256,
+        "corrected_request_sha256": (
+            REFERENCE_ADDITIONAL_CORRECTED_PREFLIGHT_REQUEST_SHA256
+        ),
+        "disposition": "consumed_preprovider_forfeit",
+        "incremental_spend_usd": "0",
+        "reservation_created": False,
+        "provider_contacted": False,
+        "modal_submitted": False,
+        "weight_transfer": False,
     }
 
 
@@ -756,6 +843,82 @@ def validate_reference_additional_authority(
     if authority != expected or sha256_json(authority) != (REFERENCE_ADDITIONAL_AUTHORITY_SHA256):
         raise ReferenceAuthorityError("additional authority boundary has drifted")
     return REFERENCE_ADDITIONAL_AUTHORITY_SHA256
+
+
+def validate_reference_additional_replacement_authority(root: Path) -> str:
+    """Validate the exact amendment, deterministic forfeit, and unchanged parent."""
+    validate_reference_additional_authority(root, ADDITIONAL_AUTHORITY_PATH)
+    try:
+        root = root.resolve(strict=True)
+    except OSError as exc:
+        raise ReferenceAuthorityError("additional replacement root is unavailable") from exc
+
+    statement = _read(
+        _confined_path(
+            root,
+            ADDITIONAL_REPLACEMENT_STATEMENT_PATH,
+            "additional replacement statement",
+        ),
+        "additional replacement statement",
+    )
+    if (
+        statement.startswith(b"\xef\xbb\xbf")
+        or not statement.endswith(b"\n")
+        or statement.endswith(b"\n\n")
+        or b"\r" in statement
+        or hashlib.sha256(statement).hexdigest()
+        != REFERENCE_ADDITIONAL_REPLACEMENT_STATEMENT_ARTIFACT_SHA256
+        or hashlib.sha256(statement[:-1]).hexdigest()
+        != REFERENCE_ADDITIONAL_REPLACEMENT_STATEMENT_SHA256
+    ):
+        raise ReferenceAuthorityError("additional replacement statement bytes have drifted")
+    try:
+        statement.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as exc:
+        raise ReferenceAuthorityError("additional replacement statement is not UTF-8") from exc
+
+    authority_bytes = _read(
+        _confined_path(
+            root,
+            ADDITIONAL_REPLACEMENT_AUTHORITY_PATH,
+            "additional replacement authority",
+        ),
+        "additional replacement authority",
+    )
+    receipt_bytes = _read(
+        _confined_path(
+            root,
+            ADDITIONAL_REPLACEMENT_FORFEIT_RECEIPT_PATH,
+            "additional pre-provider forfeit receipt",
+        ),
+        "additional pre-provider forfeit receipt",
+    )
+    expected_authority = build_reference_additional_replacement_authority()
+    expected_receipt = build_reference_additional_forfeit_receipt()
+    if authority_bytes != (canonical_json(expected_authority) + "\n").encode("utf-8"):
+        raise ReferenceAuthorityError("additional replacement authority bytes have drifted")
+    if receipt_bytes != (canonical_json(expected_receipt) + "\n").encode("utf-8"):
+        raise ReferenceAuthorityError("additional forfeit receipt bytes have drifted")
+    try:
+        authority = json.loads(
+            authority_bytes.decode("utf-8", errors="strict"),
+            object_pairs_hook=_reject_duplicate_keys,
+        )
+        receipt = json.loads(
+            receipt_bytes.decode("utf-8", errors="strict"),
+            object_pairs_hook=_reject_duplicate_keys,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ReferenceAuthorityError("additional replacement artifacts are invalid") from exc
+    if (
+        authority != expected_authority
+        or sha256_json(authority) != REFERENCE_ADDITIONAL_REPLACEMENT_AUTHORITY_SHA256
+        or receipt != expected_receipt
+        or sha256_json(receipt)
+        != REFERENCE_ADDITIONAL_REPLACEMENT_FORFEIT_RECEIPT_SHA256
+    ):
+        raise ReferenceAuthorityError("additional replacement authority boundary has drifted")
+    return REFERENCE_ADDITIONAL_REPLACEMENT_AUTHORITY_SHA256
 
 
 def authorize_reference_additional_action(

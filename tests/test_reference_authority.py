@@ -10,6 +10,9 @@ from lowbit_lab.handoff import canonical_json, sha256_json
 from lowbit_lab.reference_authority import (
     ACTION_CLASSES,
     ADDITIONAL_AUTHORITY_PATH,
+    ADDITIONAL_REPLACEMENT_AUTHORITY_PATH,
+    ADDITIONAL_REPLACEMENT_FORFEIT_RECEIPT_PATH,
+    ADDITIONAL_REPLACEMENT_STATEMENT_PATH,
     ADDITIONAL_SETTLEMENT_RECEIPT_PATH,
     ADDITIONAL_STATEMENT_PATH,
     BOOTSTRAP_AUTHORITY_PATH,
@@ -27,9 +30,12 @@ from lowbit_lab.reference_authority import (
     authorize_reference_action,
     authorize_reference_additional_action,
     authorize_reference_bootstrap_action,
+    build_reference_additional_forfeit_receipt,
+    build_reference_additional_replacement_authority,
     build_reference_recovery_authority,
     build_workspace_scope_reconciliation_authority,
     validate_reference_additional_authority,
+    validate_reference_additional_replacement_authority,
     validate_reference_authority,
     validate_reference_bootstrap_authority,
     validate_reference_recovery_authority,
@@ -135,6 +141,49 @@ def _copy_additional_authority_inputs(root: Path) -> Path:
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination.write_bytes(source.read_bytes())
     return root / ADDITIONAL_AUTHORITY_PATH
+
+
+def _write_additional_replacement_inputs(root: Path) -> None:
+    _copy_additional_authority_inputs(root)
+    repository = Path(__file__).resolve().parents[1]
+    statement = root / ADDITIONAL_REPLACEMENT_STATEMENT_PATH
+    statement.parent.mkdir(parents=True, exist_ok=True)
+    statement.write_bytes((repository / ADDITIONAL_REPLACEMENT_STATEMENT_PATH).read_bytes())
+    for path, value in (
+        (
+            ADDITIONAL_REPLACEMENT_AUTHORITY_PATH,
+            build_reference_additional_replacement_authority(),
+        ),
+        (
+            ADDITIONAL_REPLACEMENT_FORFEIT_RECEIPT_PATH,
+            build_reference_additional_forfeit_receipt(),
+        ),
+    ):
+        destination = root / path
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes((canonical_json(value) + "\n").encode())
+
+
+def test_additional_replacement_authority_validates_exact_forfeit(tmp_path: Path) -> None:
+    _write_additional_replacement_inputs(tmp_path)
+    assert validate_reference_additional_replacement_authority(tmp_path) == (
+        reference_authority.REFERENCE_ADDITIONAL_REPLACEMENT_AUTHORITY_SHA256
+    )
+    receipt = json.loads(
+        (tmp_path / ADDITIONAL_REPLACEMENT_FORFEIT_RECEIPT_PATH).read_text()
+    )
+    assert receipt["incremental_spend_usd"] == "0"
+    assert receipt["reservation_created"] is False
+    assert receipt["provider_contacted"] is False
+    assert receipt["weight_transfer"] is False
+
+
+def test_additional_replacement_authority_rejects_receipt_drift(tmp_path: Path) -> None:
+    _write_additional_replacement_inputs(tmp_path)
+    receipt = tmp_path / ADDITIONAL_REPLACEMENT_FORFEIT_RECEIPT_PATH
+    receipt.write_bytes(receipt.read_bytes() + b"\n")
+    with pytest.raises(ReferenceAuthorityError, match="forfeit receipt"):
+        validate_reference_additional_replacement_authority(tmp_path)
 
 
 def test_additional_authority_validates_exact_real_bytes(tmp_path: Path) -> None:
